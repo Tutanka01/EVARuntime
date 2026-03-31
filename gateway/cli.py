@@ -335,8 +335,10 @@ def status():
     console.print(f"  Modèle          : {s['model_name']}")
     console.print(f"  Chemin          : {s['model_path']}")
     console.print(f"  PID             : {s['pid'] or '—'}")
-    console.print(f"  Uptime          : {f\"{s['uptime_seconds']:.0f}s\" if s['uptime_seconds'] else '—'}")
-    console.print(f"  Idle depuis     : {f\"{s['idle_seconds']}s\" if s['idle_seconds'] else '—'}")
+    uptime = f"{s['uptime_seconds']:.0f}s" if s['uptime_seconds'] else '—'
+    idle = f"{s['idle_seconds']}s" if s['idle_seconds'] else '—'
+    console.print(f"  Uptime          : {uptime}")
+    console.print(f"  Idle depuis     : {idle}")
     console.print(f"  Idle timeout    : {s['idle_timeout_seconds']}s")
     console.print()
     p = s["llama_params"]
