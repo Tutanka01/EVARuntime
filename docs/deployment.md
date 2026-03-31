@@ -227,34 +227,17 @@ LLAMA_PARALLEL=8                # 8 utilisateurs simultanés
 
 L'accès HTTPS est **obligatoire** — les clés API transitent dans les headers.
 
-### Option A — Let's Encrypt (domaine public)
+Le domaine utilisé est **`llm.eva.univ-pau.fr`**. Le certificat est fourni par la DSI UPPA (PKI interne) — pas de certbot.
 
 ```bash
-sudo apt install certbot python3-certbot-nginx
-
-# Remplacer par le domaine réel
-sudo certbot certonly --nginx -d llm.univ-pau.fr
-
-# Certificat généré dans :
-# /etc/letsencrypt/live/llm.univ-pau.fr/fullchain.pem
-# /etc/letsencrypt/live/llm.univ-pau.fr/privkey.pem
-
-# Renouvellement automatique (cron déjà configuré par certbot)
-sudo certbot renew --dry-run
-```
-
-### Option B — PKI interne UPPA
-
-```bash
-# Placer les fichiers fournis par la DSI :
+# Placer les fichiers fournis par la DSI UPPA :
 sudo cp uppa-llm.crt /etc/ssl/certs/llm-gateway.crt
 sudo cp uppa-llm.key /etc/ssl/private/llm-gateway.key
 sudo chmod 600 /etc/ssl/private/llm-gateway.key
-
-# Adapter nginx.conf :
-# ssl_certificate     /etc/ssl/certs/llm-gateway.crt;
-# ssl_certificate_key /etc/ssl/private/llm-gateway.key;
+sudo chmod 644 /etc/ssl/certs/llm-gateway.crt
 ```
+
+> **Note :** Le certificat est géré par la DSI UPPA. Contacter le service informatique pour le renouvellement avant expiration.
 
 ---
 
@@ -317,7 +300,7 @@ sudo -u llmservice ./venv/bin/python cli.py create-key test --name "test"
 # → Copier la clé affichée : llmgw-XXXX...
 
 # Tester (le modèle va charger, attendre ~60-90s)
-curl -s https://llm.univ-pau.fr/v1/chat/completions \
+curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer llmgw-VOTRE_CLE" \
   -H "Content-Type: application/json" \
   -d '{"model":"llama-3.3-70b-instruct","messages":[{"role":"user","content":"Dis bonjour"}]}' \
