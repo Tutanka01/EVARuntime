@@ -84,7 +84,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LLM Inference Gateway UPPA",
     description=(
-        "Inference gateway souverain pour le GPU L40S UPPA. "
+        "Inference gateway souverain du cluster EVA (hébergé à l'UPPA). "
         "Compatible API OpenAI. Accès réservé aux membres authentifiés."
     ),
     version="1.0.0",

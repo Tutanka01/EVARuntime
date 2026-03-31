@@ -1,4 +1,4 @@
-# Architecture technique — LLM Gateway UPPA
+# Architecture technique — Cluster EVA Inference Gateway
 
 Ce document explique les décisions de conception, les flux de données et
 les invariants de sécurité du gateway. Il s'adresse aux développeurs et
@@ -22,7 +22,7 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 └─────────────────────────┼───────────────────────────────────────────────┘
                           │
 ┌─────────────────────────┼───────────────────────────────────────────────┐
-│  Serveur UPPA (GPU L40S)│                                               │
+│  Cluster EVA — hébergé à l'UPPA (GPU L40S)│                                               │
 │                         ▼                                               │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │  nginx (TLS termination, rate limiting, IP filtering /admin)     │  │

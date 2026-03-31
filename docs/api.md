@@ -1,7 +1,7 @@
-# Guide utilisateur — API LLM Gateway UPPA
+# Guide utilisateur — API Cluster EVA
 
 Ce document s'adresse aux doctorants, enseignants et chercheurs qui souhaitent
-utiliser le service d'inférence LLM de l'UPPA depuis leurs scripts et applications.
+utiliser le service d'inférence du cluster EVA depuis leurs scripts et applications.
 
 L'API est **compatible avec le standard OpenAI** : tout code existant utilisant
 `openai-python`, LangChain, LiteLLM ou `curl` fonctionne en changeant simplement

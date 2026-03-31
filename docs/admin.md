@@ -1,4 +1,4 @@
-# Guide administrateur — LLM Gateway UPPA
+# Guide administrateur — Cluster EVA Inference Gateway
 
 Ce document s'adresse à l'administrateur du gateway : gestion des utilisateurs,
 des clés API, surveillance du système et reporting d'usage.

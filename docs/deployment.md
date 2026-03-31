@@ -1,4 +1,4 @@
-# Guide de déploiement — LLM Gateway UPPA
+# Guide de déploiement — Cluster EVA Inference Gateway
 
 Ce document décrit l'installation complète du gateway sur le serveur hébergeant
 le GPU NVIDIA L40S 48GB. Il s'adresse à l'administrateur système responsable
