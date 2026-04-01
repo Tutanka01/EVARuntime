@@ -1156,13 +1156,12 @@
             <th>Status</th>
             <th>RPM</th>
             <th>Monthly quota</th>
-            <th title="Estimated cost if this usage had gone through Claude Sonnet 3.7 ($3/M input · $15/M output)">≈ Claude Sonnet cost</th>
             <th>Created</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody id="users-mgmt-tbody">
-          <tr><td colspan="8" class="empty-state">Loading…</td></tr>
+          <tr><td colspan="7" class="empty-state">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1251,11 +1250,11 @@
          <thead>
            <tr>
              <th>User</th><th>Requests</th><th>Tokens</th>
-             <th>Quota</th><th>RPM</th><th>Last active</th><th>Status</th>
+             <th>Quota</th><th>RPM</th><th title="Estimated cost if this usage had gone through Claude Sonnet 3.7 ($3/M input · $15/M output)">≈ Claude Sonnet cost</th><th>Last active</th><th>Status</th>
            </tr>
          </thead>
         <tbody id="users-tbody">
-           <tr><td colspan="7" class="empty-state">Loading…</td></tr>
+           <tr><td colspan="8" class="empty-state">Loading…</td></tr>
          </tbody>
       </table>
     </div>
@@ -1766,17 +1765,19 @@ function renderLlamaMetrics(d) {
 function renderUsers(rows) {
    const tbody = document.getElementById('users-tbody');
    if (!rows || !rows.length) {
-     tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No data for this period.</td></tr>';
+     tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No data for this period.</td></tr>';
      return;
    }
    tbody.innerHTML = rows.map(u => {
      const q = buildQuotaBar(u.total_tokens, u.monthly_token_limit, u.quota_used_pct);
+     const costCell = renderClaudeCostCell(u.prompt_tokens, u.completion_tokens);
      return `<tr>
        <td class="td-user ${u.is_active ? '' : 'user-inactive'}">${esc(u.username)}</td>
        <td class="mono">${fmt(u.request_count)}</td>
        <td class="mono">${fmt(u.total_tokens)}</td>
        <td>${q}</td>
        <td class="mono">${u.rpm_limit || '—'}/m</td>
+       <td>${costCell}</td>
        <td style="color:var(--text3);font-size:11.5px">${fmtRelative(u.last_request)}</td>
        <td><span class="pill ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? 'on' : 'off'}</span></td>
      </tr>`;
@@ -2266,7 +2267,7 @@ function renderUsersManagement(users, summaryByUser = {}) {
    const countEl = document.getElementById('users-mgmt-count');
    if (countEl) countEl.textContent = users.length;
    if (!users.length) {
-     tbody.innerHTML = '<tr><td colspan="8" class="empty-state">No users yet. Click "Add User" to create the first one.</td></tr>';
+     tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No users yet. Click "Add User" to create the first one.</td></tr>';
      return;
    }
    tbody.innerHTML = users.map(u => {
@@ -2283,7 +2284,6 @@ function renderUsersManagement(users, summaryByUser = {}) {
        <td><span class="pill ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? 'active' : 'suspended'}</span></td>
        <td class="mono" style="font-size:11.5px">${u.rpm_limit}/m</td>
        <td style="font-size:11.5px">${quotaStr}</td>
-       <td>${costCell}</td>
        <td style="font-size:11.5px;color:var(--text3)">${fmtRelative(u.created_at)}</td>
        <td>
          <div class="action-group">
