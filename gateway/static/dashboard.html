@@ -1156,7 +1156,7 @@
             <th>Status</th>
             <th>RPM</th>
             <th>Monthly quota</th>
-            <th>vs Claude Sonnet</th>
+            <th title="Estimated cost if this usage had gone through Claude Sonnet 3.7 ($3/M input · $15/M output)">≈ Claude Sonnet cost</th>
             <th>Created</th>
             <th>Actions</th>
           </tr>
@@ -1251,7 +1251,7 @@
          <thead>
            <tr>
              <th>User</th><th>Requests</th><th>Tokens</th>
-             <th>Quota</th><th>RPM</th><th>vs Claude Sonnet</th><th>Last active</th><th>Status</th>
+             <th>Quota</th><th>RPM</th><th title="Estimated cost if this usage had gone through Claude Sonnet 3.7 ($3/M input · $15/M output)">≈ Claude Sonnet cost</th><th>Last active</th><th>Status</th>
            </tr>
          </thead>
         <tbody id="users-tbody">
@@ -1477,14 +1477,24 @@ function fmtRelative(iso) {
    return Math.floor(diff/86400) + 'd ago';
 }
 
-function calculateClaudeCost(tokens) {
-   if (!tokens || tokens <= 0) return '$0.0000';
-   const INPUT_PRICE_PER_MILLION = 3.00;
-   const OUTPUT_PRICE_PER_MILLION = 15.00;
-   const inputTokens = Math.floor(tokens * 0.5);
-   const outputTokens = Math.floor(tokens * 0.5);
-   const cost = (inputTokens * INPUT_PRICE_PER_MILLION + outputTokens * OUTPUT_PRICE_PER_MILLION) / 1_000_000;
-   return '$' + cost.toFixed(4);
+// Claude Sonnet 3.7 pricing (as of 2025): $3/M input, $15/M output
+const SONNET_INPUT_PRICE  = 3.00;
+const SONNET_OUTPUT_PRICE = 15.00;
+
+function calculateClaudeCost(promptTokens, completionTokens) {
+   const p = promptTokens    || 0;
+   const c = completionTokens || 0;
+   if (p <= 0 && c <= 0) return null;
+   return (p * SONNET_INPUT_PRICE + c * SONNET_OUTPUT_PRICE) / 1_000_000;
+}
+
+function renderClaudeCostCell(promptTokens, completionTokens) {
+   const cost = calculateClaudeCost(promptTokens, completionTokens);
+   if (cost === null) return '<span style="color:var(--text3);font-size:11px">no usage</span>';
+   const p = promptTokens || 0, c = completionTokens || 0;
+   const tip = `${fmt(p)} input + ${fmt(c)} output tokens`;
+   const color = cost < 0.01 ? 'var(--text2)' : cost < 1 ? 'var(--green)' : 'var(--amber)';
+   return `<span class="mono" style="color:${color}" title="${tip}">$${cost.toFixed(4)}</span>`;
 }
 
 function fmtCost(cost) {
@@ -1761,14 +1771,14 @@ function renderUsers(rows) {
    }
    tbody.innerHTML = rows.map(u => {
      const q = buildQuotaBar(u.total_tokens, u.monthly_token_limit, u.quota_used_pct);
-     const claudeCost = calculateClaudeCost(u.total_tokens);
+     const costCell = renderClaudeCostCell(u.prompt_tokens, u.completion_tokens);
      return `<tr>
        <td class="td-user ${u.is_active ? '' : 'user-inactive'}">${esc(u.username)}</td>
        <td class="mono">${fmt(u.request_count)}</td>
        <td class="mono">${fmt(u.total_tokens)}</td>
        <td>${q}</td>
        <td class="mono">${u.rpm_limit || '—'}/m</td>
-       <td class="mono" style="color:var(--green)">${claudeCost}</td>
+       <td>${costCell}</td>
        <td style="color:var(--text3);font-size:11.5px">${fmtRelative(u.last_request)}</td>
        <td><span class="pill ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? 'on' : 'off'}</span></td>
      </tr>`;
@@ -2232,13 +2242,20 @@ let _usersCache = [];
 
 async function fetchUsersManagement() {
   try {
-    const res = await fetch('/admin/users', {
-      headers: { 'Authorization': 'Bearer ' + _token }
-    });
-    if (res.status === 403) { doLogout(); return; }
-    if (!res.ok) return;
-    _usersCache = await res.json();
-    renderUsersManagement(_usersCache);
+    const headers = { 'Authorization': 'Bearer ' + _token };
+    const [usersRes, summaryRes] = await Promise.all([
+      fetch('/admin/users',          { headers }),
+      fetch('/admin/usage/summary',  { headers }),
+    ]);
+    if (usersRes.status === 403) { doLogout(); return; }
+    if (!usersRes.ok) return;
+    _usersCache = await usersRes.json();
+    const summaryByUser = {};
+    if (summaryRes.ok) {
+      const summary = await summaryRes.json();
+      for (const s of summary) summaryByUser[s.username] = s;
+    }
+    renderUsersManagement(_usersCache, summaryByUser);
   } catch(e) { console.error('fetchUsersManagement', e); }
 }
 
@@ -2246,7 +2263,7 @@ const EDIT_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" st
 const KEY_SVG  = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>`;
 const USR_DEL_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
 
-function renderUsersManagement(users) {
+function renderUsersManagement(users, summaryByUser = {}) {
    const tbody = document.getElementById('users-mgmt-tbody');
    const countEl = document.getElementById('users-mgmt-count');
    if (countEl) countEl.textContent = users.length;
@@ -2257,7 +2274,8 @@ function renderUsersManagement(users) {
    tbody.innerHTML = users.map(u => {
      const un = esc(u.username);
      const quotaStr = u.monthly_token_limit > 0 ? fmt(u.monthly_token_limit) + ' tok' : '<span style="color:var(--text3)">∞ unlimited</span>';
-     const claudeCost = calculateClaudeCost(u.monthly_token_limit);
+     const s = summaryByUser[u.username] || {};
+     const costCell = renderClaudeCostCell(s.total_prompt_tokens, s.total_completion_tokens);
      return `<tr>
        <td>
          <div style="font-weight:500;${u.is_active ? '' : 'color:var(--text3)'}">${un}</div>
@@ -2267,7 +2285,7 @@ function renderUsersManagement(users) {
        <td><span class="pill ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? 'active' : 'suspended'}</span></td>
        <td class="mono" style="font-size:11.5px">${u.rpm_limit}/m</td>
        <td style="font-size:11.5px">${quotaStr}</td>
-       <td class="mono" style="color:var(--green)">${claudeCost}</td>
+       <td>${costCell}</td>
        <td style="font-size:11.5px;color:var(--text3)">${fmtRelative(u.created_at)}</td>
        <td>
          <div class="action-group">
