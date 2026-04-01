@@ -118,28 +118,25 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 # LLM Gateway UPPA — Configuration
 # Généré le $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 # Modifier selon votre environnement.
+# Les modèles (chemins, paramètres llama-server) sont dans $CONFIG_DIR/models.yaml
 
 # ── Chemins ───────────────────────────────────────────────────────────────────
-MODEL_PATH=/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
+MODELS_CONFIG_PATH=${CONFIG_DIR}/models.yaml
 LLAMA_SERVER_BIN=/usr/local/bin/llama-server
 DB_PATH=${DATA_DIR}/gateway.db
 LOG_DIR=${LOG_DIR}
 
-# ── Modèle ────────────────────────────────────────────────────────────────────
-MODEL_PUBLIC_NAME=llama-3.3-70b-instruct
+# ── Pool de ports multi-modèles ───────────────────────────────────────────────
+BASE_LLAMA_PORT=8081
+MAX_LOADED_MODELS=5
 
-# ── Paramètres llama-server (optimisés L40S 48GB) ─────────────────────────────
-LLAMA_N_GPU_LAYERS=999
-LLAMA_CTX_SIZE=32768
-LLAMA_PARALLEL=4
-LLAMA_BATCH_SIZE=4096
-LLAMA_UBATCH_SIZE=512
-LLAMA_FLASH_ATTN=true
-LLAMA_CACHE_TYPE_K=q8_0
-LLAMA_CACHE_TYPE_V=q8_0
-LLAMA_THREADS=8
-LLAMA_THREADS_HTTP=4
-CUDA_VISIBLE_DEVICES=0
+# ── Budget VRAM (L40S 48 GB — adapter selon GPU) ─────────────────────────────
+TOTAL_VRAM_GB=48.0
+VRAM_OVERHEAD_GB=2.0
+VRAM_SAFETY_MARGIN=0.05
+
+# ── Modèle par défaut (vide = premier modèle activé du registre) ─────────────
+DEFAULT_MODEL_ID=
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 IDLE_TIMEOUT_SECONDS=300
@@ -154,7 +151,7 @@ ADMIN_SECRET=${ADMIN_SECRET}
 GATEWAY_HOST=127.0.0.1
 GATEWAY_PORT=8000
 LLAMA_SERVER_HOST=127.0.0.1
-LLAMA_SERVER_PORT=8081
+CUDA_VISIBLE_DEVICES=0
 
 # ── Rate limiting par défaut ───────────────────────────────────────────────────
 DEFAULT_RPM_LIMIT=20
@@ -165,10 +162,24 @@ EOF
     chown root:"$SERVICE_USER" "$CONFIG_FILE"
 
     warn "Configuration générée dans $CONFIG_FILE"
-    warn "IMPORTANT : vérifiez MODEL_PATH et adaptez les paramètres si nécessaire."
     warn "ADMIN_SECRET = $ADMIN_SECRET — notez-le maintenant."
 else
     info "Configuration existante conservée : $CONFIG_FILE"
+fi
+
+# ── 6b. Registre des modèles (models.yaml) ────────────────────────────────────
+
+MODELS_FILE="$CONFIG_DIR/models.yaml"
+
+if [[ ! -f "$MODELS_FILE" ]]; then
+    info "Installation du registre de modèles initial…"
+    cp "$SCRIPT_DIR/models.yaml" "$MODELS_FILE"
+    chmod 640 "$MODELS_FILE"
+    chown root:"$SERVICE_USER" "$MODELS_FILE"
+    warn "Registre des modèles installé dans $MODELS_FILE"
+    warn "IMPORTANT : vérifiez les chemins 'path' dans ce fichier avant de démarrer."
+else
+    info "Registre de modèles existant conservé : $MODELS_FILE"
 fi
 
 # ── 7. Service systemd ────────────────────────────────────────────────────────
@@ -222,8 +233,9 @@ echo "  1. Télécharger le modèle :"
 echo "     huggingface-cli download bartowski/Llama-3.3-70B-Instruct-GGUF \\"
 echo "       --include '*Q4_K_M*' --local-dir /models/"
 echo ""
-echo "  2. Adapter la configuration :"
+echo "  2. Adapter la configuration et le registre des modèles :"
 echo "     sudo nano $CONFIG_FILE"
+echo "     sudo nano $MODELS_FILE"
 echo ""
 echo "  3. Configurer le certificat TLS :"
 echo "     sudo certbot certonly --nginx -d llm.univ-pau.fr"
