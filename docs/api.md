@@ -17,12 +17,15 @@ l'URL de base et la clé API.
 4. [Python — requêtes directes (httpx)](#4-python--requêtes-directes-httpx)
 5. [Streaming](#5-streaming)
 6. [Paramètres de génération](#6-paramètres-de-génération)
-7. [Intégration LangChain](#7-intégration-langchain)
-8. [JavaScript / Node.js](#8-javascript--nodejs)
-9. [Comportement au premier appel](#9-comportement-au-premier-appel)
-10. [Codes d'erreur et solutions](#10-codes-derreur-et-solutions)
-11. [Limites et quotas](#11-limites-et-quotas)
-12. [Exemples complets par cas d'usage](#12-exemples-complets-par-cas-dusage)
+   - [6.1 Paramètres standard OpenAI](#61-paramètres-standard-openai)
+   - [6.2 Paramètres de sampling avancés (llama.cpp)](#62-paramètres-de-sampling-avancés-llamacpp)
+7. [Endpoints natifs llama.cpp](#7-endpoints-natifs-llamacpp)
+8. [Intégration LangChain](#8-intégration-langchain)
+9. [JavaScript / Node.js](#9-javascript--nodejs)
+10. [Comportement au premier appel](#10-comportement-au-premier-appel)
+11. [Codes d'erreur et solutions](#11-codes-derreur-et-solutions)
+12. [Limites et quotas](#12-limites-et-quotas)
+13. [Exemples complets par cas d'usage](#13-exemples-complets-par-cas-dusage)
 
 ---
 
@@ -408,6 +411,8 @@ curl -sN https://llm.eva.univ-pau.fr/v1/chat/completions \
 
 ## 6. Paramètres de génération
 
+### 6.1 Paramètres standard OpenAI
+
 Tous les paramètres standard OpenAI sont supportés :
 
 ```python
@@ -446,7 +451,305 @@ response = client.chat.completions.create(
 
 ---
 
-## 7. Intégration LangChain
+### 6.2 Paramètres de sampling avancés (llama.cpp)
+
+La gateway est un **proxy transparent** : tous les paramètres de sampling natifs de llama.cpp
+peuvent être passés directement dans le body de la requête `/v1/chat/completions`, en plus
+des paramètres OpenAI standard. Aucune configuration particulière n'est nécessaire.
+
+#### Contrôle du vocabulaire
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `top_k` | 40 | Limite le vocabulaire aux K tokens les plus probables |
+| `min_p` | 0.05 | Exclut les tokens avec moins de 5% de probabilité relative au top |
+
+#### Anti-répétition (essentiel pour les longues générations)
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `repeat_last_n` | 64 | Fenêtre de tokens analysée pour détecter les répétitions |
+| `repeat_penalty` | 1.0 | Pénalité de répétition (1.1 = légère, 1.3 = forte) |
+| `presence_penalty` | 0.0 | Pénalise tout token déjà apparu dans la génération |
+| `frequency_penalty` | 0.0 | Pénalise les tokens proportionnellement à leur fréquence |
+
+#### Sampler DRY — anti-répétition long-terme
+
+Conçu pour les générations de > 10 000 mots. Détecte et pénalise les séquences de tokens
+qui se répètent à long terme, là où `repeat_penalty` est insuffisant.
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `dry_multiplier` | 0.0 | Intensité (0 = désactivé, 0.5 = recommandé pour textes longs) |
+| `dry_base` | 1.75 | Facteur de base de la pénalité exponentielle |
+| `dry_allowed_length` | 2 | Longueur minimale d'une séquence répétée pour être pénalisée |
+| `dry_penalty_last_n` | -1 | Fenêtre de recherche (-1 = fenêtre de contexte entière) |
+
+#### Mirostat — contrôle entropique adaptatif
+
+Alternative à `temperature` + `top_p` : contrôle directement l'entropie du texte généré
+en ajustant dynamiquement les probabilités à chaque token.
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `mirostat` | 0 | 0 = désactivé, 1 = Mirostat v1, **2 = Mirostat 2.0 (recommandé)** |
+| `mirostat_tau` | 5.0 | Entropie cible (↓ = plus prévisible, ↑ = plus créatif) |
+| `mirostat_eta` | 0.1 | Taux d'adaptation — laisser à 0.1 dans la plupart des cas |
+
+#### Samplers avancés (XTC, Typical-P, TFS)
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `xtc_probability` | 0.0 | Probabilité d'élaguer les tokens très probables (0 = désactivé) |
+| `xtc_threshold` | 0.1 | Seuil de probabilité pour l'élagage XTC |
+| `typical_p` | 1.0 | Nucleus sampling « typique » (1.0 = désactivé) |
+| `tfs_z` | 1.0 | Tail-free sampling (1.0 = désactivé) |
+
+#### Contrôle d'exécution
+
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `n_predict` | — | Alias de `max_tokens` — nombre max de tokens à générer |
+| `seed` | aléatoire | Graine pour une génération reproductible (ex: `42`) |
+| `ignore_eos` | false | Ignorer le token de fin de séquence (génération forcée) |
+| `stop` | — | Séquences d'arrêt — pour les modèles Qwen/ChatML : `["<\|im_end\|>", "<\|endoftext\|>"]` |
+
+#### Exemple — génération longue avec paramètres avancés (Python)
+
+Avec le SDK `openai-python`, les paramètres llama.cpp natifs sont passés via `extra_body`.
+Le SDK les fusionne dans le root body avant envoi — llama.cpp les reçoit sans distinction.
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=600.0,  # prévoir large pour les longues générations
+)
+
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[
+        {
+            "role": "system",
+            "content": "Tu es un expert en prospective éducative. Rédige un texte académique exhaustif.",
+        },
+        {
+            "role": "user",
+            "content": "Rédige un chapitre complet sur : L'IA comme tuteur algorithmique universel",
+        },
+    ],
+
+    # ── Paramètres OpenAI standard ──────────────────────────────────────────
+    max_tokens=4096,
+    temperature=0.8,
+    top_p=0.95,
+    presence_penalty=0.0,
+    frequency_penalty=0.0,
+    stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+
+    # ── Paramètres llama.cpp natifs — transmis directement au moteur ────────
+    extra_body={
+        "top_k": 40,
+        "min_p": 0.05,
+        "repeat_last_n": 64,
+        "repeat_penalty": 1.1,
+        "dry_multiplier": 0.5,      # anti-répétition long-terme
+        "dry_base": 1.75,
+        "dry_allowed_length": 2,
+        "seed": 42,                 # reproductibilité
+        "ignore_eos": False,
+    },
+)
+
+print(response.choices[0].message.content)
+```
+
+> **Note :** Les paramètres dans `extra_body` sont fusionnés dans le body JSON par le SDK OpenAI.
+> llama.cpp les applique directement. La gateway ne filtre aucun paramètre — tout champ inconnu
+> est transmis tel quel vers llama-server.
+
+#### Exemple — curl avec paramètres avancés
+
+Les paramètres standard et avancés coexistent dans le même body JSON — pas de nesting nécessaire :
+
+```bash
+curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "messages": [{"role": "user", "content": "Rédige une introduction sur les LLMs."}],
+    "max_tokens": 2048,
+    "temperature": 0.8,
+    "top_k": 40,
+    "min_p": 0.05,
+    "repeat_last_n": 64,
+    "repeat_penalty": 1.1,
+    "dry_multiplier": 0.5,
+    "seed": 42
+  }'
+```
+
+---
+
+## 7. Endpoints natifs llama.cpp
+
+En plus des endpoints compatibles OpenAI, la gateway expose les endpoints natifs de llama.cpp.
+Ils bénéficient de la même authentification, du même rate limiting et de la même gestion
+VRAM automatique que les routes standard.
+
+### Completion native — `POST /completion` et `POST /v1/completion`
+
+Contrairement à `/v1/chat/completions` qui prend un tableau `messages` et applique un chat
+template, cet endpoint accepte un champ `prompt` (chaîne brute). Utile pour :
+
+- Les scripts llama.cpp existants
+- Les cas où vous gérez vous-même le formatage ChatML / Alpaca / autre
+- Les modèles sans chat template
+
+```bash
+curl -s https://llm.eva.univ-pau.fr/completion \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "prompt": "<|im_start|>user\nQu'\''est-ce qu'\''un LLM ?<|im_end|>\n<|im_start|>assistant\n",
+    "n_predict": 512,
+    "temperature": 0.7,
+    "repeat_penalty": 1.1,
+    "stop": ["<|im_end|>", "<|endoftext|>"]
+  }'
+```
+
+Réponse (format natif llama.cpp — différent du format OpenAI) :
+
+```json
+{
+  "content": "Un LLM (Large Language Model) est un modèle de langage...",
+  "stop": true,
+  "tokens_predicted": 87,
+  "tokens_evaluated": 42,
+  "generation_settings": { "temperature": 0.7, "top_k": 40, "..." : "..." }
+}
+```
+
+> **Attention :** La réponse n'est pas au format OpenAI (`choices[0].message.content`).
+> Lire le champ `content` directement.
+
+Python avec `httpx` (tous les paramètres avancés disponibles directement dans le body) :
+
+```python
+import httpx
+import os
+
+response = httpx.post(
+    "https://llm.eva.univ-pau.fr/completion",
+    headers={"Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}"},
+    json={
+        "model": "llama-3.3-70b-instruct",
+        "prompt": "La photosynthèse est",
+        "n_predict": 256,
+        "temperature": 0.5,
+        "top_k": 40,
+        "min_p": 0.05,
+        "repeat_last_n": 64,
+        "repeat_penalty": 1.1,
+        "dry_multiplier": 0.5,
+        "dry_base": 1.75,
+        "dry_allowed_length": 2,
+        "mirostat": 2,
+        "mirostat_tau": 5.0,
+        "mirostat_eta": 0.1,
+        "seed": 42,
+    },
+    timeout=120.0,
+)
+
+data = response.json()
+print(data["content"])
+print(f"Tokens prompt : {data['tokens_evaluated']}  |  Tokens générés : {data['tokens_predicted']}")
+```
+
+Les deux chemins sont équivalents :
+- `POST /completion` — chemin exact attendu par les scripts llama.cpp existants
+- `POST /v1/completion` — alias préfixé `/v1/`
+
+### Tokenisation — `POST /v1/tokenize`
+
+Compte précisément le nombre de tokens d'un texte **selon le tokenizer exact du modèle**,
+avant de l'envoyer. Utile pour éviter les erreurs de contexte dépassé.
+
+```bash
+curl -s https://llm.eva.univ-pau.fr/v1/tokenize \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "content": "Votre texte à tokeniser ici..."
+  }'
+# Réponse : {"tokens": [123, 456, 789, ...]}
+```
+
+Python — vérifier qu'un prompt tient dans le contexte avant envoi :
+
+```python
+import httpx
+import os
+
+def count_tokens(text: str, model: str = "llama-3.3-70b-instruct") -> int:
+    """Compte les tokens d'un texte selon le tokenizer exact du modèle."""
+    r = httpx.post(
+        "https://llm.eva.univ-pau.fr/v1/tokenize",
+        headers={"Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}"},
+        json={"model": model, "content": text},
+        timeout=10.0,
+    )
+    return len(r.json()["tokens"])
+
+
+MAX_CONTEXT = 32768  # tokens — dépend du modèle et de ctx_size (voir admin)
+
+prompt = open("mon_document_long.txt").read()
+token_count = count_tokens(prompt)
+
+if token_count > MAX_CONTEXT * 0.8:  # garde 20% pour la réponse
+    print(f"Prompt trop long ({token_count} tokens) — découper en chunks")
+else:
+    print(f"OK : {token_count} tokens  ({MAX_CONTEXT - token_count} disponibles pour la réponse)")
+```
+
+### Détokenisation — `POST /v1/detokenize`
+
+Reconstruit du texte depuis une liste de token IDs.
+
+```bash
+curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "tokens": [9468, 17403, 374, 264]
+  }'
+# Réponse : {"content": "La France est un"}
+```
+
+### Résumé des endpoints disponibles
+
+| Endpoint | Format entrée | Format réponse | Usage |
+|----------|--------------|----------------|-------|
+| `POST /v1/chat/completions` | `messages` (array) | OpenAI standard | Recommandé — chat template automatique |
+| `POST /v1/completions` | `prompt` (string) | OpenAI standard | Legacy OpenAI text completion |
+| `POST /completion` | `prompt` (string) | Natif llama.cpp | Scripts llama.cpp existants |
+| `POST /v1/completion` | `prompt` (string) | Natif llama.cpp | Alias de `/completion` |
+| `POST /v1/tokenize` | `content` (string) | `{"tokens": [...]}` | Compter les tokens avant envoi |
+| `POST /v1/detokenize` | `tokens` (array) | `{"content": "..."}` | Reconstruire du texte depuis des IDs |
+
+---
+
+## 8. Intégration LangChain
 
 ```python
 from langchain_openai import ChatOpenAI
@@ -512,7 +815,7 @@ print(result["result"])
 
 ---
 
-## 8. JavaScript / Node.js
+## 9. JavaScript / Node.js
 
 ```bash
 npm install openai
@@ -558,7 +861,7 @@ console.log();
 
 ---
 
-## 9. Comportement au premier appel
+## 10. Comportement au premier appel
 
 Les modèles ne sont **pas chargés en permanence** (pour économiser l'électricité et
 réduire le bruit des ventilateurs du serveur). Chaque modèle a son propre cycle
@@ -623,7 +926,7 @@ print("VRAM disponible :", status["vram_available_gb"], "GB")
 
 ---
 
-## 10. Codes d'erreur et solutions
+## 11. Codes d'erreur et solutions
 
 ### Vue d'ensemble
 
@@ -775,7 +1078,7 @@ for i, prompt in enumerate(prompts):
 
 ---
 
-## 11. Limites et quotas
+## 12. Limites et quotas
 
 | Limite | Valeur par défaut | Notes |
 |--------|-------------------|-------|
@@ -808,7 +1111,7 @@ print(f"Tokens estimés : {tokens}")
 
 ---
 
-## 12. Exemples complets par cas d'usage
+## 13. Exemples complets par cas d'usage
 
 ### Annotation d'un corpus de textes
 

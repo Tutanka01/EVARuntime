@@ -340,6 +340,24 @@ async def list_keys(
     return await db.list_keys_for_user(user["id"])
 
 
+@router.delete("/users/{username}", status_code=200)
+async def delete_user(
+    username: str,
+    _: None = Depends(require_admin),
+) -> dict:
+    """Supprime un utilisateur et toutes ses clés API (action irréversible)."""
+    user = await db.get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"Utilisateur '{username}' introuvable.")
+
+    deleted = await db.delete_user(user["id"])
+    if not deleted:
+        raise HTTPException(status_code=500, detail="Échec de la suppression.")
+
+    log.info("Admin : utilisateur '%s' supprimé", username)
+    return {"message": f"Utilisateur '{username}' supprimé avec succès."}
+
+
 @router.delete("/keys/{key_prefix}", status_code=200)
 async def revoke_key(
     key_prefix: str,

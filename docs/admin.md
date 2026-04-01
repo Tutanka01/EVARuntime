@@ -683,6 +683,27 @@ curl -s "$GW/admin/models" \
 | `GET` | `/admin/status` | Budget VRAM + état de tous les modèles |
 | `POST` | `/admin/unload` | Décharger tous les modèles chargés |
 
+### Endpoints d'inférence exposés aux utilisateurs
+
+Pour référence — ces routes sont accessibles par les utilisateurs avec leur clé API (Bearer token).
+Elles sont toutes soumises au rate limiting et à la gestion VRAM automatique.
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/v1/models` | Liste les modèles activés |
+| `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible, streaming supporté) |
+| `POST` | `/v1/completions` | Legacy text completion (OpenAI-compatible) |
+| `POST` | `/completion` | Completion native llama.cpp — prend un champ `prompt` string |
+| `POST` | `/v1/completion` | Alias de `/completion` |
+| `POST` | `/v1/tokenize` | Tokenise un texte — retourne les token IDs |
+| `POST` | `/v1/detokenize` | Reconstruit du texte depuis des token IDs |
+| `GET` | `/health` | Health check (non authentifié) |
+
+> **Paramètres avancés llama.cpp :** `/v1/chat/completions` et `/completion` acceptent tous les
+> paramètres de sampling natifs llama.cpp directement dans le body (`mirostat`, `dry_multiplier`,
+> `repeat_last_n`, `xtc_*`, etc.). La gateway les transmet sans filtrage vers llama-server.
+> Voir le guide utilisateur `docs/api.md` sections 6.2 et 7 pour les détails et exemples.
+
 **Exemple — vue d'ensemble du statut système :**
 
 ```bash

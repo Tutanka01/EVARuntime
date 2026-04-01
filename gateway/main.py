@@ -208,6 +208,39 @@ async def completions(
     return await proxy_request(request, "/v1/completions", user, model_manager)
 
 
+@app.post("/v1/completion")
+@app.post("/completion")
+async def raw_completion(
+    request: Request,
+    user: dict = Depends(check_rate_limit),
+):
+    """
+    Endpoint natif llama.cpp. Prend un champ 'prompt' (string) au lieu de 'messages'.
+    Tous les paramètres de sampling avancés sont supportés sans configuration particulière :
+    mirostat, dry_multiplier, dry_base, xtc_*, repeat_last_n, repeat_penalty, ignore_eos, etc.
+    Utile pour les scripts llama.cpp existants ou les cas sans chat template.
+    """
+    return await proxy_request(request, "/completion", user, model_manager)
+
+
+@app.post("/v1/tokenize")
+async def tokenize(
+    request: Request,
+    user: dict = Depends(check_rate_limit),
+):
+    """Tokenise un texte — retourne les token IDs. Body: {"model": "...", "content": "..."}"""
+    return await proxy_request(request, "/tokenize", user, model_manager)
+
+
+@app.post("/v1/detokenize")
+async def detokenize(
+    request: Request,
+    user: dict = Depends(check_rate_limit),
+):
+    """Reconstruit du texte depuis des token IDs. Body: {"model": "...", "tokens": [...]}"""
+    return await proxy_request(request, "/detokenize", user, model_manager)
+
+
 # ── Gestionnaire d'erreurs global ────────────────────────────────────────────
 
 @app.exception_handler(Exception)

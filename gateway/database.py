@@ -268,6 +268,14 @@ async def list_keys_for_user(user_id: int) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def delete_user(user_id: int) -> bool:
+    """Supprime définitivement un utilisateur et toutes ses clés (CASCADE). Retourne True si supprimé."""
+    async with get_db() as db:
+        cursor = await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
 async def touch_key_last_used(key_id: int) -> None:
     async with get_db() as db:
         await db.execute(

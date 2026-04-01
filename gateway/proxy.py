@@ -4,6 +4,10 @@ Proxy OpenAI-compatible vers llama-server.
 Endpoints gérés :
   POST /v1/chat/completions   — streaming SSE + non-streaming
   POST /v1/completions        — legacy completions
+  POST /v1/completion         — endpoint natif llama.cpp (prompt string, sans chat template)
+  POST /completion            — alias direct pour les scripts llama.cpp existants
+  POST /v1/tokenize           — tokenisation d'un texte
+  POST /v1/detokenize         — reconstruction texte depuis token IDs
   GET  /v1/models             — liste dynamique depuis le registre
 
 Design :
@@ -12,6 +16,14 @@ Design :
 - On injecte l'Authorization interne (clé gateway ↔ llama-server)
 - On log l'usage en fire-and-forget après chaque requête terminée
 - Pour le streaming : on désactive tout buffering nginx/uvicorn via les headers
+
+Proxy transparent — paramètres llama.cpp natifs :
+  Le body JSON est forwardé tel quel vers llama-server. Tous les paramètres de sampling
+  avancés sont supportés sans configuration particulière, que ce soit via /v1/chat/completions
+  (superset OpenAI) ou /completion (endpoint natif) :
+  mirostat, mirostat_tau, mirostat_eta, dry_multiplier, dry_base, dry_allowed_length,
+  repeat_last_n, repeat_penalty, top_k, min_p, tfs_z, typical_p,
+  xtc_probability, xtc_threshold, ignore_eos, n_predict, seed, etc.
 
 Point critique SSE :
   nginx doit avoir proxy_buffering off et X-Accel-Buffering: no
@@ -167,7 +179,12 @@ async def _non_stream_proxy(
         if has_any_tool_calls and msg.get("content"):
             msg["content"] = None
 
-    usage = data.get("usage", {})
+    # Supporte le format OpenAI {"usage": {...}} ET le format natif llama.cpp /completion
+    # qui retourne {"tokens_predicted": N, "tokens_evaluated": M} à la racine.
+    usage = data.get("usage") or {
+        "prompt_tokens": data.get("tokens_evaluated", 0),
+        "completion_tokens": data.get("tokens_predicted", 0),
+    }
     asyncio.create_task(db.log_usage(
         user_id=user["user_id"],
         key_id=user["key_id"],

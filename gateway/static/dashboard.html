@@ -610,6 +610,82 @@
     }
     .btn-confirm-del:hover { opacity: .85; }
     @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+
+    /* ── User management section ─────────────────────────────────────── */
+    .users-mgmt-section {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden;
+      box-shadow: var(--shadow-sm); margin-bottom: 10px;
+    }
+    .users-mgmt-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-bottom: 1px solid var(--border);
+    }
+    .users-mgmt-title {
+      font-size: 12.5px; font-weight: 600;
+      display: flex; align-items: center; gap: 7px; color: var(--text);
+    }
+    .users-mgmt-title svg { color: var(--text3); }
+    .users-count-badge {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 1px 7px;
+      font-size: 10.5px; font-weight: 600; color: var(--text2);
+    }
+    .users-mgmt-table { width: 100%; border-collapse: collapse; }
+    .users-mgmt-table thead th {
+      font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px;
+      color: var(--text3); padding: 8px 14px; text-align: left;
+      border-bottom: 1px solid var(--border); background: var(--surface2); white-space: nowrap;
+    }
+    .users-mgmt-table tbody tr { border-bottom: 1px solid var(--border); }
+    .users-mgmt-table tbody tr:last-child { border-bottom: none; }
+    .users-mgmt-table tbody tr:hover { background: var(--surface2); }
+    .users-mgmt-table tbody td { padding: 9px 14px; vertical-align: middle; }
+
+    /* ── Key reveal ──────────────────────────────────────────────────── */
+    .key-reveal-warn {
+      background: var(--amber-bg); border: 1px solid var(--amber-brd);
+      border-radius: var(--radius-sm); padding: 10px 13px;
+      color: var(--amber); font-size: 12px; font-weight: 500;
+      margin-bottom: 14px; display: flex; align-items: flex-start; gap: 8px; line-height: 1.45;
+    }
+    .key-reveal-warn svg { flex-shrink: 0; margin-top: 1px; }
+    .key-reveal-box {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 12px 14px;
+      display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+    }
+    .key-reveal-code {
+      font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+      color: var(--text); word-break: break-all; flex: 1; line-height: 1.5;
+      user-select: all;
+    }
+    .btn-copy {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text2);
+      cursor: pointer; font-size: 11px; font-weight: 500;
+      padding: 5px 10px; white-space: nowrap; flex-shrink: 0;
+      transition: background .12s, color .12s, border-color .12s;
+      font-family: 'Inter', sans-serif;
+    }
+    .btn-copy:hover { background: var(--surface3); color: var(--text); }
+    .btn-copy.copied { background: var(--green-bg); border-color: var(--green-brd); color: var(--green); }
+
+    /* ── Keys modal list ─────────────────────────────────────────────── */
+    .key-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 0; border-bottom: 1px solid var(--border);
+    }
+    .key-row:last-child { border-bottom: none; }
+    .key-row-main { flex: 1; min-width: 0; }
+    .key-prefix-lbl { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; }
+    .key-name-lbl   { font-size: 11px; color: var(--text2); margin-top: 1px; }
+    .key-meta-lbl   { font-size: 10.5px; color: var(--text3); margin-top: 2px; }
+    .keys-generate-form {
+      display: flex; gap: 8px; align-items: flex-end; margin-bottom: 14px;
+      padding-bottom: 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap;
+    }
+    .keys-generate-form .form-group { margin-bottom: 0; flex: 1; min-width: 120px; }
   </style>
 </head>
 <body>
@@ -804,6 +880,169 @@
   </div>
 </div>
 
+<!-- Add User Modal -->
+<div id="add-user-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeAddUser()">
+  <div class="modal-card" style="max-width:480px">
+    <div class="modal-head">
+      <h3>Add User</h3>
+      <button class="modal-close" onclick="closeAddUser()" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <form id="add-user-form" onsubmit="return false;" autocomplete="off">
+      <div class="modal-body">
+        <div id="add-user-err" class="modal-err-banner"></div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="au-username">Username <span class="req">*</span></label>
+            <input class="form-input" type="text" id="au-username" placeholder="alice" autocomplete="off" spellcheck="false" />
+            <div class="form-hint">Letters, digits, _ . - · 2–64 chars.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="au-email">Email</label>
+            <input class="form-input" type="email" id="au-email" placeholder="alice@university.edu" style="font-family:'Inter',sans-serif" autocomplete="off" />
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="au-rpm">RPM limit</label>
+            <input class="form-input" type="number" id="au-rpm" placeholder="20" min="1" max="1000" />
+            <div class="form-hint">Requests / min (default: 20).</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="au-mtl">Monthly tokens</label>
+            <input class="form-input" type="number" id="au-mtl" placeholder="0 = unlimited" min="0" />
+            <div class="form-hint">0 = unlimited.</div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="au-notes">Notes</label>
+          <input class="form-input" type="text" id="au-notes" placeholder="Optional admin notes…" maxlength="500" style="font-family:'Inter',sans-serif" />
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" type="button" onclick="closeAddUser()">Cancel</button>
+        <button class="btn-add-model" id="btn-submit-user" type="button" onclick="submitAddUser()">Create User</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Edit User Modal -->
+<div id="edit-user-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeEditUser()">
+  <div class="modal-card" style="max-width:480px">
+    <div class="modal-head">
+      <h3 id="edit-user-title">Edit User</h3>
+      <button class="modal-close" onclick="closeEditUser()" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <form id="edit-user-form" onsubmit="return false;" autocomplete="off">
+      <div class="modal-body">
+        <div id="edit-user-err" class="modal-err-banner"></div>
+        <div class="form-group">
+          <label class="form-label">Account status</label>
+          <label class="toggle" style="display:inline-flex;align-items:center;gap:10px;cursor:pointer;margin-top:5px">
+            <input type="checkbox" id="eu-active" onchange="document.getElementById('eu-active-label').textContent=this.checked?'Active':'Suspended'" />
+            <span class="toggle-slider"></span>
+            <span style="font-size:12px;color:var(--text2)" id="eu-active-label">Active</span>
+          </label>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="eu-email">Email</label>
+            <input class="form-input" type="email" id="eu-email" placeholder="alice@university.edu" style="font-family:'Inter',sans-serif" />
+          </div>
+          <div class="form-group"></div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="eu-rpm">RPM limit</label>
+            <input class="form-input" type="number" id="eu-rpm" min="1" max="1000" />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="eu-mtl">Monthly tokens</label>
+            <input class="form-input" type="number" id="eu-mtl" min="0" />
+            <div class="form-hint">0 = unlimited.</div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="eu-notes">Notes</label>
+          <input class="form-input" type="text" id="eu-notes" maxlength="500" style="font-family:'Inter',sans-serif" />
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn" type="button" onclick="closeEditUser()">Cancel</button>
+        <button class="btn-add-model" id="btn-submit-edit-user" type="button" onclick="submitEditUser()">Save Changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Keys Modal -->
+<div id="keys-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeKeysModal()">
+  <div class="modal-card" style="max-width:640px">
+    <div class="modal-head">
+      <h3>API Keys &mdash; <span id="keys-modal-username" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500"></span></h3>
+      <button class="modal-close" onclick="closeKeysModal()" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="keys-generate-form">
+        <div class="form-group">
+          <label class="form-label" for="new-key-name">Key name</label>
+          <input class="form-input" type="text" id="new-key-name" placeholder="e.g. laptop-dev" maxlength="64" style="font-family:'Inter',sans-serif" autocomplete="off" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="new-key-expiry">Expires (optional)</label>
+          <input class="form-input" type="date" id="new-key-expiry" style="font-family:'Inter',sans-serif" />
+        </div>
+        <button class="btn-add-model" id="btn-generate-key" onclick="doGenerateKey()" style="flex-shrink:0;align-self:flex-end">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+          Generate Key
+        </button>
+      </div>
+      <div id="keys-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Key Reveal Modal (z-index above keys modal) -->
+<div id="key-reveal-modal" class="modal-overlay hidden" style="z-index:700">
+  <div class="modal-card" style="max-width:500px">
+    <div class="modal-head">
+      <h3>New API Key Created</h3>
+    </div>
+    <div class="modal-body">
+      <div class="key-reveal-warn">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span>This key will <strong>never be shown again</strong>. Copy it now and store it in a secure location (password manager, .env file, etc.).</span>
+      </div>
+      <div class="key-reveal-box">
+        <span class="key-reveal-code" id="key-reveal-value"></span>
+        <button class="btn-copy" id="btn-copy-key" onclick="copyKey()">Copy</button>
+      </div>
+      <div id="key-reveal-meta" style="font-size:11.5px;color:var(--text2);line-height:1.5"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-add-model" onclick="closeKeyReveal()">Done — key saved</button>
+    </div>
+  </div>
+</div>
+
+<!-- Delete User Confirm -->
+<div id="confirm-user-del-overlay" class="confirm-overlay hidden" onclick="if(event.target===this)cancelDeleteUser()">
+  <div class="confirm-card">
+    <h4>Delete user?</h4>
+    <p>User <strong id="confirm-user-del-name" style="font-family:'JetBrains Mono',monospace;font-size:12px"></strong> and all their API keys will be permanently deleted. This cannot be undone.</p>
+    <div class="confirm-actions">
+      <button class="btn-cancel-del" onclick="cancelDeleteUser()">Cancel</button>
+      <button class="btn-confirm-del" id="btn-confirm-user-del" onclick="doConfirmDeleteUser()">Delete</button>
+    </div>
+  </div>
+</div>
+
 <!-- Main -->
 <div class="page">
 
@@ -890,6 +1129,39 @@
         </thead>
         <tbody id="models-tbody">
           <tr><td colspan="6" class="empty-state">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- User Management -->
+  <div class="users-mgmt-section">
+    <div class="users-mgmt-header">
+      <div class="users-mgmt-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        Users
+        <span class="users-count-badge" id="users-mgmt-count">—</span>
+      </div>
+      <button class="btn-add-model" onclick="openAddUser()">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add User
+      </button>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="users-mgmt-table">
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Email</th>
+            <th>Status</th>
+            <th>RPM</th>
+            <th>Monthly quota</th>
+            <th>Created</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="users-mgmt-tbody">
+          <tr><td colspan="7" class="empty-state">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1519,6 +1791,7 @@ async function fetchAll() {
     fetchUsers(),
     fetchLlama(),
     fetchModels(),
+    fetchUsersManagement(),
   ]);
   const now = new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', hour12: false });
   setText('last-updated', 'Updated ' + now);
@@ -1927,11 +2200,332 @@ function showToast(msg, type) {
   setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity .3s'; setTimeout(() => toast.remove(), 300); }, 4000);
 }
 
+// ── User Management ────────────────────────────────────────────────
+let _usersCache = [];
+
+async function fetchUsersManagement() {
+  try {
+    const res = await fetch('/admin/users', {
+      headers: { 'Authorization': 'Bearer ' + _token }
+    });
+    if (res.status === 403) { doLogout(); return; }
+    if (!res.ok) return;
+    _usersCache = await res.json();
+    renderUsersManagement(_usersCache);
+  } catch(e) { console.error('fetchUsersManagement', e); }
+}
+
+const EDIT_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`;
+const KEY_SVG  = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>`;
+const USR_DEL_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
+
+function renderUsersManagement(users) {
+  const tbody = document.getElementById('users-mgmt-tbody');
+  const countEl = document.getElementById('users-mgmt-count');
+  if (countEl) countEl.textContent = users.length;
+  if (!users.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No users yet. Click "Add User" to create the first one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = users.map(u => {
+    const un = esc(u.username);
+    const quotaStr = u.monthly_token_limit > 0 ? fmt(u.monthly_token_limit) + ' tok' : '<span style="color:var(--text3)">∞ unlimited</span>';
+    return `<tr>
+      <td>
+        <div style="font-weight:500;${u.is_active ? '' : 'color:var(--text3)'}">${un}</div>
+        ${u.notes ? '<div style="font-size:10.5px;color:var(--text3);margin-top:1px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(u.notes) + '">' + esc(u.notes) + '</div>' : ''}
+      </td>
+      <td style="font-size:11.5px;color:var(--text2)">${u.email ? esc(u.email) : '<span style="color:var(--text3)">—</span>'}</td>
+      <td><span class="pill ${u.is_active ? 'active' : 'inactive'}">${u.is_active ? 'active' : 'suspended'}</span></td>
+      <td class="mono" style="font-size:11.5px">${u.rpm_limit}/m</td>
+      <td style="font-size:11.5px">${quotaStr}</td>
+      <td style="font-size:11.5px;color:var(--text3)">${fmtRelative(u.created_at)}</td>
+      <td>
+        <div class="action-group">
+          <button class="btn-action" onclick="openEditUser('${un}')" title="Edit user">${EDIT_SVG} Edit</button>
+          <button class="btn-action" onclick="openKeysModal('${un}')" title="Manage API keys">${KEY_SVG} Keys</button>
+          <button class="btn-action danger" onclick="confirmDeleteUser('${un}')" title="Delete user">${USR_DEL_SVG} Delete</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Add User ───────────────────────────────────────────────────────
+function openAddUser() {
+  document.getElementById('add-user-form').reset();
+  const banner = document.getElementById('add-user-err');
+  banner.classList.remove('show'); banner.textContent = '';
+  document.getElementById('add-user-modal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('au-username').focus(), 50);
+}
+
+function closeAddUser() {
+  document.getElementById('add-user-modal').classList.add('hidden');
+}
+
+async function submitAddUser() {
+  const banner = document.getElementById('add-user-err');
+  banner.classList.remove('show');
+
+  const username = document.getElementById('au-username').value.trim();
+  const email    = document.getElementById('au-email').value.trim() || null;
+  const rpmRaw   = document.getElementById('au-rpm').value.trim();
+  const mtlRaw   = document.getElementById('au-mtl').value.trim();
+  const notes    = document.getElementById('au-notes').value.trim() || null;
+
+  if (!username) {
+    banner.textContent = 'Username is required.';
+    banner.classList.add('show');
+    document.getElementById('au-username').focus();
+    return;
+  }
+  if (!/^[a-zA-Z0-9_.\-]{2,64}$/.test(username)) {
+    banner.textContent = 'Username: 2–64 chars, letters/digits/_ . - only.';
+    banner.classList.add('show');
+    return;
+  }
+
+  const body = { username, notes };
+  if (email) body.email = email;
+  if (rpmRaw) body.rpm_limit = parseInt(rpmRaw);
+  body.monthly_token_limit = mtlRaw ? parseInt(mtlRaw) : 0;
+
+  const btn = document.getElementById('btn-submit-user');
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    await apiPost('users', body);
+    closeAddUser();
+    await fetchUsersManagement();
+    showToast("User '" + username + "' created.", 'ok');
+  } catch(e) {
+    banner.textContent = e.detail || e.message || 'Unknown error';
+    banner.classList.add('show');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create User';
+  }
+}
+
+// ── Edit User ──────────────────────────────────────────────────────
+let _editUsername = null;
+
+function openEditUser(username) {
+  _editUsername = username;
+  const u = _usersCache.find(x => x.username === username);
+  if (!u) return;
+  document.getElementById('edit-user-title').textContent = 'Edit — ' + username;
+  document.getElementById('eu-email').value  = u.email || '';
+  document.getElementById('eu-rpm').value    = u.rpm_limit;
+  document.getElementById('eu-mtl').value    = u.monthly_token_limit;
+  document.getElementById('eu-notes').value  = u.notes || '';
+  const chk = document.getElementById('eu-active');
+  chk.checked = !!u.is_active;
+  document.getElementById('eu-active-label').textContent = u.is_active ? 'Active' : 'Suspended';
+  const banner = document.getElementById('edit-user-err');
+  banner.classList.remove('show'); banner.textContent = '';
+  document.getElementById('edit-user-modal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('eu-email').focus(), 50);
+}
+
+function closeEditUser() {
+  document.getElementById('edit-user-modal').classList.add('hidden');
+  _editUsername = null;
+}
+
+async function submitEditUser() {
+  if (!_editUsername) return;
+  const banner = document.getElementById('edit-user-err');
+  banner.classList.remove('show');
+
+  const email  = document.getElementById('eu-email').value.trim() || null;
+  const rpm    = parseInt(document.getElementById('eu-rpm').value) || null;
+  const mtl    = parseInt(document.getElementById('eu-mtl').value);
+  const notes  = document.getElementById('eu-notes').value.trim() || null;
+  const active = document.getElementById('eu-active').checked;
+
+  const body = { is_active: active, monthly_token_limit: isNaN(mtl) ? 0 : mtl };
+  if (email !== null) body.email = email;
+  if (rpm)  body.rpm_limit = rpm;
+  if (notes !== null) body.notes = notes;
+
+  const btn = document.getElementById('btn-submit-edit-user');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    await apiPatch('users/' + _editUsername, body);
+    closeEditUser();
+    await fetchUsersManagement();
+    showToast("User '" + _editUsername + "' updated.", 'ok');
+  } catch(e) {
+    banner.textContent = e.detail || e.message || 'Unknown error';
+    banner.classList.add('show');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save Changes';
+  }
+}
+
+// ── Keys Modal ─────────────────────────────────────────────────────
+let _keysUsername = null;
+
+async function openKeysModal(username) {
+  _keysUsername = username;
+  document.getElementById('keys-modal-username').textContent = username;
+  document.getElementById('new-key-name').value   = '';
+  document.getElementById('new-key-expiry').value = '';
+  document.getElementById('keys-modal').classList.remove('hidden');
+  await fetchUserKeys();
+}
+
+function closeKeysModal() {
+  document.getElementById('keys-modal').classList.add('hidden');
+  _keysUsername = null;
+}
+
+async function fetchUserKeys() {
+  const list = document.getElementById('keys-list');
+  list.innerHTML = '<div style="text-align:center;padding:20px 0;color:var(--text3);font-size:12.5px">Loading…</div>';
+  try {
+    const res = await fetch('/admin/users/' + encodeURIComponent(_keysUsername) + '/keys', {
+      headers: { 'Authorization': 'Bearer ' + _token }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    renderKeysList(await res.json());
+  } catch(e) {
+    list.innerHTML = '<div style="color:var(--red);padding:12px;font-size:12px">' + esc(e.message) + '</div>';
+  }
+}
+
+const REVOKE_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`;
+
+function renderKeysList(keys) {
+  const list = document.getElementById('keys-list');
+  if (!keys.length) {
+    list.innerHTML = '<div class="empty-state" style="padding:20px 0">No API keys yet. Generate one above.</div>';
+    return;
+  }
+  const active  = keys.filter(k => k.is_active);
+  const revoked = keys.filter(k => !k.is_active);
+  const renderKey = k => {
+    const isActive  = !!k.is_active;
+    const expStr    = k.expires_at ? 'expires ' + fmtRelative(k.expires_at) : 'no expiry';
+    const lastUsed  = k.last_used ? 'last used ' + fmtRelative(k.last_used) : 'never used';
+    return `<div class="key-row">
+      <div class="key-row-main">
+        <div class="key-prefix-lbl">${esc(k.key_prefix)}…</div>
+        <div class="key-name-lbl">${k.name ? esc(k.name) : '<em style="color:var(--text3)">unnamed</em>'}</div>
+        <div class="key-meta-lbl">Created ${fmtRelative(k.created_at)} · ${lastUsed} · ${expStr}</div>
+      </div>
+      <span class="pill ${isActive ? 'active' : 'inactive'}" style="flex-shrink:0">${isActive ? 'active' : 'revoked'}</span>
+      ${isActive
+        ? `<button class="btn-action danger" onclick="doRevokeKey('${esc(k.key_prefix)}')" style="flex-shrink:0">${REVOKE_SVG} Revoke</button>`
+        : `<span style="width:62px"></span>`
+      }
+    </div>`;
+  };
+  list.innerHTML = active.map(renderKey).join('') + (revoked.length ? `
+    <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--text3);margin:12px 0 6px">Revoked (${revoked.length})</div>
+    ${revoked.map(renderKey).join('')}` : '');
+}
+
+async function doGenerateKey() {
+  if (!_keysUsername) return;
+  const nameVal   = document.getElementById('new-key-name').value.trim() || null;
+  const expiryVal = document.getElementById('new-key-expiry').value || null;
+  const expires_at = expiryVal ? new Date(expiryVal).toISOString() : null;
+
+  const btn = document.getElementById('btn-generate-key');
+  btn.disabled = true; btn.textContent = 'Generating…';
+  try {
+    const data = await apiPost('users/' + encodeURIComponent(_keysUsername) + '/keys', { name: nameVal, expires_at });
+    document.getElementById('new-key-name').value   = '';
+    document.getElementById('new-key-expiry').value = '';
+    await fetchUserKeys();
+    showKeyReveal(data.api_key, data.key_prefix, data.name, expiryVal);
+  } catch(e) {
+    showToast('Key generation failed: ' + (e.detail || e.message), 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Generate Key';
+  }
+}
+
+async function doRevokeKey(prefix) {
+  if (!confirm('Revoke key ' + prefix + '…? This is immediate and irreversible.')) return;
+  try {
+    await apiDel('keys/' + encodeURIComponent(prefix));
+    showToast('Key ' + prefix + '… revoked.', 'ok');
+    await fetchUserKeys();
+  } catch(e) {
+    showToast('Revoke failed: ' + (e.detail || e.message), 'error');
+  }
+}
+
+// ── Key Reveal ─────────────────────────────────────────────────────
+function showKeyReveal(rawKey, prefix, name, expiryDate) {
+  document.getElementById('key-reveal-value').textContent = rawKey;
+  const lines = [
+    '<strong>Prefix:</strong> ' + esc(prefix) + '…',
+    name ? '<strong>Name:</strong> ' + esc(name) : null,
+    expiryDate ? '<strong>Expires:</strong> ' + esc(expiryDate) : '<strong>Expires:</strong> never',
+  ].filter(Boolean).join(' &nbsp;·&nbsp; ');
+  document.getElementById('key-reveal-meta').innerHTML = lines;
+  const btn = document.getElementById('btn-copy-key');
+  btn.textContent = 'Copy'; btn.classList.remove('copied');
+  document.getElementById('key-reveal-modal').classList.remove('hidden');
+}
+
+function closeKeyReveal() {
+  document.getElementById('key-reveal-modal').classList.add('hidden');
+}
+
+function copyKey() {
+  const val = document.getElementById('key-reveal-value').textContent;
+  navigator.clipboard.writeText(val).then(() => {
+    const btn = document.getElementById('btn-copy-key');
+    btn.textContent = 'Copied!'; btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
+  });
+}
+
+// ── Delete User ────────────────────────────────────────────────────
+let _pendingDeleteUser = null;
+
+function confirmDeleteUser(username) {
+  _pendingDeleteUser = username;
+  document.getElementById('confirm-user-del-name').textContent = username;
+  document.getElementById('confirm-user-del-overlay').classList.remove('hidden');
+}
+
+function cancelDeleteUser() {
+  _pendingDeleteUser = null;
+  document.getElementById('confirm-user-del-overlay').classList.add('hidden');
+}
+
+async function doConfirmDeleteUser() {
+  if (!_pendingDeleteUser) return;
+  const username = _pendingDeleteUser;
+  const btn = document.getElementById('btn-confirm-user-del');
+  btn.disabled = true; btn.textContent = 'Deleting…';
+  cancelDeleteUser();
+  try {
+    await apiDel('users/' + encodeURIComponent(username));
+    showToast("User '" + username + "' deleted.", 'ok');
+    await fetchUsersManagement();
+  } catch(e) {
+    showToast('Delete failed: ' + (e.detail || e.message), 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Delete';
+  }
+}
+
 // Close modals on Escape key
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
-    if (!document.getElementById('add-model-modal').classList.contains('hidden')) closeAddModel();
-    if (!document.getElementById('confirm-overlay').classList.contains('hidden')) cancelDelete();
+    if (!document.getElementById('key-reveal-modal').classList.contains('hidden'))     { closeKeyReveal(); return; }
+    if (!document.getElementById('keys-modal').classList.contains('hidden'))           { closeKeysModal(); return; }
+    if (!document.getElementById('add-user-modal').classList.contains('hidden'))       { closeAddUser(); return; }
+    if (!document.getElementById('edit-user-modal').classList.contains('hidden'))      { closeEditUser(); return; }
+    if (!document.getElementById('confirm-user-del-overlay').classList.contains('hidden')) { cancelDeleteUser(); return; }
+    if (!document.getElementById('add-model-modal').classList.contains('hidden'))      { closeAddModel(); return; }
+    if (!document.getElementById('confirm-overlay').classList.contains('hidden'))      { cancelDelete(); return; }
   }
 });
 </script>
