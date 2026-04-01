@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     # ── Chemins ────────────────────────────────────────────────────────────────
-    models_config_path: Path = Path("/etc/llm-gateway/models.yaml")
+    models_config_path: Path = Path("/var/lib/llm-gateway/models.yaml")
     llama_server_bin: Path = Path("/usr/local/bin/llama-server")
     db_path: Path = Path("/var/lib/llm-gateway/gateway.db")
     log_dir: Path = Path("/var/log/llm-gateway")
