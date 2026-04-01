@@ -2241,20 +2241,13 @@ let _usersCache = [];
 
 async function fetchUsersManagement() {
   try {
-    const headers = { 'Authorization': 'Bearer ' + _token };
-    const [usersRes, summaryRes] = await Promise.all([
-      fetch('/admin/users',          { headers }),
-      fetch('/admin/usage/summary',  { headers }),
-    ]);
-    if (usersRes.status === 403) { doLogout(); return; }
-    if (!usersRes.ok) return;
-    _usersCache = await usersRes.json();
-    const summaryByUser = {};
-    if (summaryRes.ok) {
-      const summary = await summaryRes.json();
-      for (const s of summary) summaryByUser[s.username] = s;
-    }
-    renderUsersManagement(_usersCache, summaryByUser);
+    const res = await fetch('/admin/users', {
+      headers: { 'Authorization': 'Bearer ' + _token }
+    });
+    if (res.status === 403) { doLogout(); return; }
+    if (!res.ok) return;
+    _usersCache = await res.json();
+    renderUsersManagement(_usersCache);
   } catch(e) { console.error('fetchUsersManagement', e); }
 }
 
@@ -2262,7 +2255,7 @@ const EDIT_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" st
 const KEY_SVG  = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>`;
 const USR_DEL_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
 
-function renderUsersManagement(users, summaryByUser = {}) {
+function renderUsersManagement(users) {
    const tbody = document.getElementById('users-mgmt-tbody');
    const countEl = document.getElementById('users-mgmt-count');
    if (countEl) countEl.textContent = users.length;
@@ -2273,8 +2266,6 @@ function renderUsersManagement(users, summaryByUser = {}) {
    tbody.innerHTML = users.map(u => {
      const un = esc(u.username);
      const quotaStr = u.monthly_token_limit > 0 ? fmt(u.monthly_token_limit) + ' tok' : '<span style="color:var(--text3)">∞ unlimited</span>';
-     const s = summaryByUser[u.username] || {};
-     const costCell = renderClaudeCostCell(s.total_prompt_tokens, s.total_completion_tokens);
      return `<tr>
        <td>
          <div style="font-weight:500;${u.is_active ? '' : 'color:var(--text3)'}">${un}</div>
