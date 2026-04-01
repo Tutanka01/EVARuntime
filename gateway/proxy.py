@@ -123,6 +123,20 @@ async def _non_stream_proxy(
     duration_ms = int((time.monotonic() - start_time) * 1000)
     data = response.json()
 
+    # Normaliser le nom du modèle
+    data["model"] = settings.model_public_name
+
+    has_any_tool_calls = any(
+        choice.get("message", {}).get("tool_calls")
+        for choice in data.get("choices", [])
+    )
+    for choice in data.get("choices", []):
+        msg = choice.get("message", {})
+        msg.pop("reasoning_content", None)
+        # Si le modèle fait un tool_call, supprimer le content textuel superflu
+        if has_any_tool_calls and msg.get("content"):
+            msg["content"] = None
+
     usage = data.get("usage", {})
     asyncio.create_task(db.log_usage(
         user_id=user["user_id"],
@@ -149,11 +163,16 @@ async def _stream_proxy(
 ) -> AsyncGenerator[bytes, None]:
     """
     Générateur async qui pipe les chunks SSE de llama-server vers le client.
-    Capture l'usage depuis le dernier chunk (OpenAI stream_options.include_usage).
+
+    Quand la requête contient des tools : on bufferise tout le stream pour
+    détecter si le modèle fait un tool_call. Si oui, on supprime le texte
+    "thinking aloud" (content) avant les tool_calls — le SDK Vercel AI
+    n'accepte pas un stream avec content + tool_calls mélangés.
     """
     prompt_tokens = 0
     completion_tokens = 0
     status_code = 200
+    has_tools = bool(body.get("tools"))
 
     # Demander à llama-server d'inclure l'usage dans le stream
     body_with_usage = {**body, "stream_options": {"include_usage": True}}
@@ -168,23 +187,76 @@ async def _stream_proxy(
             ) as response:
                 status_code = response.status_code
 
-                async for line in response.aiter_lines():
-                    if not line:
-                        # Ligne vide = séparateur SSE, on la transmet
-                        yield b"\n"
-                        continue
+                if has_tools:
+                    # ── Mode bufferisé (requête avec tools) ──────────────────
+                    chunks: list[dict] = []
+                    has_tool_calls = False
 
-                    yield (line + "\n\n").encode()
+                    async for line in response.aiter_lines():
+                        if not line or line == "data: [DONE]":
+                            continue
+                        if line.startswith("data: "):
+                            try:
+                                chunk = json.loads(line[6:])
+                                if "model" in chunk:
+                                    chunk["model"] = settings.model_public_name
+                                for choice in chunk.get("choices", []):
+                                    delta = choice.get("delta", {})
+                                    delta.pop("reasoning_content", None)
+                                    if delta.get("tool_calls"):
+                                        has_tool_calls = True
+                                if usage := chunk.get("usage"):
+                                    prompt_tokens = usage.get("prompt_tokens", 0)
+                                    completion_tokens = usage.get("completion_tokens", 0)
+                                chunks.append(chunk)
+                            except json.JSONDecodeError:
+                                pass
 
-                    # Parser les chunks pour extraire l'usage final
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            chunk = json.loads(line[6:])
-                            if usage := chunk.get("usage"):
-                                prompt_tokens = usage.get("prompt_tokens", 0)
-                                completion_tokens = usage.get("completion_tokens", 0)
-                        except json.JSONDecodeError:
-                            pass
+                    # Si tool_calls détectés → supprimer le texte superflu (non-standard)
+                    # On garde content: null (premier chunk de rôle), on strip le texte réel
+                    for chunk in chunks:
+                        if has_tool_calls:
+                            for choice in chunk.get("choices", []):
+                                delta = choice.get("delta", {})
+                                if delta.get("content") and not delta.get("tool_calls"):
+                                    delta.pop("content", None)
+
+                        # Émettre uniquement les chunks non-vides
+                        choices = chunk.get("choices", [])
+                        all_empty = all(
+                            not choice.get("delta") and choice.get("finish_reason") is None
+                            for choice in choices
+                        ) if choices else False
+                        if not all_empty or not choices:
+                            yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()
+
+                    yield b"data: [DONE]\n\n"
+
+                else:
+                    # ── Mode streaming direct (sans tools) ───────────────────
+                    async for line in response.aiter_lines():
+                        if not line:
+                            yield b"\n"
+                            continue
+
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                chunk = json.loads(line[6:])
+                                if "model" in chunk:
+                                    chunk["model"] = settings.model_public_name
+                                for choice in chunk.get("choices", []):
+                                    delta = choice.get("delta", {})
+                                    reasoning = delta.pop("reasoning_content", None)
+                                    if reasoning and not delta.get("content"):
+                                        delta["content"] = reasoning
+                                if usage := chunk.get("usage"):
+                                    prompt_tokens = usage.get("prompt_tokens", 0)
+                                    completion_tokens = usage.get("completion_tokens", 0)
+                                line = "data: " + json.dumps(chunk, ensure_ascii=False)
+                            except json.JSONDecodeError:
+                                pass
+
+                        yield (line + "\n\n").encode()
 
     except httpx.TimeoutException:
         err = _sse_error("Timeout d'inférence dépassé.")
