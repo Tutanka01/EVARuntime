@@ -72,8 +72,11 @@ class ModelManager:
             )
 
         # Fast path : déjà READY (pas de lock nécessaire)
+        # On passe quand même par ensure_loaded() pour mettre à jour _last_request_time
+        # (fenêtre glissante d'inactivité). Le fast path interne d'ensure_loaded est sans overhead.
         manager = self._managers.get(model_id)
         if manager and manager.state == ModelState.READY:
+            await manager.ensure_loaded()
             return manager
 
         # Slow path : sous lock
