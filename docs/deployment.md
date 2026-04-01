@@ -16,8 +16,9 @@ de la mise en production.
 6. [Certificat TLS](#6-certificat-tls)
 7. [Configuration nginx](#7-configuration-nginx)
 8. [Démarrage et vérification](#8-démarrage-et-vérification)
-9. [Mise à jour](#9-mise-à-jour)
-10. [Dépannage](#10-dépannage)
+9. [Dashboard de monitoring](#9-dashboard-de-monitoring)
+10. [Mise à jour](#10-mise-à-jour)
+11. [Dépannage](#11-dépannage)
 
 ---
 
@@ -333,18 +334,119 @@ sudo journalctl -u llm-gateway -p err --since "1 hour ago"
 
 ---
 
-## 9. Mise à jour
+## 9. Dashboard de monitoring
+
+Le gateway embarque un dashboard d'administration accessible depuis le navigateur.
+Il affiche en temps réel les KPIs d'usage, les graphiques de consommation de tokens,
+la distribution des erreurs, les statistiques par utilisateur et les métriques GPU
+de llama-server.
+
+### Accès
+
+Le dashboard est servi à l'URL :
+
+```
+https://llm.eva.univ-pau.fr/admin/dashboard
+```
+
+> **Prérequis réseau :** la route `/admin/` est restreinte au réseau campus par nginx
+> (plages `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Le dashboard n'est donc
+> pas accessible depuis Internet.
+
+### Première connexion
+
+1. Ouvrir `https://llm.eva.univ-pau.fr/admin/dashboard` dans un navigateur
+2. Un écran de connexion s'affiche — entrer l'`ADMIN_SECRET`
+3. Le token est stocké dans `sessionStorage` (durée de vie : onglet du navigateur)
+4. À la fermeture du navigateur ou de l'onglet, la session est automatiquement détruite
+
+Pour retrouver l'`ADMIN_SECRET` sur le serveur :
+
+```bash
+sudo grep ADMIN_SECRET /etc/llm-gateway/env
+```
+
+### Ce que le dashboard affiche
+
+| Section | Contenu |
+|---------|---------|
+| **KPI cards** | Requêtes aujourd'hui (Δ% vs hier), tokens, utilisateurs actifs (7j), latence moyenne, taux d'erreur, état du modèle |
+| **Requêtes / heure** | Graphique ligne, dernières 24h/7j/30j, avec courbe d'erreurs |
+| **Token usage** | Graphique barres empilées (prompt vs completion), dernières 24h/7j/30j |
+| **Distribution HTTP** | Graphique donut des codes de statut (200, 429, 503…) |
+| **Latence** | Courbe de latence moyenne, dernières 24h/7j/30j |
+| **Tableau utilisateurs** | Requêtes, tokens consommés, barre de quota, RPM, dernière activité |
+| **Statut système** | État du modèle, PID, uptime, paramètres GPU, métriques llama-server en direct (KV cache, slots actifs, tokens/s) |
+
+Le dashboard se rafraîchit automatiquement toutes les **30 secondes**. Un bouton
+de rafraîchissement manuel est disponible en haut à droite.
+
+### Endpoints metrics (pour l'automatisation)
+
+Les données du dashboard sont exposées en JSON via les routes suivantes,
+toutes protégées par le même `ADMIN_SECRET` :
+
+```bash
+# Vue d'ensemble KPI
+curl -s "$GW/admin/metrics/overview" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Série temporelle (period=24h|7d|30d)
+curl -s "$GW/admin/metrics/timeseries?period=7d" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Statistiques par utilisateur (period=7d|30d|90d)
+curl -s "$GW/admin/metrics/users?period=30d" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Distribution des codes HTTP
+curl -s "$GW/admin/metrics/status-codes?period=24h" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Métriques llama-server en direct (retourne {} si le modèle est déchargé)
+curl -s "$GW/admin/metrics/llama" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+```
+
+### Sécurité
+
+| Couche | Mécanisme |
+|--------|-----------|
+| Réseau | nginx restreint `/admin/*` aux IP campus |
+| API | Tous les `/admin/metrics/*` exigent `Authorization: Bearer <ADMIN_SECRET>` |
+| Navigateur | Token dans `sessionStorage` — jamais dans `localStorage`, détruit à la fermeture |
+| Transport | TLS 1.2/1.3 (nginx) |
+
+---
+
+## 10. Mise à jour
 
 ### Mettre à jour le code de la gateway
 
-```bash
-# Sur la machine de développement
-git pull
-sudo bash gateway/deploy/install.sh   # idempotent — ne touche pas à la config
+Un script dédié gère le cycle complet : `git pull` → sync des fichiers → mise à jour des dépendances → redémarrage → health check.
 
-sudo systemctl restart llm-gateway
-sudo journalctl -u llm-gateway -f --since now
+```bash
+# Sur le serveur GPU, dans le répertoire du dépôt cloné
+sudo bash gateway/deploy/update.sh
 ```
+
+Ce que fait le script :
+
+1. `git pull` dans le dépôt
+2. Synchronise les fichiers Python et `requirements.txt` vers `/opt/llm-gateway/`
+3. Synchronise le répertoire `static/` (dashboard HTML…)
+4. Met à jour les dépendances pip si `requirements.txt` a changé
+5. Copie le fichier systemd et recharge `daemon-reload`
+6. Redémarre le service proprement et attend le health check
+
+Pour mettre à jour aussi la configuration nginx en même temps :
+
+```bash
+sudo bash gateway/deploy/update.sh --nginx
+```
+
+> **Note :** Le script ne touche jamais à `/etc/llm-gateway/env` (secrets),
+> à la base de données, ni aux modèles GGUF.
 
 ### Mettre à jour llama.cpp
 
@@ -376,7 +478,7 @@ sudo systemctl restart llm-gateway
 
 ---
 
-## 10. Dépannage
+## 11. Dépannage
 
 ### Le service ne démarre pas
 

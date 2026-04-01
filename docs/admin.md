@@ -3,8 +3,9 @@
 Ce document s'adresse à l'administrateur du gateway : gestion des utilisateurs,
 des clés API, surveillance du système et reporting d'usage.
 
-Deux interfaces sont disponibles :
-- **CLI** (`cli.py`) : à utiliser directement sur le serveur, idéal pour le quotidien
+Trois interfaces sont disponibles :
+- **Dashboard** (`/admin/dashboard`) : interface web avec graphiques, tableaux et métriques en temps réel — recommandé pour la surveillance quotidienne
+- **CLI** (`cli.py`) : à utiliser directement sur le serveur, idéal pour la gestion des utilisateurs et des clés
 - **API REST** (`/admin/...`) : accessible depuis le réseau campus uniquement, utile pour l'automatisation
 
 ---
@@ -235,7 +236,27 @@ curl -s -X DELETE "$GW/admin/keys/llmgw-xK8mP" \
 
 ## 4. Surveillance du système
 
-### État en temps réel
+### Dashboard de monitoring (recommandé)
+
+Le gateway embarque un dashboard graphique accessible depuis n'importe quel navigateur
+sur le réseau campus. C'est le point d'entrée recommandé pour la surveillance quotidienne.
+
+**Accès :** `https://llm.eva.univ-pau.fr/admin/dashboard`
+
+Connexion avec l'`ADMIN_SECRET`. Le token est stocké dans `sessionStorage` et détruit
+à la fermeture de l'onglet.
+
+**Ce qui est visible en un coup d'œil :**
+- Requêtes et tokens du jour (avec Δ% par rapport à hier)
+- Taux d'erreur et latence sur 24h (P50/P95/P99)
+- État du modèle avec uptime et temps d'inactivité restant
+- Graphiques par heure / par jour sur 24h, 7j ou 30j
+- Tableau de tous les utilisateurs avec leur consommation et leur quota
+- Métriques GPU en direct : KV cache fill, slots actifs, tokens/s
+
+Le dashboard se rafraîchit automatiquement toutes les **30 secondes**.
+
+### État en temps réel (CLI / API)
 
 ```bash
 # CLI
@@ -300,16 +321,25 @@ Lorsque le modèle est chargé, les métriques sont disponibles directement
 depuis le serveur :
 
 ```bash
-# Métriques brutes (format Prometheus)
+# Métriques brutes (format Prometheus) — accès local uniquement
 curl http://127.0.0.1:8081/metrics
 
 # Métriques intéressantes :
-# llama_prompt_tokens_total        — tokens en entrée traités
-# llama_completion_tokens_total    — tokens générés
-# llama_tokens_per_second          — débit en génération
-# llama_kv_cache_usage_ratio       — taux d'utilisation du KV cache
-# llama_requests_processing        — requêtes en cours
-# llama_requests_deferred          — requêtes en attente de slot
+# llamacpp:prompt_tokens_total        — tokens en entrée traités
+# llamacpp:tokens_predicted_total     — tokens générés
+# llamacpp:tokens_per_second          — débit en génération
+# llamacpp:kv_cache_usage_ratio       — taux d'utilisation du KV cache (0–1)
+# llamacpp:requests_processing        — requêtes en cours
+# llamacpp:requests_deferred          — requêtes en attente de slot
+```
+
+Ces métriques sont également disponibles en JSON via le gateway (depuis le réseau campus),
+ce qui évite d'avoir à ouvrir un accès direct à llama-server :
+
+```bash
+curl -s "$GW/admin/metrics/llama" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+# Retourne {} si le modèle est déchargé
 ```
 
 ---
@@ -402,6 +432,13 @@ sudo journalctl -u llm-gateway -f --since now
 ## 7. Référence API REST admin
 
 Toutes les routes nécessitent : `Authorization: Bearer <ADMIN_SECRET>`
+Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
+
+### Interface web
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/admin/dashboard` | Dashboard de monitoring (HTML, navigateur) |
 
 ### Utilisateurs
 
@@ -420,12 +457,39 @@ Toutes les routes nécessitent : `Authorization: Bearer <ADMIN_SECRET>`
 | `GET` | `/admin/users/{username}/keys` | Lister les clés (sans valeur brute) |
 | `DELETE` | `/admin/keys/{key_prefix}` | Révoquer une clé |
 
-### Usage
+### Usage (données brutes)
 
 | Méthode | Route | Paramètres |
 |---------|-------|------------|
 | `GET` | `/admin/usage` | `username`, `from_date`, `to_date`, `limit` |
 | `GET` | `/admin/usage/summary` | `from_date`, `to_date` |
+
+### Métriques dashboard
+
+| Méthode | Route | Paramètres | Description |
+|---------|-------|------------|-------------|
+| `GET` | `/admin/metrics/overview` | — | KPIs globaux, latence (P50/P95/P99), état du modèle |
+| `GET` | `/admin/metrics/timeseries` | `period=24h\|7d\|30d` | Série temporelle (requêtes, tokens, erreurs, latence) |
+| `GET` | `/admin/metrics/users` | `period=7d\|30d\|90d` | Statistiques par utilisateur avec quota |
+| `GET` | `/admin/metrics/status-codes` | `period=24h\|7d` | Distribution des codes HTTP |
+| `GET` | `/admin/metrics/llama` | — | Métriques llama-server en direct (JSON) — retourne `{}` si déchargé |
+
+**Exemple — vue d'ensemble :**
+
+```bash
+curl -s "$GW/admin/metrics/overview" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# {
+#   "requests_today": 142,
+#   "tokens_today": 284031,
+#   "active_users_7d": 5,
+#   "avg_latency_24h_ms": 3821.4,
+#   "error_rate_24h": 0.007,
+#   "latency_p50_ms": 2940.0,
+#   "latency_p95_ms": 8210.0,
+#   "model": { "model_state": "ready", "uptime_seconds": 1842, ... }
+# }
+```
 
 ### Système
 

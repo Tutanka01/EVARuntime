@@ -12,54 +12,49 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  Réseau UPPA / Internet                                                 │
 │                                                                         │
-│  Clients                                                                │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                              │
-│  │ Python   │  │ curl     │  │ LangChain│  ...                         │
-│  │ openai   │  │          │  │          │                              │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                              │
-│       └─────────────┴─────────────┘                                     │
-│                         │ HTTPS / TLS 1.3                               │
-└─────────────────────────┼───────────────────────────────────────────────┘
-                          │
-┌─────────────────────────┼───────────────────────────────────────────────┐
-│  Cluster EVA — hébergé à l'UPPA (GPU L40S)│                                               │
-│                         ▼                                               │
-│  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │  nginx (TLS termination, rate limiting, IP filtering /admin)     │  │
-│  └──────────────────────────┬─────────────────────────────────────┘  │
-│                              │ HTTP/1.1 (127.0.0.1:8000)               │
-│  ┌───────────────────────────▼──────────────────────────────────────┐  │
-│  │                    FastAPI Gateway                                │  │
-│  │                                                                   │  │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │  │
-│  │  │    auth.py  │  │rate_limiter  │  │     proxy.py             │ │  │
-│  │  │  Bearer SHA │  │sliding window│  │  forward + SSE streaming  │ │  │
-│  │  └─────────────┘  └──────────────┘  └────────────┬─────────────┘ │  │
-│  │                                                   │               │  │
-│  │  ┌──────────────────────────────────────────────┐ │               │  │
-│  │  │           server_manager.py                  │ │               │  │
-│  │  │  UNLOADED → LOADING → READY → UNLOADING      │ │               │  │
-│  │  │  asyncio.Lock + asyncio.Event                │◄┘               │  │
-│  │  └──────────────────────┬───────────────────────┘                 │  │
-│  │                         │ subprocess (start_new_session=True)     │  │
-│  │  ┌──────────────────────▼───────────────────────┐                 │  │
-│  │  │            llama-server (llama.cpp)           │                 │  │
-│  │  │  port 8081 — 127.0.0.1 uniquement            │                 │  │
-│  │  │  -ngl 999 -c 32768 --parallel 4              │                 │  │
-│  │  │  -ctk q8_0 -ctv q8_0 -fa on                  │                 │  │
-│  │  └──────────────────────┬───────────────────────┘                 │  │
-│  │                         │ CUDA                                    │  │
-│  │  ┌──────────────────────▼───────────────────────┐                 │  │
-│  │  │          NVIDIA L40S 48GB                    │                 │  │
-│  │  │  Modèle chargé : ~40.5GB VRAM                │                 │  │
-│  │  │  Modèle déchargé : ~0.2GB (driver only)      │                 │  │
-│  │  └──────────────────────────────────────────────┘                 │  │
-│  │                                                                   │  │
-│  │  ┌─────────────────────────────────────┐                          │  │
-│  │  │  SQLite WAL (database.py)            │                          │  │
-│  │  │  users | api_keys | usage_log        │                          │  │
-│  │  └─────────────────────────────────────┘                          │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
+│  Clients inférence            Admin (réseau campus uniquement)          │
+│  ┌──────────┐  ┌──────────┐   ┌──────────────────────────────────┐     │
+│  │ Python   │  │ curl     │   │ Navigateur → /admin/dashboard    │     │
+│  │ openai   │  │ LangChain│   │ curl → /admin/metrics/*          │     │
+│  └────┬─────┘  └────┬─────┘   └────────────────┬─────────────────┘     │
+│       └─────────────┘                           │                       │
+│                         │ HTTPS / TLS 1.3       │ HTTPS (campus only)   │
+└─────────────────────────┼─────────────────────────────────────────────┘
+                          │                       │
+┌─────────────────────────┼───────────────────────┼─────────────────────┐
+│  Cluster EVA — hébergé à l'UPPA (GPU L40S)      │                     │
+│                         ▼                       ▼                     │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  nginx  (TLS termination, rate limiting, IP filtering /admin)    │ │
+│  └──────────────────────────┬─────────────────────────────────────┘ │
+│                              │ HTTP/1.1 (127.0.0.1:8000)             │
+│  ┌───────────────────────────▼──────────────────────────────────────┐ │
+│  │                    FastAPI Gateway                                │ │
+│  │                                                                   │ │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │ │
+│  │  │    auth.py  │  │rate_limiter  │  │     proxy.py             │ │ │
+│  │  │  Bearer SHA │  │sliding window│  │  forward + SSE streaming  │ │ │
+│  │  └─────────────┘  └──────────────┘  └────────────┬─────────────┘ │ │
+│  │                                                   │               │ │
+│  │  ┌─────────────────────────────┐  ┌──────────────┴─────────────┐ │ │
+│  │  │  metrics.py + dashboard.html│  │   server_manager.py        │ │ │
+│  │  │  /admin/metrics/*  (JSON)   │  │  UNLOADED→LOADING→READY    │ │ │
+│  │  │  /admin/dashboard  (HTML)   │  │  asyncio.Lock + Event      │ │ │
+│  │  └─────────────┬───────────────┘  └──────────────┬─────────────┘ │ │
+│  │                │ (lit usage_log,                  │               │ │
+│  │                │  proxie /metrics)    subprocess  │               │ │
+│  │  ┌─────────────▼───────────────┐  ┌──────────────▼─────────────┐ │ │
+│  │  │  SQLite WAL (database.py)   │  │  llama-server (llama.cpp)  │ │ │
+│  │  │  users | api_keys           │  │  port 8081 — 127.0.0.1     │ │ │
+│  │  │  usage_log                  │  │  --metrics (Prometheus)    │ │ │
+│  │  └─────────────────────────────┘  └──────────────┬─────────────┘ │ │
+│  │                                                   │ CUDA          │ │
+│  │                                   ┌──────────────▼─────────────┐ │ │
+│  │                                   │  NVIDIA L40S 48GB          │ │ │
+│  │                                   │  Chargé : ~40.5GB VRAM     │ │ │
+│  │                                   │  Déchargé : ~0.2GB         │ │ │
+│  │                                   └────────────────────────────┘ │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -383,6 +378,66 @@ Sans continuous batching, les slots d'inférence ne commencent un nouveau
 token que quand **tous** les slots ont terminé leur génération en cours.
 Avec continuous batching, chaque slot avance indépendamment : le GPU
 est utilisé de façon optimale même avec des requêtes de longueurs variables.
+
+---
+
+## Couche monitoring (dashboard)
+
+### Composants
+
+| Fichier | Rôle |
+|---------|------|
+| `metrics.py` | Router FastAPI sous `/admin/metrics/` — agrège les données et les expose en JSON |
+| `static/dashboard.html` | SPA auto-contenue (Chart.js CDN + vanilla JS) servie par `GET /admin/dashboard` |
+
+### Flux de données du dashboard
+
+```
+Navigateur admin
+  │
+  ├─ GET /admin/dashboard ──→ HTMLResponse(dashboard.html)   [synchronous file read]
+  │
+  └─ GET /admin/metrics/overview
+     GET /admin/metrics/timeseries?period=24h
+     GET /admin/metrics/users?period=30d
+     GET /admin/metrics/status-codes
+     GET /admin/metrics/llama
+            │
+            ├─ usage_log / users (aiosqlite, index idx_usage_timestamp)
+            │
+            └─ llama-server :8081/metrics (Prometheus text → parsing Python → JSON)
+                 ↑ retourne {} si état ≠ READY (pas d'erreur pour le dashboard)
+```
+
+### Calcul des percentiles de latence
+
+SQLite ne supporte pas `PERCENTILE_CONT`. Les percentiles (P50/P95/P99) sont
+calculés en Python depuis des échantillons bruts :
+
+```python
+samples = await db.get_latency_samples(period_hours=168, limit=10_000)
+samples.sort()
+p95 = samples[int(0.95 * len(samples))]
+```
+
+À l'échelle universitaire (milliers à dizaines de milliers de requêtes), ce calcul
+reste sous 10ms. Si le volume venait à dépasser ~100k requêtes par semaine, envisager
+une pré-agrégation horaire dans un job cron.
+
+### Sécurité du dashboard
+
+Le dashboard ne stocke **aucune donnée sensible** :
+- Pas de contenu de prompt ou de réponse
+- Pas de clé API (ni hash ni préfixe)
+- Pas d'adresse IP des utilisateurs
+
+Le token admin est stocké dans `sessionStorage` (effacé à la fermeture de l'onglet,
+jamais dans `localStorage`, jamais envoyé à un tiers).
+
+La route `GET /admin/dashboard` ne requiert pas de bearer token — la protection réseau
+nginx (campus IP only) est suffisante pour servir le fichier HTML. En revanche, tous
+les endpoints `/admin/metrics/*` exigent le bearer token, de sorte qu'un accès direct
+à l'URL de la page sans connaissance du secret n'affiche aucune donnée.
 
 ---
 

@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EVA Gateway — Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    /* ── Reset & Base ─────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0a0a0b;
+      --surface:   #131316;
+      --surface2:  #1a1a1f;
+      --border:    #25252d;
+      --border2:   #32323e;
+      --text:      #e8e8f0;
+      --text2:     #8888a0;
+      --text3:     #55556a;
+      --indigo:    #6366f1;
+      --indigo-d:  #4f51d1;
+      --indigo-bg: rgba(99,102,241,.08);
+      --green:     #10b981;
+      --green-bg:  rgba(16,185,129,.08);
+      --amber:     #f59e0b;
+      --amber-bg:  rgba(245,158,11,.08);
+      --red:       #ef4444;
+      --red-bg:    rgba(239,68,68,.08);
+      --blue:      #3b82f6;
+      --radius:    10px;
+      --radius-sm: 6px;
+    }
+
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* ── Login overlay ────────────────────────────────────────────────────── */
+    #login-overlay {
+      position: fixed; inset: 0; z-index: 999;
+      background: rgba(10,10,11,.95);
+      backdrop-filter: blur(8px);
+      display: flex; align-items: center; justify-content: center;
+    }
+    #login-overlay.hidden { display: none; }
+
+    .login-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 40px;
+      width: 360px;
+      text-align: center;
+    }
+    .login-card .logo {
+      width: 48px; height: 48px;
+      background: var(--indigo-bg);
+      border: 1px solid var(--indigo);
+      border-radius: 12px;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 22px; margin-bottom: 20px;
+    }
+    .login-card h2 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    .login-card p  { color: var(--text2); font-size: 13px; margin-bottom: 24px; }
+    .login-card input {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border2);
+      border-radius: var(--radius-sm);
+      color: var(--text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      padding: 10px 14px;
+      outline: none;
+      margin-bottom: 14px;
+      letter-spacing: .5px;
+    }
+    .login-card input:focus { border-color: var(--indigo); }
+    .login-card .login-btn {
+      width: 100%;
+      background: var(--indigo);
+      border: none;
+      border-radius: var(--radius-sm);
+      color: #fff;
+      cursor: pointer;
+      font-size: 14px; font-weight: 600;
+      padding: 10px;
+      transition: background .15s;
+    }
+    .login-card .login-btn:hover { background: var(--indigo-d); }
+    .login-card .login-error {
+      color: var(--red);
+      font-size: 12px;
+      margin-top: 10px;
+      min-height: 18px;
+    }
+
+    /* ── Layout ───────────────────────────────────────────────────────────── */
+    .page { max-width: 1440px; margin: 0 auto; padding: 0 24px 40px; }
+
+    /* ── Header ───────────────────────────────────────────────────────────── */
+    header {
+      display: flex; align-items: center; gap: 16px;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 28px;
+    }
+    .header-title {
+      display: flex; align-items: center; gap: 10px;
+      flex: 1;
+    }
+    .header-icon {
+      width: 36px; height: 36px;
+      background: var(--indigo-bg);
+      border: 1px solid rgba(99,102,241,.3);
+      border-radius: 9px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    .header-title h1 {
+      font-size: 16px; font-weight: 600; letter-spacing: -.2px;
+    }
+    .header-title span {
+      color: var(--text2); font-size: 13px;
+    }
+
+    .model-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 5px 12px;
+      border-radius: 20px;
+      font-size: 12px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .5px;
+      border: 1px solid transparent;
+    }
+    .model-badge.ready    { background: var(--green-bg); border-color: rgba(16,185,129,.3); color: var(--green); }
+    .model-badge.loading  { background: var(--amber-bg); border-color: rgba(245,158,11,.3); color: var(--amber); }
+    .model-badge.unloaded { background: var(--surface2); border-color: var(--border2); color: var(--text2); }
+    .model-badge.unloading{ background: var(--amber-bg); border-color: rgba(245,158,11,.3); color: var(--amber); }
+    .badge-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: currentColor;
+    }
+    .badge-dot.pulse {
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: .3; }
+    }
+
+    .header-meta {
+      color: var(--text3); font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      display: flex; align-items: center; gap: 4px;
+    }
+    .header-actions { display: flex; gap: 8px; }
+    .btn-icon {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text2);
+      cursor: pointer;
+      font-size: 13px;
+      padding: 6px 12px;
+      display: flex; align-items: center; gap: 6px;
+      transition: all .15s;
+    }
+    .btn-icon:hover { background: var(--surface); border-color: var(--border2); color: var(--text); }
+    .btn-icon.spinning svg { animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── KPI Cards ────────────────────────────────────────────────────────── */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    @media (max-width: 1200px) { .kpi-grid { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 700px)  { .kpi-grid { grid-template-columns: repeat(2, 1fr); } }
+
+    .kpi-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px;
+      position: relative;
+      overflow: hidden;
+    }
+    .kpi-card::before {
+      content: '';
+      position: absolute; top: 0; left: 0; right: 0;
+      height: 2px;
+      background: var(--accent-color, var(--indigo));
+      opacity: .5;
+    }
+    .kpi-label {
+      font-size: 11px; font-weight: 500; text-transform: uppercase;
+      letter-spacing: .8px; color: var(--text2);
+      margin-bottom: 10px;
+    }
+    .kpi-value {
+      font-size: 26px; font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1;
+      letter-spacing: -1px;
+      margin-bottom: 8px;
+    }
+    .kpi-sub {
+      font-size: 11px; color: var(--text2);
+      display: flex; align-items: center; gap: 6px;
+      flex-wrap: wrap;
+    }
+    .delta {
+      font-size: 11px; font-weight: 600;
+      padding: 1px 5px; border-radius: 4px;
+    }
+    .delta.up   { background: var(--green-bg); color: var(--green); }
+    .delta.down { background: var(--red-bg);   color: var(--red); }
+    .delta.flat { background: var(--surface2); color: var(--text2); }
+
+    /* ── Charts grid ──────────────────────────────────────────────────────── */
+    .charts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
+
+    .chart-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px 22px;
+    }
+    .chart-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 18px;
+    }
+    .chart-title {
+      font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .chart-title-icon {
+      width: 26px; height: 26px;
+      background: var(--indigo-bg);
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px;
+    }
+    .period-tabs {
+      display: flex; gap: 2px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 2px;
+    }
+    .period-tab {
+      background: none; border: none; cursor: pointer;
+      font-size: 11px; font-weight: 500;
+      color: var(--text2);
+      padding: 4px 10px;
+      border-radius: 4px;
+      transition: all .15s;
+    }
+    .period-tab.active {
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 1px 3px rgba(0,0,0,.3);
+    }
+
+    /* Chart canvas wrapper — fixed height */
+    .chart-wrap { position: relative; height: 200px; }
+
+    /* Donut chart smaller */
+    .chart-wrap.donut { height: 200px; }
+
+    /* ── Bottom section ───────────────────────────────────────────────────── */
+    .bottom-grid {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 1100px) { .bottom-grid { grid-template-columns: 1fr; } }
+
+    /* ── Users table ──────────────────────────────────────────────────────── */
+    .table-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .table-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+    .table-title {
+      font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .table-period {
+      font-size: 11px; color: var(--text2);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 2px 10px;
+    }
+
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      font-size: 11px; font-weight: 500; text-transform: uppercase;
+      letter-spacing: .6px; color: var(--text2);
+      padding: 10px 20px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      transition: background .1s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: var(--surface2); }
+    tbody td {
+      padding: 11px 20px;
+      font-size: 13px;
+    }
+    .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    .td-user { font-weight: 500; }
+    .user-active   { color: var(--text); }
+    .user-inactive { color: var(--text3); }
+
+    .quota-bar {
+      background: var(--surface2);
+      border-radius: 3px;
+      height: 4px;
+      width: 80px;
+      overflow: hidden;
+      margin-top: 3px;
+    }
+    .quota-fill {
+      height: 100%;
+      border-radius: 3px;
+      background: var(--green);
+      transition: width .3s;
+    }
+    .quota-fill.warn  { background: var(--amber); }
+    .quota-fill.crit  { background: var(--red); }
+
+    .pill {
+      display: inline-block;
+      font-size: 10px; font-weight: 600;
+      padding: 2px 7px; border-radius: 10px;
+      text-transform: uppercase; letter-spacing: .4px;
+    }
+    .pill.active   { background: var(--green-bg); color: var(--green); }
+    .pill.inactive { background: var(--surface2); color: var(--text3); }
+
+    /* ── System status card ───────────────────────────────────────────────── */
+    .status-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+    .status-card h3 {
+      font-size: 13px; font-weight: 600;
+      margin-bottom: 18px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .status-section { margin-bottom: 18px; }
+    .status-section:last-child { margin-bottom: 0; }
+    .status-section-label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .8px; color: var(--text3);
+      margin-bottom: 10px;
+    }
+    .status-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .status-row:last-child { border-bottom: none; }
+    .status-key  { color: var(--text2); font-size: 12px; }
+    .status-val  {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px; font-weight: 500;
+      color: var(--text);
+    }
+    .status-val.green  { color: var(--green); }
+    .status-val.amber  { color: var(--amber); }
+    .status-val.red    { color: var(--red); }
+    .status-val.muted  { color: var(--text3); }
+
+    .gauge-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 6px 0;
+    }
+    .gauge-label { color: var(--text2); font-size: 12px; flex: 1; }
+    .gauge-pct   { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text2); width: 36px; text-align: right; }
+    .gauge-bar {
+      width: 80px; height: 5px;
+      background: var(--surface2);
+      border-radius: 3px; overflow: hidden;
+    }
+    .gauge-fill {
+      height: 100%; border-radius: 3px;
+      background: var(--indigo);
+      transition: width .4s;
+    }
+    .gauge-fill.warn { background: var(--amber); }
+    .gauge-fill.crit { background: var(--red); }
+
+    /* ── Empty / loading states ───────────────────────────────────────────── */
+    .empty-state {
+      text-align: center; padding: 40px 20px;
+      color: var(--text3); font-size: 13px;
+    }
+    .skeleton {
+      background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+      border-radius: 4px;
+      height: 18px;
+    }
+    @keyframes shimmer { to { background-position: -200% 0; } }
+
+    /* ── Footer ───────────────────────────────────────────────────────────── */
+    .footer {
+      border-top: 1px solid var(--border);
+      padding: 16px 0 0;
+      display: flex; align-items: center; justify-content: space-between;
+      color: var(--text3); font-size: 11px;
+    }
+    .footer span { font-family: 'JetBrains Mono', monospace; }
+
+    /* ── Utility ──────────────────────────────────────────────────────────── */
+    .hidden { display: none !important; }
+    .flex-gap { display: flex; align-items: center; gap: 8px; }
+  </style>
+</head>
+<body>
+
+<!-- ── Login overlay ─────────────────────────────────────────────────────── -->
+<div id="login-overlay">
+  <div class="login-card">
+    <div class="logo">⚡</div>
+    <h2>EVA Gateway</h2>
+    <p>Enter your admin secret to access the dashboard.</p>
+    <input type="password" id="token-input" placeholder="Admin secret…" autocomplete="current-password" />
+    <button class="login-btn" onclick="doLogin()">Sign in</button>
+    <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- ── Main layout ────────────────────────────────────────────────────────── -->
+<div class="page">
+
+  <!-- Header -->
+  <header>
+    <div class="header-title">
+      <div class="header-icon">⚡</div>
+      <div>
+        <h1>EVA Cluster — LLM Gateway</h1>
+        <span id="model-name-sub" style="color:var(--text2);font-size:12px;">llama-3.3-70b-instruct</span>
+      </div>
+    </div>
+
+    <div id="model-badge" class="model-badge unloaded">
+      <span class="badge-dot"></span>
+      <span id="model-state-text">—</span>
+    </div>
+
+    <div class="header-meta" id="last-updated">—</div>
+
+    <div class="header-actions">
+      <button class="btn-icon" id="refresh-btn" onclick="doRefresh()">
+        <svg id="refresh-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+          <path d="M3 3v5h5"/>
+        </svg>
+        Refresh
+      </button>
+      <button class="btn-icon" onclick="doLogout()">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+        Logout
+      </button>
+    </div>
+  </header>
+
+  <!-- KPI Row -->
+  <div class="kpi-grid" id="kpi-grid">
+    <!-- Populated by JS -->
+    <div class="kpi-card"><div class="kpi-label">Requests today</div><div class="kpi-value skeleton">&nbsp;&nbsp;&nbsp;&nbsp;</div></div>
+    <div class="kpi-card"><div class="kpi-label">Tokens today</div><div class="kpi-value skeleton">&nbsp;&nbsp;&nbsp;&nbsp;</div></div>
+    <div class="kpi-card"><div class="kpi-label">Active users (7d)</div><div class="kpi-value skeleton">&nbsp;&nbsp;&nbsp;&nbsp;</div></div>
+    <div class="kpi-card"><div class="kpi-label">Avg latency (24h)</div><div class="kpi-value skeleton">&nbsp;&nbsp;&nbsp;&nbsp;</div></div>
+    <div class="kpi-card"><div class="kpi-label">Error rate (24h)</div><div class="kpi-value skeleton">&nbsp;&nbsp;&nbsp;&nbsp;</div></div>
+    <div class="kpi-card"><div class="kpi-label">Model state</div><div class="kpi-value skeleton">&nbsp;&nbsp;&nbsp;&nbsp;</div></div>
+  </div>
+
+  <!-- Charts row -->
+  <div class="charts-grid">
+
+    <!-- Requests over time -->
+    <div class="chart-card">
+      <div class="chart-header">
+        <div class="chart-title">
+          <div class="chart-title-icon">📈</div>
+          Requests
+        </div>
+        <div class="period-tabs">
+          <button class="period-tab active" data-chart="req" data-period="24h" onclick="switchPeriod(this,'req')">24h</button>
+          <button class="period-tab" data-chart="req" data-period="7d"  onclick="switchPeriod(this,'req')">7d</button>
+          <button class="period-tab" data-chart="req" data-period="30d" onclick="switchPeriod(this,'req')">30d</button>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-req"></canvas></div>
+    </div>
+
+    <!-- Token usage -->
+    <div class="chart-card">
+      <div class="chart-header">
+        <div class="chart-title">
+          <div class="chart-title-icon">🔢</div>
+          Token Usage
+        </div>
+        <div class="period-tabs">
+          <button class="period-tab active" data-chart="tok" data-period="24h" onclick="switchPeriod(this,'tok')">24h</button>
+          <button class="period-tab" data-chart="tok" data-period="7d"  onclick="switchPeriod(this,'tok')">7d</button>
+          <button class="period-tab" data-chart="tok" data-period="30d" onclick="switchPeriod(this,'tok')">30d</button>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-tok"></canvas></div>
+    </div>
+
+    <!-- Status codes donut -->
+    <div class="chart-card">
+      <div class="chart-header">
+        <div class="chart-title">
+          <div class="chart-title-icon">🔵</div>
+          Status Codes
+        </div>
+        <div class="period-tabs">
+          <button class="period-tab active" data-chart="sc" data-period="24h" onclick="switchPeriod(this,'sc')">24h</button>
+          <button class="period-tab" data-chart="sc" data-period="7d"  onclick="switchPeriod(this,'sc')">7d</button>
+        </div>
+      </div>
+      <div class="chart-wrap donut"><canvas id="chart-sc"></canvas></div>
+    </div>
+
+    <!-- Latency -->
+    <div class="chart-card">
+      <div class="chart-header">
+        <div class="chart-title">
+          <div class="chart-title-icon">⏱</div>
+          Latency (ms)
+        </div>
+        <div class="period-tabs">
+          <button class="period-tab active" data-chart="lat" data-period="24h" onclick="switchPeriod(this,'lat')">24h</button>
+          <button class="period-tab" data-chart="lat" data-period="7d"  onclick="switchPeriod(this,'lat')">7d</button>
+          <button class="period-tab" data-chart="lat" data-period="30d" onclick="switchPeriod(this,'lat')">30d</button>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="chart-lat"></canvas></div>
+    </div>
+
+  </div>
+
+  <!-- Bottom: Users table + System status -->
+  <div class="bottom-grid">
+
+    <!-- Users table -->
+    <div class="table-card">
+      <div class="table-header">
+        <div class="table-title">
+          <span>👥</span> Users
+        </div>
+        <div class="period-tabs">
+          <button class="period-tab active" data-chart="users" data-period="7d"  onclick="switchPeriod(this,'users')">7d</button>
+          <button class="period-tab" data-chart="users" data-period="30d" onclick="switchPeriod(this,'users')">30d</button>
+          <button class="period-tab" data-chart="users" data-period="90d" onclick="switchPeriod(this,'users')">90d</button>
+        </div>
+      </div>
+      <div id="users-table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>User</th>
+              <th>Requests</th>
+              <th>Tokens</th>
+              <th>Quota</th>
+              <th>RPM limit</th>
+              <th>Last active</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="users-tbody">
+            <tr><td colspan="7" class="empty-state">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- System status -->
+    <div class="status-card">
+      <h3>
+        <span>🖥</span> System Status
+      </h3>
+
+      <div class="status-section">
+        <div class="status-section-label">Model</div>
+        <div class="status-row"><span class="status-key">Name</span><span class="status-val mono" id="s-model-name">—</span></div>
+        <div class="status-row"><span class="status-key">State</span><span class="status-val" id="s-model-state">—</span></div>
+        <div class="status-row"><span class="status-key">PID</span><span class="status-val mono" id="s-pid">—</span></div>
+        <div class="status-row"><span class="status-key">Uptime</span><span class="status-val mono" id="s-uptime">—</span></div>
+        <div class="status-row"><span class="status-key">Idle</span><span class="status-val mono" id="s-idle">—</span></div>
+        <div class="status-row"><span class="status-key">Idle timeout</span><span class="status-val mono" id="s-idle-timeout">—</span></div>
+      </div>
+
+      <div class="status-section">
+        <div class="status-section-label">GPU Parameters</div>
+        <div class="status-row"><span class="status-key">Context size</span><span class="status-val mono" id="s-ctx">—</span></div>
+        <div class="status-row"><span class="status-key">Parallel slots</span><span class="status-val mono" id="s-parallel">—</span></div>
+        <div class="status-row"><span class="status-key">Flash Attention</span><span class="status-val mono" id="s-flash">—</span></div>
+        <div class="status-row"><span class="status-key">KV cache type</span><span class="status-val mono" id="s-cache">—</span></div>
+      </div>
+
+      <div class="status-section" id="llama-metrics-section">
+        <div class="status-section-label">Live Metrics</div>
+        <div class="gauge-row">
+          <span class="gauge-label">KV cache fill</span>
+          <span class="gauge-pct" id="g-kv-pct">—</span>
+          <div class="gauge-bar"><div class="gauge-fill" id="g-kv-fill" style="width:0%"></div></div>
+        </div>
+        <div class="status-row"><span class="status-key">Requests active</span><span class="status-val mono" id="g-req-proc">—</span></div>
+        <div class="status-row"><span class="status-key">Requests queued</span><span class="status-val mono" id="g-req-def">—</span></div>
+        <div class="status-row"><span class="status-key">Speed</span><span class="status-val mono" id="g-tps">—</span></div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="footer">
+    <div>EVA Cluster — LLM Inference Gateway</div>
+    <span id="footer-refresh">Auto-refresh every 30s</span>
+  </div>
+
+</div><!-- /page -->
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   EVA Gateway Dashboard — vanilla JS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// ── Auth ────────────────────────────────────────────────────────────────────
+const TOKEN_KEY = 'eva_admin_token';
+
+let _token = sessionStorage.getItem(TOKEN_KEY) || '';
+
+function doLogin() {
+  const inp = document.getElementById('token-input');
+  const err = document.getElementById('login-error');
+  const tok = inp.value.trim();
+  if (!tok) { err.textContent = 'Please enter your admin secret.'; return; }
+  _token = tok;
+  // Test immediately
+  apiGet('overview')
+    .then(() => {
+      sessionStorage.setItem(TOKEN_KEY, _token);
+      document.getElementById('login-overlay').classList.add('hidden');
+      init();
+    })
+    .catch(() => {
+      err.textContent = 'Invalid token or server unreachable.';
+      _token = '';
+    });
+}
+
+document.getElementById('token-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') doLogin();
+});
+
+function doLogout() {
+  sessionStorage.removeItem(TOKEN_KEY);
+  _token = '';
+  document.getElementById('login-overlay').classList.remove('hidden');
+}
+
+// ── API helpers ──────────────────────────────────────────────────────────────
+async function apiGet(path, params = {}) {
+  const qs = new URLSearchParams(params).toString();
+  const url = '/admin/metrics/' + path + (qs ? '?' + qs : '');
+  const res = await fetch(url, {
+    headers: { 'Authorization': 'Bearer ' + _token }
+  });
+  if (res.status === 403) { doLogout(); throw new Error('Forbidden'); }
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// ── Formatting ────────────────────────────────────────────────────────────────
+function fmt(n, decimals = 0) {
+  if (n == null || isNaN(n)) return '—';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
+  return Number(n).toFixed(decimals);
+}
+function fmtMs(ms) {
+  if (ms == null) return '—';
+  if (ms >= 60000) return (ms/60000).toFixed(1) + 'm';
+  if (ms >= 1000)  return (ms/1000).toFixed(1) + 's';
+  return Math.round(ms) + 'ms';
+}
+function fmtPct(r) {
+  if (r == null) return '—';
+  return (r * 100).toFixed(1) + '%';
+}
+function fmtDuration(sec) {
+  if (sec == null) return '—';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+function fmtRelative(isoStr) {
+  if (!isoStr) return '—';
+  const d = new Date(isoStr.endsWith('Z') ? isoStr : isoStr + 'Z');
+  const diff = (Date.now() - d) / 1000;
+  if (diff < 60)    return 'just now';
+  if (diff < 3600)  return Math.floor(diff/60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+  return Math.floor(diff/86400) + 'd ago';
+}
+function delta(now, prev) {
+  if (!prev || prev === 0) return null;
+  const pct = ((now - prev) / prev * 100);
+  const sign = pct > 0 ? '+' : '';
+  const cls = pct > 5 ? 'up' : pct < -5 ? 'down' : 'flat';
+  return `<span class="delta ${cls}">${sign}${pct.toFixed(0)}%</span>`;
+}
+
+// ── Chart defaults ───────────────────────────────────────────────────────────
+Chart.defaults.color = '#8888a0';
+Chart.defaults.borderColor = '#25252d';
+Chart.defaults.font.family = "'Inter', sans-serif";
+Chart.defaults.font.size = 11;
+
+const COLORS = {
+  indigo: '#6366f1',
+  indigoA: 'rgba(99,102,241,.15)',
+  green:  '#10b981',
+  greenA: 'rgba(16,185,129,.15)',
+  amber:  '#f59e0b',
+  amberA: 'rgba(245,158,11,.15)',
+  red:    '#ef4444',
+  redA:   'rgba(239,68,68,.15)',
+  blue:   '#3b82f6',
+  blueA:  'rgba(59,130,246,.15)',
+};
+
+function chartDefaults(type) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 300 },
+    plugins: {
+      legend: {
+        display: type !== 'line',
+        position: 'bottom',
+        labels: { usePointStyle: true, pointStyleWidth: 8, padding: 16, font: { size: 11 } },
+      },
+      tooltip: {
+        backgroundColor: '#1a1a1f',
+        borderColor: '#32323e',
+        borderWidth: 1,
+        titleColor: '#e8e8f0',
+        bodyColor: '#8888a0',
+        padding: 10,
+        cornerRadius: 6,
+      },
+    },
+    scales: type === 'doughnut' ? {} : {
+      x: {
+        grid: { color: '#1a1a1f' },
+        ticks: { maxRotation: 0, maxTicksLimit: 8 },
+      },
+      y: {
+        grid: { color: '#1a1a1f' },
+        beginAtZero: true,
+        ticks: { callback: v => fmt(v) },
+      },
+    },
+  };
+}
+
+// ── Chart instances ──────────────────────────────────────────────────────────
+const charts = {};
+
+function mkLine(id, datasets) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), {
+    type: 'line',
+    data: { labels: [], datasets },
+    options: {
+      ...chartDefaults('line'),
+      plugins: { ...chartDefaults('line').plugins, legend: { display: datasets.length > 1, position: 'bottom', labels: { usePointStyle: true, pointStyleWidth: 8, padding: 14, font: { size: 11 } } } },
+    },
+  });
+  return charts[id];
+}
+
+function mkBar(id, datasets) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), {
+    type: 'bar',
+    data: { labels: [], datasets },
+    options: {
+      ...chartDefaults('bar'),
+      plugins: { ...chartDefaults('bar').plugins, legend: { display: true, position: 'bottom', labels: { usePointStyle: true, pointStyleWidth: 8, padding: 14, font: { size: 11 } } } },
+      scales: {
+        x: { stacked: true, grid: { color: '#1a1a1f' }, ticks: { maxRotation: 0, maxTicksLimit: 8 } },
+        y: { stacked: true, grid: { color: '#1a1a1f' }, beginAtZero: true, ticks: { callback: v => fmt(v) } },
+      },
+    },
+  });
+  return charts[id];
+}
+
+function mkDoughnut(id) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), {
+    type: 'doughnut',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderWidth: 0, hoverOffset: 4 }] },
+    options: {
+      ...chartDefaults('doughnut'),
+      cutout: '68%',
+      plugins: {
+        ...chartDefaults('doughnut').plugins,
+        legend: { display: true, position: 'bottom', labels: { usePointStyle: true, pointStyleWidth: 8, padding: 12, font: { size: 11 } } },
+      },
+    },
+  });
+  return charts[id];
+}
+
+// ── State: current periods ───────────────────────────────────────────────────
+const periods = { req: '24h', tok: '24h', sc: '24h', lat: '24h', users: '7d' };
+
+function switchPeriod(btn, chart) {
+  const p = btn.dataset.period;
+  periods[chart] = p;
+  // Update tab styles
+  btn.closest('.period-tabs').querySelectorAll('.period-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  // Reload the relevant data
+  if (chart === 'users') fetchUsers();
+  else fetchTimeseries(chart, p);
+}
+
+// ── Data fetchers ────────────────────────────────────────────────────────────
+async function fetchOverview() {
+  try {
+    const d = await apiGet('overview');
+    renderKPIs(d);
+    renderSystem(d);
+  } catch(e) { console.error('overview', e); }
+}
+
+async function fetchTimeseries(chart, period) {
+  try {
+    const rows = await apiGet('timeseries', { period });
+    const labels = rows.map(r => fmtBucket(r.bucket, period));
+
+    if (chart === 'req' || chart === 'all') {
+      const c = charts['chart-req'];
+      if (c) {
+        c.data.labels = labels;
+        c.data.datasets[0].data = rows.map(r => r.request_count);
+        c.data.datasets[1].data = rows.map(r => r.error_count);
+        c.update('none');
+      }
+    }
+    if (chart === 'tok' || chart === 'all') {
+      const c = charts['chart-tok'];
+      if (c) {
+        c.data.labels = labels;
+        c.data.datasets[0].data = rows.map(r => r.prompt_tokens);
+        c.data.datasets[1].data = rows.map(r => r.completion_tokens);
+        c.update('none');
+      }
+    }
+    if (chart === 'lat' || chart === 'all') {
+      const c = charts['chart-lat'];
+      if (c) {
+        c.data.labels = labels;
+        c.data.datasets[0].data = rows.map(r => r.avg_latency_ms ? Math.round(r.avg_latency_ms) : null);
+        c.update('none');
+      }
+    }
+  } catch(e) { console.error('timeseries', chart, e); }
+}
+
+async function fetchStatusCodes(period) {
+  try {
+    const rows = await apiGet('status-codes', { period });
+    const c = charts['chart-sc'];
+    if (!c) return;
+    const colorMap = {
+      '200': COLORS.green, '201': COLORS.green,
+      '400': COLORS.amber, '401': COLORS.amber, '422': COLORS.amber, '429': COLORS.amber,
+      '500': COLORS.red,   '502': COLORS.red,   '503': COLORS.red, '504': COLORS.red,
+    };
+    c.data.labels = rows.map(r => r.status_code);
+    c.data.datasets[0].data = rows.map(r => r.count);
+    c.data.datasets[0].backgroundColor = rows.map(r => colorMap[r.status_code] || COLORS.blue);
+    c.update('none');
+  } catch(e) { console.error('status-codes', e); }
+}
+
+async function fetchUsers() {
+  try {
+    const rows = await apiGet('users', { period: periods.users });
+    renderUsers(rows);
+  } catch(e) { console.error('users', e); }
+}
+
+async function fetchLlama() {
+  try {
+    const d = await apiGet('llama');
+    renderLlamaMetrics(d);
+  } catch(e) { console.error('llama', e); }
+}
+
+function fmtBucket(bucket, period) {
+  if (!bucket) return '';
+  if (period === '24h') {
+    // "2025-01-15 14:00" → "14:00"
+    return bucket.split(' ')[1] || bucket;
+  }
+  // "2025-01-15" → "Jan 15"
+  const d = new Date(bucket + 'T00:00:00Z');
+  return d.toLocaleDateString('en', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
+// ── Renderers ────────────────────────────────────────────────────────────────
+function renderKPIs(d) {
+  const model = d.model || {};
+  const state = model.model_state || 'unloaded';
+
+  // Model badge in header
+  const badge = document.getElementById('model-badge');
+  badge.className = 'model-badge ' + state;
+  badge.querySelector('.badge-dot').className = 'badge-dot' + (state === 'loading' || state === 'unloading' ? ' pulse' : '');
+  document.getElementById('model-state-text').textContent = state.toUpperCase();
+  if (model.model_name) document.getElementById('model-name-sub').textContent = model.model_name;
+
+  const dlt = delta(d.requests_today, d.requests_yesterday);
+  const dtok = delta(d.tokens_today, d.tokens_yesterday);
+
+  const errPct = d.error_rate_24h != null ? (d.error_rate_24h * 100).toFixed(1) + '%' : '—';
+  const errColor = (d.error_rate_24h || 0) > 0.05 ? COLORS.red : (d.error_rate_24h || 0) > 0.01 ? COLORS.amber : COLORS.green;
+
+  const p95 = d.latency_p95_ms ? `P95 ${fmtMs(d.latency_p95_ms)}` : '';
+
+  const stateLabel = {
+    ready: '<span style="color:var(--green)">READY</span>',
+    loading: '<span style="color:var(--amber)">LOADING…</span>',
+    unloading: '<span style="color:var(--amber)">UNLOADING…</span>',
+    unloaded: '<span style="color:var(--text3)">UNLOADED</span>',
+  }[state] || state;
+
+  const uptime = model.uptime_seconds != null ? fmtDuration(model.uptime_seconds) : (model.idle_seconds != null ? `idle ${fmtDuration(model.idle_seconds)}` : '—');
+
+  document.getElementById('kpi-grid').innerHTML = `
+    <div class="kpi-card">
+      <div class="kpi-label">Requests today</div>
+      <div class="kpi-value">${fmt(d.requests_today)}</div>
+      <div class="kpi-sub">${dlt || ''} vs yesterday</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Tokens today</div>
+      <div class="kpi-value">${fmt(d.tokens_today)}</div>
+      <div class="kpi-sub">${dtok || ''}
+        <span>${fmt(d.prompt_tokens_today)} prompt · ${fmt(d.completion_tokens_today)} compl.</span>
+      </div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Active users (7d)</div>
+      <div class="kpi-value">${fmt(d.active_users_7d)}</div>
+      <div class="kpi-sub">of ${fmt(d.total_users)} registered</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Avg latency (24h)</div>
+      <div class="kpi-value">${fmtMs(d.avg_latency_24h_ms)}</div>
+      <div class="kpi-sub">${p95}</div>
+    </div>
+    <div class="kpi-card" style="--accent-color:${errColor}">
+      <div class="kpi-label">Error rate (24h)</div>
+      <div class="kpi-value" style="color:${errColor}">${errPct}</div>
+      <div class="kpi-sub">${fmt(d.errors_24h)} errors / ${fmt(d.requests_24h)} requests</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Model state</div>
+      <div class="kpi-value" style="font-size:18px;letter-spacing:0">${stateLabel}</div>
+      <div class="kpi-sub">${uptime}</div>
+    </div>
+  `;
+}
+
+function renderSystem(d) {
+  const m = d.model || {};
+  const p = m.llama_params || {};
+
+  const stateColors = { ready: 'green', loading: 'amber', unloading: 'amber', unloaded: 'muted' };
+  const stateClass = stateColors[m.model_state] || 'muted';
+
+  setText('s-model-name',    m.model_name || '—');
+  setHtml('s-model-state',  `<span class="status-val ${stateClass}">${(m.model_state||'—').toUpperCase()}</span>`);
+  setText('s-pid',           m.pid != null ? m.pid : '—');
+  setText('s-uptime',        m.uptime_seconds != null ? fmtDuration(m.uptime_seconds) : '—');
+  setText('s-idle',          m.idle_seconds != null ? fmtDuration(m.idle_seconds) + ' idle' : '—');
+  setText('s-idle-timeout',  m.idle_timeout_seconds != null ? fmtDuration(m.idle_timeout_seconds) : '—');
+  setText('s-ctx',           p.ctx_size != null ? p.ctx_size.toLocaleString() + ' tokens' : '—');
+  setText('s-parallel',      p.parallel != null ? p.parallel + ' slots' : '—');
+  setText('s-flash',         p.flash_attn != null ? (p.flash_attn ? 'ON' : 'OFF') : '—');
+  setText('s-cache',         (p.cache_type_k && p.cache_type_v) ? `${p.cache_type_k} / ${p.cache_type_v}` : '—');
+}
+
+function renderLlamaMetrics(d) {
+  const noData = Object.keys(d).length === 0;
+  if (noData) {
+    setText('g-kv-pct',   '—');
+    setText('g-req-proc', '—');
+    setText('g-req-def',  '—');
+    setText('g-tps',      '—');
+    document.getElementById('g-kv-fill').style.width = '0%';
+    return;
+  }
+
+  const kvRatio = d.kv_cache_usage_ratio;
+  const kvPct   = kvRatio != null ? (kvRatio * 100).toFixed(1) + '%' : '—';
+  const kvWidth  = kvRatio != null ? Math.min(kvRatio * 100, 100) + '%' : '0%';
+  const kvFill   = document.getElementById('g-kv-fill');
+  kvFill.style.width = kvWidth;
+  kvFill.className = 'gauge-fill' + (kvRatio > 0.9 ? ' crit' : kvRatio > 0.7 ? ' warn' : '');
+  setText('g-kv-pct',   kvPct);
+
+  setText('g-req-proc', d.requests_processing != null ? Math.round(d.requests_processing) : '—');
+  setText('g-req-def',  d.requests_deferred != null   ? Math.round(d.requests_deferred) : '—');
+  setText('g-tps',      d.tokens_per_second != null   ? d.tokens_per_second.toFixed(1) + ' t/s' : '—');
+}
+
+function renderUsers(rows) {
+  const tbody = document.getElementById('users-tbody');
+  if (!rows || rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No data for this period.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(u => {
+    const isActive = u.is_active;
+    const quotaBar = buildQuotaBar(u.total_tokens, u.monthly_token_limit, u.quota_used_pct);
+    const lastSeen = fmtRelative(u.last_request);
+    return `
+      <tr>
+        <td class="td-user ${isActive ? 'user-active' : 'user-inactive'}">${esc(u.username)}</td>
+        <td class="mono">${fmt(u.request_count)}</td>
+        <td class="mono">${fmt(u.total_tokens)}</td>
+        <td>${quotaBar}</td>
+        <td class="mono">${u.rpm_limit || '—'}/m</td>
+        <td style="color:var(--text2);font-size:12px">${lastSeen}</td>
+        <td><span class="pill ${isActive ? 'active' : 'inactive'}">${isActive ? 'active' : 'off'}</span></td>
+      </tr>`;
+  }).join('');
+}
+
+function buildQuotaBar(used, limit, pct) {
+  if (!limit || limit === 0) return '<span style="color:var(--text3);font-size:11px">∞ unlimited</span>';
+  const p = pct != null ? pct : (used / limit * 100);
+  const cls = p >= 90 ? 'crit' : p >= 70 ? 'warn' : '';
+  return `
+    <div style="font-size:11px;color:var(--text2);margin-bottom:3px">${p.toFixed(1)}%</div>
+    <div class="quota-bar"><div class="quota-fill ${cls}" style="width:${Math.min(p,100)}%"></div></div>`;
+}
+
+function setText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = val;
+}
+function setHtml(id, html) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = html;
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+}
+
+// ── Init: create charts, then fetch all data ─────────────────────────────────
+function initCharts() {
+  mkLine('chart-req', [
+    { label: 'Requests', data: [], borderColor: COLORS.indigo, backgroundColor: COLORS.indigoA, fill: true, tension: .35, pointRadius: 2, borderWidth: 2 },
+    { label: 'Errors',   data: [], borderColor: COLORS.red,    backgroundColor: COLORS.redA,    fill: true, tension: .35, pointRadius: 2, borderWidth: 2 },
+  ]);
+  mkBar('chart-tok', [
+    { label: 'Prompt',     data: [], backgroundColor: COLORS.indigo },
+    { label: 'Completion', data: [], backgroundColor: COLORS.green  },
+  ]);
+  mkDoughnut('chart-sc');
+  mkLine('chart-lat', [
+    { label: 'Avg latency (ms)', data: [], borderColor: COLORS.amber, backgroundColor: COLORS.amberA, fill: true, tension: .35, pointRadius: 2, borderWidth: 2 },
+  ]);
+}
+
+async function fetchAll() {
+  await Promise.allSettled([
+    fetchOverview(),
+    fetchTimeseries('req', periods.req),
+    fetchTimeseries('tok', periods.tok),
+    fetchTimeseries('lat', periods.lat),
+    fetchStatusCodes(periods.sc),
+    fetchUsers(),
+    fetchLlama(),
+  ]);
+  const now = new Date().toLocaleTimeString();
+  document.getElementById('last-updated').textContent = `Updated ${now}`;
+}
+
+let _refreshInterval = null;
+
+async function doRefresh() {
+  const btn = document.getElementById('refresh-btn');
+  const icon = document.getElementById('refresh-icon');
+  btn.disabled = true;
+  icon.style.animation = 'spin 1s linear infinite';
+  await fetchAll();
+  icon.style.animation = '';
+  btn.disabled = false;
+}
+
+function init() {
+  initCharts();
+  fetchAll();
+  _refreshInterval = setInterval(fetchAll, 30_000);
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+if (_token) {
+  // Validate existing token silently
+  apiGet('overview')
+    .then(() => {
+      document.getElementById('login-overlay').classList.add('hidden');
+      init();
+    })
+    .catch(() => {
+      sessionStorage.removeItem(TOKEN_KEY);
+      _token = '';
+    });
+} else {
+  // Show login
+}
+</script>
+</body>
+</html>

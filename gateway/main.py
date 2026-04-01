@@ -13,15 +13,17 @@ import logging
 import logging.config
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 import database as db
 from admin import router as admin_router
 from auth import get_current_user
 from config import settings
+from metrics import router as metrics_router
 from proxy import models_response, proxy_request
 from rate_limiter import check_rate_limit
 from server_manager import server_manager
@@ -104,8 +106,9 @@ app.add_middleware(
     max_age=600,
 )
 
-# Routes admin
+# Routes admin + métriques dashboard
 app.include_router(admin_router)
+app.include_router(metrics_router)
 
 
 # ── Middleware de logging des requêtes ────────────────────────────────────────
@@ -116,8 +119,9 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    # Ne pas loguer les health checks pour ne pas polluer les logs
-    if request.url.path not in ("/health", "/v1/models"):
+    # Ne pas loguer les health checks ni les polls dashboard pour ne pas polluer les logs
+    _silent = ("/health", "/v1/models")
+    if not request.url.path.startswith("/admin/metrics") and request.url.path not in _silent:
         log.info(
             "%s %s %d %dms",
             request.method,
@@ -129,6 +133,13 @@ async def log_requests(request: Request, call_next):
 
 
 # ── Routes publiques ──────────────────────────────────────────────────────────
+
+@app.get("/admin/dashboard", include_in_schema=False)
+async def dashboard_ui():
+    """Sert le dashboard d'administration (SPA HTML)."""
+    html_path = Path(__file__).parent / "static" / "dashboard.html"
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+
 
 @app.get("/health", include_in_schema=False)
 async def health():

@@ -386,3 +386,185 @@ async def get_usage_summary(
             params,
         )).fetchall()
         return [dict(r) for r in rows]
+
+
+# ── Dashboard analytics ───────────────────────────────────────────────────────
+
+async def get_overview_stats() -> dict:
+    """
+    Agrégats KPI pour le dashboard :
+    - Compteurs aujourd'hui et hier (pour Δ%)
+    - Compteurs sur les dernières 24h
+    - Utilisateurs actifs sur 7 jours
+    - Taux d'erreur sur 24h
+    """
+    async with get_db() as db:
+        row = await (await db.execute(
+            """
+            SELECT
+                -- Aujourd'hui (UTC)
+                COUNT(CASE WHEN date(timestamp) = date('now') THEN 1 END)
+                    AS requests_today,
+                COALESCE(SUM(CASE WHEN date(timestamp) = date('now')
+                    THEN total_tokens END), 0)
+                    AS tokens_today,
+                COALESCE(SUM(CASE WHEN date(timestamp) = date('now')
+                    THEN prompt_tokens END), 0)
+                    AS prompt_tokens_today,
+                COALESCE(SUM(CASE WHEN date(timestamp) = date('now')
+                    THEN completion_tokens END), 0)
+                    AS completion_tokens_today,
+
+                -- Hier (pour calcul Δ%)
+                COUNT(CASE WHEN date(timestamp) = date('now', '-1 day') THEN 1 END)
+                    AS requests_yesterday,
+                COALESCE(SUM(CASE WHEN date(timestamp) = date('now', '-1 day')
+                    THEN total_tokens END), 0)
+                    AS tokens_yesterday,
+
+                -- 24 dernières heures
+                COUNT(CASE WHEN timestamp >= datetime('now', '-24 hours') THEN 1 END)
+                    AS requests_24h,
+                COALESCE(SUM(CASE WHEN timestamp >= datetime('now', '-24 hours')
+                    THEN total_tokens END), 0)
+                    AS tokens_24h,
+
+                -- Erreurs 24h (status != 200)
+                COUNT(CASE WHEN timestamp >= datetime('now', '-24 hours')
+                    AND status_code IS NOT NULL AND status_code != 200 THEN 1 END)
+                    AS errors_24h,
+
+                -- Latence moyenne 24h
+                AVG(CASE WHEN timestamp >= datetime('now', '-24 hours')
+                    AND duration_ms IS NOT NULL THEN duration_ms END)
+                    AS avg_latency_24h_ms,
+
+                -- Total utilisateurs ayant fait au moins une requête en 7j
+                COUNT(DISTINCT CASE WHEN timestamp >= datetime('now', '-7 days')
+                    THEN user_id END)
+                    AS active_users_7d
+            FROM usage_log
+            """
+        )).fetchone()
+
+        total_users_row = await (await db.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE is_active = 1"
+        )).fetchone()
+
+    result = dict(row)
+    result["total_users"] = total_users_row["n"] if total_users_row else 0
+
+    # Taux d'erreur 24h
+    r24h = result["requests_24h"] or 0
+    result["error_rate_24h"] = (
+        round(result["errors_24h"] / r24h, 4) if r24h > 0 else 0.0
+    )
+    return result
+
+
+async def get_timeseries(bucket: str = "hour", lookback_hours: int = 24) -> list[dict]:
+    """
+    Série temporelle agrégée par heure ou par jour.
+
+    bucket : "hour" → GROUP BY heure  |  "day" → GROUP BY jour
+    lookback_hours : fenêtre en heures (24, 168, 720…)
+    """
+    if bucket == "day":
+        fmt = "%Y-%m-%d"
+    else:
+        fmt = "%Y-%m-%d %H:00"
+
+    async with get_db() as db:
+        rows = await (await db.execute(
+            f"""
+            SELECT
+                strftime('{fmt}', timestamp)    AS bucket,
+                COUNT(*)                         AS request_count,
+                COALESCE(SUM(prompt_tokens), 0)     AS prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0)      AS total_tokens,
+                COUNT(CASE WHEN status_code IS NOT NULL
+                           AND status_code != 200 THEN 1 END) AS error_count,
+                AVG(duration_ms)                 AS avg_latency_ms
+            FROM usage_log
+            WHERE timestamp >= datetime('now', ? || ' hours')
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            """,
+            (f"-{lookback_hours}",),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_user_period_stats(period_days: int = 30) -> list[dict]:
+    """
+    Statistiques par utilisateur sur une période donnée.
+    Inclut les limites quota pour afficher les barres de progression.
+    """
+    async with get_db() as db:
+        rows = await (await db.execute(
+            """
+            SELECT
+                u.username,
+                u.is_active,
+                u.rpm_limit,
+                u.monthly_token_limit,
+                COUNT(l.id)                          AS request_count,
+                COALESCE(SUM(l.total_tokens), 0)     AS total_tokens,
+                COALESCE(SUM(l.prompt_tokens), 0)    AS prompt_tokens,
+                COALESCE(SUM(l.completion_tokens), 0) AS completion_tokens,
+                COUNT(CASE WHEN l.status_code IS NOT NULL
+                           AND l.status_code != 200 THEN 1 END) AS error_count,
+                AVG(l.duration_ms)                   AS avg_latency_ms,
+                MAX(l.timestamp)                     AS last_request
+            FROM users u
+            LEFT JOIN usage_log l
+                ON l.user_id = u.id
+                AND l.timestamp >= datetime('now', ? || ' days')
+            GROUP BY u.id, u.username
+            ORDER BY total_tokens DESC
+            """,
+            (f"-{period_days}",),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_status_code_stats(period_hours: int = 24) -> list[dict]:
+    """Distribution des codes HTTP sur la période."""
+    async with get_db() as db:
+        rows = await (await db.execute(
+            """
+            SELECT
+                COALESCE(CAST(status_code AS TEXT), 'unknown') AS status_code,
+                COUNT(*) AS count
+            FROM usage_log
+            WHERE timestamp >= datetime('now', ? || ' hours')
+            GROUP BY status_code
+            ORDER BY count DESC
+            """,
+            (f"-{period_hours}",),
+        )).fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_latency_samples(
+    period_hours: int = 168,
+    limit: int = 10_000,
+) -> list[int]:
+    """
+    Retourne les durées brutes (ms) pour le calcul des percentiles en Python.
+    On utilise l'index idx_usage_timestamp.
+    """
+    async with get_db() as db:
+        rows = await (await db.execute(
+            """
+            SELECT duration_ms
+            FROM usage_log
+            WHERE timestamp >= datetime('now', ? || ' hours')
+              AND duration_ms IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (f"-{period_hours}", limit),
+        )).fetchall()
+        return [r["duration_ms"] for r in rows]
