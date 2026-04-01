@@ -1,0 +1,1912 @@
+% ============================================================
+%  Guide utilisateur — API Cluster EVA
+%  Université de Pau et des Pays de l'Adour (UPPA)
+%  Auteur : Mohamad El Akhal El Bouzidi
+% ============================================================
+\documentclass[12pt, a4paper, twoside]{article}
+
+% ── Encodage & langue ────────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[french]{babel}
+\usepackage{csquotes}
+
+% ── Mise en page ─────────────────────────────────────────────
+\usepackage[
+  top=2.5cm, bottom=2.5cm,
+  inner=3cm, outer=2.5cm,
+  headheight=14pt
+]{geometry}
+\usepackage{fancyhdr}
+\usepackage{emptypage}
+\usepackage{setspace}
+\onehalfspacing
+
+% ── Police ───────────────────────────────────────────────────
+\usepackage{lmodern}
+\usepackage{microtype}
+
+% ── Mathématiques ────────────────────────────────────────────
+\usepackage{amsmath}
+
+% ── Graphiques & couleurs ────────────────────────────────────
+\usepackage{graphicx}
+\usepackage[table]{xcolor}
+\definecolor{codebg}{gray}{0.96}
+\definecolor{coderule}{gray}{0.70}
+\definecolor{notebg}{gray}{0.93}
+\definecolor{warnbg}{gray}{0.88}
+\definecolor{uppaBlue}{RGB}{0,72,144}
+
+% ── Listings (blocs de code) ─────────────────────────────────
+\usepackage{listings}
+\lstdefinestyle{bashstyle}{
+  language=bash,
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{coderule},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b,
+  xleftmargin=6pt,
+  xrightmargin=6pt,
+  aboveskip=6pt,
+  belowskip=4pt,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape\color{gray},
+}
+\lstdefinestyle{pythonstyle}{
+  language=python,
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{coderule},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=4,
+  captionpos=b,
+  xleftmargin=6pt,
+  xrightmargin=6pt,
+  aboveskip=6pt,
+  belowskip=4pt,
+  keywordstyle=\bfseries,
+  stringstyle=\color{black!70},
+  commentstyle=\itshape\color{gray},
+  morekeywords={True,False,None,from,import,as,def,return,async,await,with,for,in,if,elif,else,try,except,raise,print,open},
+}
+\lstdefinestyle{jsonstyle}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0.4pt,
+  rulecolor=\color{coderule},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  tabsize=2,
+  captionpos=b,
+  xleftmargin=6pt,
+  xrightmargin=6pt,
+  aboveskip=6pt,
+  belowskip=4pt,
+}
+\lstset{style=pythonstyle}
+
+% ── Boîtes de mise en évidence ───────────────────────────────
+\usepackage{tcolorbox}
+\tcbuselibrary{skins, breakable}
+
+\newtcolorbox{important}[1][]{
+  enhanced, breakable,
+  colback=notebg, colframe=black!40,
+  fonttitle=\bfseries\small,
+  title={Important},
+  boxrule=0.5pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt,
+  #1
+}
+\newtcolorbox{warning}[1][]{
+  enhanced, breakable,
+  colback=warnbg, colframe=black!55,
+  fonttitle=\bfseries\small,
+  title={Attention},
+  boxrule=0.8pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt,
+  #1
+}
+\newtcolorbox{tip}[1][]{
+  enhanced, breakable,
+  colback=codebg, colframe=black!30,
+  fonttitle=\bfseries\small,
+  title={Bonne pratique},
+  boxrule=0.4pt,
+  left=6pt, right=6pt, top=4pt, bottom=4pt,
+  #1
+}
+
+% ── Tableaux ─────────────────────────────────────────────────
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{longtable}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+% ── Liens & navigation ───────────────────────────────────────
+\usepackage[
+  colorlinks=true,
+  linkcolor=uppaBlue,
+  urlcolor=uppaBlue,
+  citecolor=uppaBlue,
+  pdftitle={Guide API — Cluster EVA UPPA},
+  pdfauthor={Mohamad El Akhal El Bouzidi},
+  pdfsubject={Guide utilisateur API d'inférence LLM},
+]{hyperref}
+
+% ── Numérotation & titres ────────────────────────────────────
+\usepackage{titlesec}
+\titleformat{\section}
+  {\Large\bfseries\color{uppaBlue}}{\thesection}{1em}{}[\vspace{-2pt}\rule{\textwidth}{0.4pt}]
+\titleformat{\subsection}
+  {\large\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}
+  {\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+% ── En-têtes & pieds de page ─────────────────────────────────
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[LE]{\small\leftmark}
+\fancyhead[RO]{\small Guide API — Cluster EVA}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% ── Divers ───────────────────────────────────────────────────
+\usepackage{parskip}
+\setlength{\parskip}{6pt}
+\usepackage{enumitem}
+\setlist{itemsep=2pt, parsep=0pt}
+\usepackage{caption}
+\captionsetup{font=small, labelfont=bf}
+
+% ── Commandes utilitaires ────────────────────────────────────
+\newcommand{\api}[1]{\texttt{#1}}
+\newcommand{\param}[1]{\texttt{\textbf{#1}}}
+\newcommand{\version}{1.0}
+\newcommand{\baseurl}{\texttt{https://llm.eva.univ-pau.fr}}
+\newcommand{\keyformat}{\texttt{llmgw-XXXXXXXX\ldots}}
+
+% ============================================================
+\begin{document}
+
+% ── Page de titre ────────────────────────────────────────────
+\begin{titlepage}
+  \centering
+  \vspace*{2cm}
+
+  {\large Université de Pau et des Pays de l'Adour}\\[0.3cm]
+  {\large Laboratoire de Mathématiques et de leurs Applications — UPPA}\\[2cm]
+
+  \rule{\textwidth}{1.5pt}\\[0.4cm]
+  {\Huge\bfseries\color{uppaBlue}
+    Guide d'utilisation\\[0.3cm]
+    de l'API du Cluster EVA
+  }\\[0.4cm]
+  \rule{\textwidth}{1.5pt}
+
+  \vspace{1.5cm}
+  {\large\bfseries Service d'inférence de grands modèles de langage (LLM)\\
+  à destination des doctorants, enseignants, chercheurs et stagiaires}
+
+  \vspace{2cm}
+
+  \begin{tabular}{ll}
+    \textbf{Auteur}   & Mohamad El Akhal El Bouzidi \\[4pt]
+    \textbf{Contacts} & Mohamad El Akhal El Bouzidi \\
+                      & Benjamin Mascret \\[4pt]
+    \textbf{Version}  & \version \\[4pt]
+    \textbf{Date}     & \today \\
+  \end{tabular}
+
+  \vfill
+
+  {\small
+    Ce document est destiné aux membres de la communauté universitaire de l'UPPA.\\
+    Il constitue la référence complète pour l'utilisation de l'API du cluster EVA.
+  }
+\end{titlepage}
+
+% ── Table des matières ───────────────────────────────────────
+\tableofcontents
+\clearpage
+
+% ============================================================
+\section*{À propos de ce document}
+\addcontentsline{toc}{section}{À propos de ce document}
+
+Ce guide s'adresse à toute personne souhaitant utiliser le service d'inférence de modèles de
+langage mis en place sur le cluster EVA de l'UPPA. Que vous soyez doctorant, enseignant-chercheur,
+ingénieur de recherche ou stagiaire, ce document vous fournira toutes les informations nécessaires
+pour intégrer rapidement l'API dans vos scripts, notebooks ou applications.
+
+\textbf{Prérequis} : des connaissances de base en Python (ou JavaScript) ainsi qu'une familiarité
+générale avec les requêtes HTTP sont suffisantes. Aucune connaissance préalable en intelligence
+artificielle ou en modèles de langage n'est requise pour suivre les exemples de ce guide.
+
+\textbf{Contacts principaux} :
+\begin{itemize}
+  \item \textbf{Mohamad El Akhal El Bouzidi} --- responsable technique du service
+  \item \textbf{Benjamin Mascret} --- administrateur système et infrastructure
+\end{itemize}
+
+Pour toute demande d'accès, signalement d'anomalie ou question technique, contacter en priorité
+l'un de ces deux interlocuteurs.
+
+% ============================================================
+\section{Présentation du service}
+
+\subsection{Qu'est-ce que le cluster EVA ?}
+
+Le cluster EVA est une infrastructure GPU dédiée à l'UPPA, équipée d'un GPU NVIDIA L40S
+(48\,Go de VRAM). Elle héberge \textbf{EVARuntime}, une passerelle logicielle (\textit{gateway})
+qui permet à tout membre de l'université d'exécuter des grands modèles de langage (LLM) de manière
+souveraine --- c'est-à-dire que les données ne quittent jamais les serveurs de l'établissement.
+
+Ce service répond à trois besoins essentiels en milieu académique :
+
+\begin{center}
+\begin{tabular}{L{3.5cm} L{9cm}}
+  \toprule
+  \textbf{Défi} & \textbf{Solution EVARuntime} \\
+  \midrule
+  Souveraineté des données
+    & Toutes les données restent sur les serveurs UPPA. Aucune information ne transite
+      vers des services commerciaux tiers (OpenAI, Anthropic, etc.). \\
+  \addlinespace
+  Coût énergétique
+    & Le GPU est libéré automatiquement en l'absence d'utilisation, réduisant la consommation
+      de $\sim350$\,W à $\sim30$\,W lors des périodes d'inactivité. \\
+  \addlinespace
+  Simplicité d'usage
+    & L'API est \textbf{entièrement compatible avec le standard OpenAI}. Tout code existant
+      utilisant la bibliothèque \texttt{openai}, LangChain, LiteLLM ou \texttt{curl} fonctionne
+      en changeant uniquement l'URL de base et la clé d'authentification. \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Architecture générale}
+
+La figure suivante illustre le chemin suivi par une requête depuis votre poste de travail
+jusqu'au GPU.
+
+\begin{figure}[h]
+\centering
+\begin{minipage}{0.85\textwidth}
+\begin{lstlisting}[style=bashstyle, frame=single, caption={Vue schématique de l'architecture}]
+Internet / Réseau UPPA
+        |
+        v  HTTPS / TLS 1.3
+  [ nginx ]  (terminaison TLS, filtrage IP pour /admin/)
+        |
+        v  HTTP interne (127.0.0.1:8000)
+  [ FastAPI Gateway ]
+     |-- Authentification (clé API, hachée SHA-256)
+     |-- Rate limiting (fenêtre glissante)
+     |-- Gestion du cycle de vie des modèles
+        |
+        v  HTTP interne (127.0.0.1:808x)
+  [ llama-server ]  (sous-processus, moteur llama.cpp)
+        |
+        v  CUDA
+  [ NVIDIA L40S — 48 Go VRAM ]
+\end{lstlisting}
+\end{minipage}
+\end{figure}
+
+\textbf{Point clé} : le moteur d'inférence \texttt{llama-server} est lancé comme sous-processus
+de la gateway. Lorsqu'aucune requête n'arrive pendant 5~minutes, il est arrêté proprement,
+libérant intégralement la VRAM GPU.
+
+\subsection{Modèles disponibles}
+
+Les modèles suivants peuvent être mis à disposition. L'administrateur active ou désactive les
+modèles selon les besoins et la disponibilité des fichiers.
+
+\begin{center}
+\begin{tabular}{L{4.5cm} C{2.5cm} C{2cm} L{4.5cm}}
+  \toprule
+  \textbf{Modèle} & \textbf{Quantisation} & \textbf{VRAM} & \textbf{Profil d'usage} \\
+  \midrule
+  Llama-3.3-70B-Instruct  & Q4\_K\_M & $\sim$40\,Go & Optimal qualité/taille \\
+  Qwen2.5-72B-Instruct    & Q4\_K\_M & $\sim$40\,Go & Alternative performante \\
+  Qwen2.5-34B-Instruct    & Q8\_0    & $\sim$36\,Go & Qualité maximale en 34B \\
+  Llama-3.1-8B-Instruct   & Q8\_0    & $\sim$9\,Go  & Rapide, faible latence \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+Pour connaître la liste exacte des modèles actuellement activés, utiliser l'endpoint
+\api{GET /v1/models} (voir section~\ref{sec:premier-test}).
+
+% ============================================================
+\section{Obtenir une clé API}
+\label{sec:cle-api}
+
+\subsection{Demande d'accès}
+
+L'accès au service est nominatif. Pour obtenir une clé API, contactez l'un des responsables
+du service en indiquant :
+\begin{itemize}
+  \item votre nom, prénom et adresse email institutionnelle,
+  \item le cadre d'utilisation prévu (thèse, enseignement, projet de recherche, stage, etc.),
+  \item une estimation du volume de requêtes attendu si vous envisagez une utilisation intensive
+        (traitement de corpus, pipeline d'annotation automatique, etc.).
+\end{itemize}
+
+Vous recevrez une clé au format suivant :
+\begin{center}
+  \texttt{llmgw-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX}
+\end{center}
+
+\begin{warning}
+  La clé brute vous est transmise \textbf{une seule fois}. Le serveur n'en conserve qu'une
+  empreinte cryptographique (hash SHA-256) et ne peut pas la régénérer. En cas de perte,
+  vous devrez demander la création d'une nouvelle clé et la révocation de l'ancienne.
+\end{warning}
+
+\subsection{Sécuriser votre clé}
+
+La clé API est un secret d'authentification personnel. Les règles suivantes sont impératives :
+
+\begin{warning}[title={Ne jamais faire}]
+  \begin{itemize}
+    \item Committer la clé dans un dépôt Git (même privé).
+    \item La partager par email ou messagerie non chiffrée.
+    \item La placer en dur dans le code source.
+    \item La publier dans un notebook Jupyter partagé.
+  \end{itemize}
+\end{warning}
+
+\begin{tip}
+  Stocker la clé dans une variable d'environnement ou dans un fichier \texttt{.env}
+  exclu du contrôle de version.
+
+\begin{lstlisting}[style=bashstyle, caption={Configuration de la variable d'environnement}]
+# Ajouter dans ~/.bashrc ou ~/.zshrc
+export UPPA_LLM_KEY="llmgw-votre_cle_ici"
+
+# Pour un projet Python : utiliser un fichier .env
+echo "UPPA_LLM_KEY=llmgw-votre_cle_ici" >> .env
+echo ".env" >> .gitignore
+\end{lstlisting}
+\end{tip}
+
+Pour charger la variable en Python sans la coder en dur :
+\begin{lstlisting}[style=pythonstyle, caption={Lecture de la clé depuis l'environnement}]
+import os
+api_key = os.environ["UPPA_LLM_KEY"]   # erreur claire si absent
+# ou, avec une valeur par defaut :
+api_key = os.getenv("UPPA_LLM_KEY", "")
+\end{lstlisting}
+
+% ============================================================
+\section{Premier test}
+\label{sec:premier-test}
+
+Avant d'écrire un script Python complet, il est utile de vérifier que le service répond
+et d'explorer les modèles disponibles. L'outil \texttt{curl} est idéal pour cela.
+
+\subsection{Vérifier l'état du service}
+
+\begin{lstlisting}[style=bashstyle, caption={Vérification de l'état de santé du service (aucune clé requise)}]
+curl -s https://llm.eva.univ-pau.fr/health
+\end{lstlisting}
+
+Réponse attendue :
+\begin{lstlisting}[style=jsonstyle, caption={Réponse de l'endpoint /health}]
+{
+  "status": "ok",
+  "models_loaded": [],
+  "vram_used_gb": 0.0,
+  "vram_available_gb": 43.6
+}
+\end{lstlisting}
+
+Si \texttt{"status": "ok"} apparaît, le service est opérationnel. Le champ
+\texttt{models\_loaded} indique les modèles actuellement en mémoire GPU.
+
+\subsection{Lister les modèles disponibles}
+
+\begin{lstlisting}[style=bashstyle, caption={Liste des modèles activés}]
+curl -s https://llm.eva.univ-pau.fr/v1/models \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
+\end{lstlisting}
+
+\subsection{Première requête de génération}
+
+\begin{lstlisting}[style=bashstyle, caption={Première requête de génération de texte avec curl}]
+curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "messages": [
+      {"role": "user", "content": "Explique le theoreme de Bayes en 3 phrases."}
+    ]
+  }' | python3 -m json.tool
+\end{lstlisting}
+
+Réponse attendue :
+\begin{lstlisting}[style=jsonstyle, caption={Structure de la réponse (format OpenAI standard)}]
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "model": "llama-3.3-70b-instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Le theoreme de Bayes decrit comment mettre a jour..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 28,
+    "completion_tokens": 87,
+    "total_tokens": 115
+  }
+}
+\end{lstlisting}
+
+\begin{important}
+  Si la réponse tarde (60 à 90~secondes), c'est normal lors du premier appel : le modèle
+  doit être chargé en VRAM depuis le disque. Les requêtes suivantes sont beaucoup plus rapides.
+  Ce comportement est expliqué en détail à la section~\ref{sec:premier-appel}.
+\end{important}
+
+% ============================================================
+\section{Intégration Python avec \texttt{openai-python}}
+\label{sec:python-openai}
+
+La bibliothèque officielle \texttt{openai} est la méthode recommandée pour interagir avec
+l'API depuis Python. Elle gère automatiquement la sérialisation JSON, le streaming et la
+gestion basique des erreurs.
+
+\subsection{Installation}
+
+\begin{lstlisting}[style=bashstyle, caption={Installation de la bibliothèque openai}]
+pip install openai
+# ou, dans un environnement virtuel (recommande) :
+python -m venv .venv && source .venv/bin/activate
+pip install openai
+\end{lstlisting}
+
+\subsection{Configuration du client}
+
+\begin{lstlisting}[style=pythonstyle, caption={Initialisation du client OpenAI pointant sur le cluster EVA}]
+from openai import OpenAI
+import os
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    # Augmenter le timeout : le modele peut mettre 60-90s a charger
+    timeout=120.0,
+)
+\end{lstlisting}
+
+Le paramètre \param{base\_url} redirige toutes les requêtes vers le cluster EVA au lieu
+des serveurs d'OpenAI. C'est le \textbf{seul changement} nécessaire par rapport à un
+code Python existant utilisant l'API OpenAI.
+
+\subsection{Requête simple}
+
+\begin{lstlisting}[style=pythonstyle, caption={Génération de texte simple}]
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[
+        {"role": "system", "content": "Tu es un assistant de recherche scientifique."},
+        {"role": "user",   "content": "Quelles sont les principales limites des LLMs ?"}
+    ],
+)
+
+print(response.choices[0].message.content)
+print(f"\n--- Tokens utilises : {response.usage.total_tokens} ---")
+\end{lstlisting}
+
+Le champ \param{model} détermine quel modèle traitera la demande. Pour connaître
+les modèles disponibles :
+
+\begin{lstlisting}[style=pythonstyle, caption={Lister les modèles depuis Python}]
+models = client.models.list()
+for m in models.data:
+    print(m.id)
+# Exemple de sortie :
+#   llama-3.3-70b-instruct
+#   llama-3.1-8b-instruct
+\end{lstlisting}
+
+\subsection{Choisir le bon modèle}
+
+Le choix du modèle dépend du compromis qualité/latence souhaité :
+
+\begin{lstlisting}[style=pythonstyle, caption={Sélection du modèle adapté au cas d'usage}]
+# Modele principal : qualite maximale, latence plus elevee
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[{"role": "user", "content": "Analyse ce texte en detail..."}],
+)
+
+# Modele leger : latence reduite (~15s de chargement vs ~90s)
+response = client.chat.completions.create(
+    model="llama-3.1-8b-instruct",
+    messages=[{"role": "user", "content": "Resume en 2 phrases."}],
+)
+\end{lstlisting}
+
+\subsection{Conversation multi-tours}
+
+Les LLMs sont des modèles \textit{stateless} : ils ne mémorisent pas les échanges précédents.
+Pour maintenir un contexte conversationnel, il faut transmettre l'historique complet à chaque
+requête sous la forme d'un tableau de messages.
+
+\begin{lstlisting}[style=pythonstyle, caption={Gestion d'une conversation multi-tours}]
+def chat(messages: list[dict], model: str = "llama-3.3-70b-instruct") -> str:
+    """Envoie une conversation et retourne la reponse."""
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=2048,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
+
+
+# Construction de la conversation
+conversation = [
+    {"role": "system", "content": "Tu es un expert en traitement du langage naturel."}
+]
+
+# Tour 1
+conversation.append({"role": "user", "content": "Qu'est-ce qu'un transformer ?"})
+reply = chat(conversation)
+conversation.append({"role": "assistant", "content": reply})
+print("Assistant :", reply)
+
+# Tour 2 — le modele a acces au tour 1 grace a l'historique
+conversation.append({"role": "user", "content": "Et le mecanisme d'attention ?"})
+reply = chat(conversation)
+print("Assistant :", reply)
+\end{lstlisting}
+
+\subsection{Gestion robuste des erreurs}
+
+Dans un pipeline de traitement, les erreurs passagères (modèle en cours de chargement,
+limite de débit dépassée) sont inévitables. Voici un patron de code avec relance automatique :
+
+\begin{lstlisting}[style=pythonstyle, caption={Requête avec retry automatique et gestion des erreurs}]
+import time
+from openai import OpenAI, APIStatusError, APITimeoutError, APIConnectionError
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=120.0,
+    max_retries=0,  # On gere nous-memes les retries
+)
+
+
+def query_with_retry(messages: list[dict],
+                     model: str = "llama-3.3-70b-instruct",
+                     max_attempts: int = 3) -> str:
+    """
+    Envoie une requete avec retry automatique.
+    Attend le chargement du modele si necessaire (503).
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=2048,
+            )
+            return response.choices[0].message.content
+
+        except APIStatusError as e:
+            if e.status_code == 503:
+                # Modele en cours de chargement — attendre et reessayer
+                wait = 30 * attempt
+                print(f"Modele en chargement, attente {wait}s "
+                      f"(tentative {attempt}/{max_attempts})...")
+                time.sleep(wait)
+            elif e.status_code == 429:
+                print("Limite de debit atteinte, attente 60s...")
+                time.sleep(60)
+            elif e.status_code == 401:
+                raise ValueError("Cle API invalide ou revoquee.") from e
+            elif e.status_code in (404, 403):
+                raise ValueError(f"Modele '{model}' inconnu ou desactive.") from e
+            else:
+                raise
+
+        except APITimeoutError:
+            print(f"Timeout (tentative {attempt}/{max_attempts})...")
+            time.sleep(10 * attempt)
+
+        except APIConnectionError:
+            print(f"Serveur injoignable (tentative {attempt}/{max_attempts})...")
+            time.sleep(5 * attempt)
+
+    raise RuntimeError(f"Echec apres {max_attempts} tentatives.")
+
+
+# Utilisation
+result = query_with_retry([
+    {"role": "user", "content": "Resume ce paragraphe : ..."}
+])
+print(result)
+\end{lstlisting}
+
+% ============================================================
+\section{Requêtes HTTP directes avec \texttt{httpx}}
+\label{sec:httpx}
+
+Si vous ne souhaitez pas dépendre de la bibliothèque \texttt{openai}, vous pouvez effectuer
+des requêtes HTTP directes. La bibliothèque \texttt{httpx} est recommandée pour sa compatibilité
+synchrone et asynchrone.
+
+\begin{lstlisting}[style=bashstyle]
+pip install httpx
+\end{lstlisting}
+
+\begin{lstlisting}[style=pythonstyle, caption={Requête HTTP directe avec httpx}]
+import httpx
+import os
+
+API_URL = "https://llm.eva.univ-pau.fr/v1/chat/completions"
+HEADERS = {
+    "Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}",
+    "Content-Type": "application/json",
+}
+
+
+def ask(prompt: str,
+        model: str = "llama-3.3-70b-instruct",
+        system: str = "Tu es un assistant utile.") -> str:
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": prompt},
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.7,
+    }
+    with httpx.Client(timeout=120.0) as http_client:
+        resp = http_client.post(API_URL, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+print(ask("Quelle est la capitale de la France ?"))
+\end{lstlisting}
+
+% ============================================================
+\section{Streaming}
+\label{sec:streaming}
+
+Le streaming permet de recevoir la réponse \textbf{token par token}, comme sur une interface
+conversationnelle classique. Il est utile pour les longues générations (améliore la réactivité
+perçue) ou pour les applications qui traitent la sortie au fur et à mesure.
+
+\subsection{Streaming synchrone (openai-python)}
+
+\begin{lstlisting}[style=pythonstyle, caption={Streaming simple — affichage token par token}]
+stream = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[{"role": "user", "content": "Redige une introduction sur les transformers."}],
+    stream=True,
+    max_tokens=1024,
+)
+
+for chunk in stream:
+    delta = chunk.choices[0].delta.content
+    if delta:
+        print(delta, end="", flush=True)
+
+print()  # Saut de ligne final
+\end{lstlisting}
+
+\subsection{Streaming avec collecte du résultat complet}
+
+\begin{lstlisting}[style=pythonstyle, caption={Streaming avec accumulation du texte complet}]
+def stream_and_collect(messages: list[dict],
+                       model: str = "llama-3.3-70b-instruct") -> str:
+    """Stream vers stdout et retourne le texte complet."""
+    full_text = ""
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        print(delta, end="", flush=True)
+        full_text += delta
+    print()
+    return full_text
+
+
+text = stream_and_collect([
+    {"role": "user", "content": "Liste 5 avantages du RAG (Retrieval-Augmented Generation)."}
+])
+# Le texte complet est maintenant dans la variable `text`
+\end{lstlisting}
+
+\subsection{Streaming asynchrone (FastAPI / asyncio)}
+
+Pour les applications web ou tout code basé sur \texttt{asyncio} :
+
+\begin{lstlisting}[style=pythonstyle, caption={Streaming asynchrone avec AsyncOpenAI}]
+import asyncio
+from openai import AsyncOpenAI
+
+async_client = AsyncOpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=120.0,
+)
+
+
+async def stream_response(prompt: str, model: str = "llama-3.3-70b-instruct"):
+    async with async_client.beta.chat.completions.stream(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        async for text in stream.text_stream:
+            print(text, end="", flush=True)
+    print()
+
+
+asyncio.run(stream_response("Explique le fine-tuning en 5 points."))
+\end{lstlisting}
+
+\subsection{Streaming avec curl (Server-Sent Events)}
+
+\begin{lstlisting}[style=bashstyle, caption={Streaming SSE avec curl}]
+curl -sN https://llm.eva.univ-pau.fr/v1/chat/completions \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "messages": [{"role": "user", "content": "Compte jusqu'\''a 5 lentement."}],
+    "stream": true
+  }'
+
+# Chaque ligne recue ressemble a :
+# data: {"id":"chatcmpl-...","choices":[{"delta":{"content":"1"},...}]}
+# data: {"id":"chatcmpl-...","choices":[{"delta":{"content":","},...}]}
+# ...
+# data: [DONE]
+\end{lstlisting}
+
+% ============================================================
+\section{Paramètres de génération}
+\label{sec:parametres}
+
+\subsection{Paramètres standard OpenAI}
+
+Ces paramètres sont universellement supportés et documentés dans la référence OpenAI.
+
+\begin{lstlisting}[style=pythonstyle, caption={Tous les paramètres standard supportés}]
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[{"role": "user", "content": "Ton message ici"}],
+
+    # Longueur
+    max_tokens=2048,        # Nombre max de tokens a generer (defaut : illimite)
+
+    # Creativite / diversite
+    temperature=0.7,        # 0.0 = deterministe, 2.0 = tres creatif (defaut : 1.0)
+    top_p=0.9,              # Nucleus sampling (alternative a temperature)
+
+    # Repetitions
+    frequency_penalty=0.0,  # Penalise les tokens frequents (-2 a 2)
+    presence_penalty=0.0,   # Penalise les tokens deja apparus (-2 a 2)
+
+    # Arret
+    stop=["###", "\n\n"],   # Sequences qui arretent la generation
+
+    # Streaming
+    stream=False,           # True pour le streaming token par token
+)
+\end{lstlisting}
+
+Le tableau suivant donne des recommandations pratiques par type de tâche :
+
+\begin{center}
+\begin{tabular}{L{4cm} C{2.5cm} C{2cm} C{2.5cm}}
+  \toprule
+  \textbf{Cas d'usage} & \textbf{temperature} & \textbf{top\_p} & \textbf{max\_tokens} \\
+  \midrule
+  Extraction / classification  & 0.0--0.2 & ---  & 256  \\
+  Réponses factuelles          & 0.3--0.5 & ---  & 1024 \\
+  Rédaction académique         & 0.5--0.7 & 0.9  & 2048 \\
+  Génération créative          & 0.8--1.2 & 0.95 & 4096 \\
+  Brainstorming                & 1.0--1.5 & 0.95 & 2048 \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Paramètres avancés de sampling (llama.cpp)}
+\label{sec:parametres-avances}
+
+La gateway est un \textbf{proxy transparent} : tous les paramètres natifs de \texttt{llama.cpp}
+peuvent être passés directement dans le corps de la requête \api{/v1/chat/completions}, en plus
+des paramètres OpenAI standard. Aucune configuration particulière n'est requise.
+
+Avec le SDK \texttt{openai-python}, les paramètres spécifiques à llama.cpp doivent être passés
+via le dictionnaire \param{extra\_body}. Le SDK les fusionne dans le corps JSON avant l'envoi.
+
+\subsubsection{Contrôle du vocabulaire}
+
+\begin{center}
+\begin{tabular}{L{2.5cm} C{1.5cm} L{9cm}}
+  \toprule
+  \textbf{Paramètre} & \textbf{Défaut} & \textbf{Description} \\
+  \midrule
+  \texttt{top\_k}  & 40   & Limite le vocabulaire aux $K$ tokens les plus probables \\
+  \texttt{min\_p}  & 0.05 & Exclut les tokens dont la probabilité est inférieure à 5\,\%
+                             de celle du token le plus probable \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Anti-répétition}
+
+Ces paramètres sont particulièrement utiles pour les longues générations (articles, rapports) :
+
+\begin{center}
+\begin{tabular}{L{3.5cm} C{1.5cm} L{8cm}}
+  \toprule
+  \textbf{Paramètre} & \textbf{Défaut} & \textbf{Description} \\
+  \midrule
+  \texttt{repeat\_last\_n}  & 64  & Fenêtre (en tokens) analysée pour détecter les répétitions \\
+  \texttt{repeat\_penalty}  & 1.0 & Pénalité appliquée ($1.1$ = légère, $1.3$ = forte) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Sampler DRY — anti-répétition long terme}
+
+Ce sampler détecte et pénalise les séquences de tokens qui se répètent sur de longues distances,
+là où \texttt{repeat\_penalty} est insuffisant. Il est conçu pour les générations de plus
+de 10\,000 mots.
+
+\begin{center}
+\begin{tabular}{L{4cm} C{1.5cm} L{7.5cm}}
+  \toprule
+  \textbf{Paramètre} & \textbf{Défaut} & \textbf{Description} \\
+  \midrule
+  \texttt{dry\_multiplier}      & 0.0  & Intensité (0 = désactivé, 0.5 = recommandé) \\
+  \texttt{dry\_base}            & 1.75 & Facteur de base de la pénalité exponentielle \\
+  \texttt{dry\_allowed\_length} & 2    & Longueur minimale d'une séquence répétée pénalisée \\
+  \texttt{dry\_penalty\_last\_n}& -1   & Fenêtre de recherche ($-1$ = contexte entier) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Mirostat — contrôle entropique adaptatif}
+
+Mirostat est une alternative à la combinaison \texttt{temperature} + \texttt{top\_p}. Plutôt
+que de fixer des seuils de probabilité, il contrôle directement l'\textit{entropie} du texte
+généré, c'est-à-dire son degré de prévisibilité.
+
+\begin{center}
+\begin{tabular}{L{3.5cm} C{1.5cm} L{8cm}}
+  \toprule
+  \textbf{Paramètre} & \textbf{Défaut} & \textbf{Description} \\
+  \midrule
+  \texttt{mirostat}     & 0   & 0 = désactivé, 1 = v1, \textbf{2 = v2 (recommandé)} \\
+  \texttt{mirostat\_tau}& 5.0 & Entropie cible ($\downarrow$ = plus prévisible) \\
+  \texttt{mirostat\_eta}& 0.1 & Taux d'adaptation (laisser à 0.1 par défaut) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Contrôle d'exécution}
+
+\begin{center}
+\begin{tabular}{L{3cm} C{2cm} L{8.5cm}}
+  \toprule
+  \textbf{Paramètre} & \textbf{Défaut} & \textbf{Description} \\
+  \midrule
+  \texttt{seed}        & aléatoire & Graine pour une génération reproductible (ex.~: \texttt{42}) \\
+  \texttt{n\_predict}  & ---        & Alias de \texttt{max\_tokens} \\
+  \texttt{ignore\_eos} & false      & Ignorer le token de fin de séquence \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{Exemple complet — génération longue avec paramètres avancés}
+
+\begin{lstlisting}[style=pythonstyle, caption={Génération longue avec paramètres llama.cpp via extra\_body}]
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=600.0,  # prevoir large pour les longues generations
+)
+
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[
+        {
+            "role": "system",
+            "content": "Tu es un expert en prospective educative. Redige un texte academique.",
+        },
+        {
+            "role": "user",
+            "content": "Redige un chapitre complet sur : L'IA comme tuteur algorithmique universel",
+        },
+    ],
+
+    # Parametres OpenAI standard
+    max_tokens=4096,
+    temperature=0.8,
+    top_p=0.95,
+    stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
+
+    # Parametres llama.cpp natifs — transmis directement au moteur
+    extra_body={
+        "top_k": 40,
+        "min_p": 0.05,
+        "repeat_last_n": 64,
+        "repeat_penalty": 1.1,
+        "dry_multiplier": 0.5,      # anti-repetition long terme
+        "dry_base": 1.75,
+        "dry_allowed_length": 2,
+        "seed": 42,                 # reproductibilite
+    },
+)
+
+print(response.choices[0].message.content)
+\end{lstlisting}
+
+Avec \texttt{curl}, les paramètres standard et avancés coexistent dans le même corps JSON,
+sans imbrication supplémentaire :
+
+\begin{lstlisting}[style=bashstyle, caption={Paramètres avancés avec curl}]
+curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "messages": [{"role": "user", "content": "Redige une introduction sur les LLMs."}],
+    "max_tokens": 2048,
+    "temperature": 0.8,
+    "top_k": 40,
+    "min_p": 0.05,
+    "repeat_last_n": 64,
+    "repeat_penalty": 1.1,
+    "dry_multiplier": 0.5,
+    "seed": 42
+  }'
+\end{lstlisting}
+
+% ============================================================
+\section{Endpoints natifs llama.cpp}
+\label{sec:endpoints-natifs}
+
+En plus des routes compatibles OpenAI, la gateway expose des endpoints natifs de
+\texttt{llama.cpp} soumis aux mêmes contrôles d'authentification et de débit.
+
+\subsection{Completion native — \texttt{POST /completion}}
+
+Contrairement à \api{/v1/chat/completions} qui accepte un tableau de messages et applique
+automatiquement un template de conversation, cet endpoint accepte une chaîne brute dans
+le champ \param{prompt}. Il est utile dans trois cas :
+\begin{itemize}
+  \item migration de scripts llama.cpp existants,
+  \item gestion manuelle du formatage (ChatML, Alpaca, etc.),
+  \item travail avec des modèles sans template de conversation.
+\end{itemize}
+
+\begin{lstlisting}[style=bashstyle, caption={Completion native avec curl}]
+curl -s https://llm.eva.univ-pau.fr/completion \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "prompt": "<|im_start|>user\nQu'\''est-ce qu'\''un LLM ?<|im_end|>\n<|im_start|>assistant\n",
+    "n_predict": 512,
+    "temperature": 0.7,
+    "repeat_penalty": 1.1,
+    "stop": ["<|im_end|>", "<|endoftext|>"]
+  }'
+\end{lstlisting}
+
+\begin{warning}
+  La réponse de l'endpoint \api{/completion} n'est \textbf{pas} au format OpenAI.
+  Le texte généré se trouve dans le champ \texttt{"content"}, et non dans
+  \texttt{"choices[0].message.content"}.
+\end{warning}
+
+Réponse (format natif llama.cpp) :
+\begin{lstlisting}[style=jsonstyle]
+{
+  "content": "Un LLM (Large Language Model) est un modele de langage...",
+  "stop": true,
+  "tokens_predicted": 87,
+  "tokens_evaluated": 42,
+  "generation_settings": { "temperature": 0.7, "top_k": 40 }
+}
+\end{lstlisting}
+
+\subsection{Tokenisation — \texttt{POST /v1/tokenize}}
+
+Permet de compter précisément le nombre de tokens d'un texte \textbf{selon le tokenizer exact
+du modèle}, avant d'envoyer une requête. Indispensable pour éviter les erreurs de dépassement
+de contexte (\textit{context overflow}).
+
+\begin{lstlisting}[style=bashstyle, caption={Compter les tokens d'un texte}]
+curl -s https://llm.eva.univ-pau.fr/v1/tokenize \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "llama-3.3-70b-instruct",
+    "content": "Votre texte a tokeniser ici..."
+  }'
+# Reponse : {"tokens": [123, 456, 789, ...]}
+\end{lstlisting}
+
+Exemple d'utilisation en Python pour vérifier qu'un prompt ne dépasse pas la taille du contexte :
+
+\begin{lstlisting}[style=pythonstyle, caption={Vérification de la taille du prompt avant envoi}]
+import httpx
+import os
+
+def count_tokens(text: str, model: str = "llama-3.3-70b-instruct") -> int:
+    """Compte les tokens d'un texte selon le tokenizer exact du modele."""
+    r = httpx.post(
+        "https://llm.eva.univ-pau.fr/v1/tokenize",
+        headers={"Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}"},
+        json={"model": model, "content": text},
+        timeout=10.0,
+    )
+    return len(r.json()["tokens"])
+
+
+MAX_CONTEXT = 32768  # tokens — depend du modele et de la configuration
+
+prompt = open("mon_document_long.txt").read()
+token_count = count_tokens(prompt)
+
+if token_count > MAX_CONTEXT * 0.8:  # garder 20% pour la reponse
+    print(f"Prompt trop long ({token_count} tokens) — decouper en segments")
+else:
+    print(f"OK : {token_count} tokens ({MAX_CONTEXT - token_count} disponibles pour la reponse)")
+\end{lstlisting}
+
+\subsection{Détokenisation — \texttt{POST /v1/detokenize}}
+
+Reconstruit du texte à partir d'une liste d'identifiants de tokens.
+
+\begin{lstlisting}[style=bashstyle, caption={Détokenisation}]
+curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "llama-3.3-70b-instruct", "tokens": [9468, 17403, 374, 264]}'
+# Reponse : {"content": "La France est un"}
+\end{lstlisting}
+
+\subsection{Récapitulatif des endpoints}
+
+\begin{center}
+\begin{tabular}{L{4.5cm} L{2.5cm} L{2.5cm} L{3.5cm}}
+  \toprule
+  \textbf{Endpoint} & \textbf{Entrée} & \textbf{Format réponse} & \textbf{Usage} \\
+  \midrule
+  \texttt{POST /v1/chat/completions} & \texttt{messages} (array) & OpenAI standard & Recommandé \\
+  \texttt{POST /v1/completions}      & \texttt{prompt} (string)  & OpenAI standard & Legacy \\
+  \texttt{POST /completion}          & \texttt{prompt} (string)  & Natif llama.cpp & Scripts existants \\
+  \texttt{POST /v1/completion}       & \texttt{prompt} (string)  & Natif llama.cpp & Alias de \texttt{/completion} \\
+  \texttt{POST /v1/tokenize}         & \texttt{content} (string) & \texttt{\{"tokens":[...]\}} & Compter les tokens \\
+  \texttt{POST /v1/detokenize}       & \texttt{tokens} (array)   & \texttt{\{"content":"..."\}} & Reconstruction \\
+  \texttt{GET /v1/models}            & ---                       & OpenAI standard & Lister les modèles \\
+  \texttt{GET /health}               & ---                       & JSON            & État du service \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Intégration LangChain}
+\label{sec:langchain}
+
+LangChain est un framework Python très utilisé en recherche pour construire des pipelines
+NLP complexes (RAG, agents, chaînes de traitement). L'intégration avec le cluster EVA
+est immédiate.
+
+\subsection{Requête simple}
+
+\begin{lstlisting}[style=bashstyle]
+pip install langchain-openai langchain-core
+\end{lstlisting}
+
+\begin{lstlisting}[style=pythonstyle, caption={LangChain pointant sur le cluster EVA}]
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+import os
+
+llm = ChatOpenAI(
+    model="llama-3.3-70b-instruct",
+    openai_api_base="https://llm.eva.univ-pau.fr/v1",
+    openai_api_key=os.environ["UPPA_LLM_KEY"],
+    temperature=0.7,
+    max_tokens=2048,
+    request_timeout=120,
+)
+
+messages = [
+    SystemMessage(content="Tu es un expert en machine learning."),
+    HumanMessage(content="Explique le concept de surapprentissage."),
+]
+response = llm.invoke(messages)
+print(response.content)
+\end{lstlisting}
+
+\subsection{Pipeline RAG (Retrieval-Augmented Generation)}
+
+Le RAG consiste à enrichir un prompt avec des documents extraits d'une base de données
+vectorielle, améliorant considérablement la précision des réponses sur un corpus spécifique.
+
+\begin{lstlisting}[style=bashstyle]
+pip install langchain-community faiss-cpu sentence-transformers
+\end{lstlisting}
+
+\begin{lstlisting}[style=pythonstyle, caption={Pipeline RAG complet avec LangChain, FAISS et embeddings locaux}]
+from langchain_openai import ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from langchain_core.documents import Document
+from langchain_community.embeddings import HuggingFaceEmbeddings
+
+# LLM local via le gateway
+llm = ChatOpenAI(
+    model="llama-3.3-70b-instruct",
+    openai_api_base="https://llm.eva.univ-pau.fr/v1",
+    openai_api_key=os.environ["UPPA_LLM_KEY"],
+    temperature=0.0,
+)
+
+# Documents a indexer (exemple)
+docs = [
+    Document(page_content="Le L40S est un GPU Ada Lovelace 48Go...", metadata={"source": "doc1"}),
+    Document(page_content="llama.cpp permet l'inference locale...",   metadata={"source": "doc2"}),
+]
+
+# Modele d'embedding local (ne fait pas appel a un service externe)
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+# Construction de l'index vectoriel
+vectorstore = FAISS.from_documents(docs, embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+# Chaine RAG
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    return_source_documents=True,
+)
+
+result = qa_chain.invoke({"query": "Quelles sont les caracteristiques du L40S ?"})
+print(result["result"])
+for doc in result["source_documents"]:
+    print(f"  Source : {doc.metadata['source']}")
+\end{lstlisting}
+
+% ============================================================
+\section{Intégration JavaScript / Node.js}
+\label{sec:nodejs}
+
+\begin{lstlisting}[style=bashstyle]
+npm install openai
+\end{lstlisting}
+
+\begin{lstlisting}[language=java, basicstyle=\ttfamily\small, backgroundcolor=\color{codebg},
+  frame=single, framerule=0.4pt, rulecolor=\color{coderule}, breaklines=true,
+  xleftmargin=6pt, xrightmargin=6pt, aboveskip=6pt, belowskip=4pt,
+  caption={Client JavaScript complet avec streaming}]
+import OpenAI from 'openai';
+
+const client = new OpenAI({
+  baseURL: 'https://llm.eva.univ-pau.fr/v1',
+  apiKey: process.env.UPPA_LLM_KEY,
+  timeout: 120_000,  // 120 secondes
+});
+
+// Lister les modeles disponibles
+const models = await client.models.list();
+console.log(models.data.map(m => m.id));
+
+// Requete simple
+const response = await client.chat.completions.create({
+  model: 'llama-3.3-70b-instruct',
+  messages: [
+    { role: 'user', content: "Qu'est-ce que la perplexite en NLP ?" }
+  ],
+  max_tokens: 1024,
+});
+console.log(response.choices[0].message.content);
+
+// Streaming
+const stream = client.chat.completions.stream({
+  model: 'llama-3.3-70b-instruct',
+  messages: [{ role: 'user', content: 'Explique BERT en detail.' }],
+  stream: true,
+});
+
+for await (const chunk of stream) {
+  const delta = chunk.choices[0]?.delta?.content ?? '';
+  process.stdout.write(delta);
+}
+console.log();
+\end{lstlisting}
+
+% ============================================================
+\section{Comportement au premier appel}
+\label{sec:premier-appel}
+
+\subsection{Chargement à la demande}
+
+Les modèles ne sont \textbf{pas maintenus en VRAM en permanence}. Cette conception réduit
+la consommation électrique d'environ 85\,\% pendant les périodes d'inactivité (typiquement
+la nuit et les week-ends). Chaque modèle a son propre cycle de vie indépendant.
+
+Le diagramme suivant illustre le flux de décision lors d'une requête :
+
+\begin{lstlisting}[style=bashstyle, frame=single, caption={Cycle de vie d'un modèle lors d'une requête}]
+Votre requete arrive (model: "llama-3.3-70b-instruct")
+        |
+        v
+Ce modele est-il charge en VRAM ?
+        |                    |
+       OUI                  NON --> Verification du budget VRAM
+        |                                      |
+        |                         Budget suffisant ?
+        |                             OUI |   NON --> Eviction LRU
+        |                                 |          (modele le moins utilise)
+        |                   Chargement en cours
+        |                   (~60-90s pour 70B, ~15s pour 8B)
+        |                   Les requetes concurrentes attendent
+        |                   et sont toutes servies a la fin
+        v
+  Reponse generee
+  (~2-30s selon la longueur du texte genere)
+\end{lstlisting}
+
+\textbf{Comportements concrets à connaître} :
+\begin{itemize}
+  \item La \textbf{première requête} vers un modèle après une période d'inactivité peut
+        prendre de 60 à 120~secondes (70B) ou 10 à 20~secondes (8B).
+  \item Les requêtes \textbf{suivantes} sont rapides (2 à 10~secondes pour une réponse courte).
+  \item Si le budget VRAM est saturé, le modèle le moins récemment utilisé est automatiquement
+        déchargé pour libérer de la place (\textit{éviction LRU}).
+  \item Après \textbf{5~minutes sans requête}, chaque modèle est déchargé automatiquement.
+  \item \textbf{Aucune requête n'est perdue} : les requêtes qui arrivent pendant le chargement
+        sont mises en attente et traitées dès que le modèle est prêt.
+\end{itemize}
+
+\subsection{Gestion du délai de chargement dans votre code}
+
+\begin{lstlisting}[style=pythonstyle, caption={Deux approches pour gérer le délai de chargement}]
+import httpx
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=150.0,  # suffisant pour attendre le chargement du modele
+)
+
+# Option 1 : timeout long (le plus simple)
+# Le client attend automatiquement pendant le chargement.
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[{"role": "user", "content": "Bonjour"}],
+)
+
+# Option 2 : interroger /health avant d'envoyer
+def check_service_status() -> dict:
+    """Retourne l'etat du gateway (modeles charges, VRAM)."""
+    r = httpx.get("https://llm.eva.univ-pau.fr/health", timeout=5)
+    return r.json()
+
+status = check_service_status()
+print("Modeles actuellement charges :", status["models_loaded"])
+print("VRAM disponible :", status["vram_available_gb"], "Go")
+\end{lstlisting}
+
+% ============================================================
+\section{Codes d'erreur et solutions}
+\label{sec:erreurs}
+
+\subsection{Tableau de référence}
+
+\begin{center}
+\begin{tabular}{C{1.5cm} L{3.5cm} L{4cm} L{4cm}}
+  \toprule
+  \textbf{Code} & \textbf{Type} & \textbf{Cause} & \textbf{Solution} \\
+  \midrule
+  200 & Succès & --- & --- \\
+  \addlinespace
+  400 & invalid\_request\_error & JSON malformé ou paramètre invalide & Vérifier le corps de la requête \\
+  \addlinespace
+  401 & authentication\_error & Clé absente, invalide ou révoquée & Vérifier la clé ; contacter l'admin si révoquée \\
+  \addlinespace
+  403 & permission\_error & Modèle désactivé par l'administrateur & Utiliser un modèle disponible (voir \api{GET /v1/models}) \\
+  \addlinespace
+  404 & not\_found\_error & Identifiant de modèle inconnu & Vérifier l'ID via \api{GET /v1/models} \\
+  \addlinespace
+  429 & rate\_limit\_error & Limite RPM dépassée & Attendre 60~s ; voir l'en-tête \texttt{Retry-After} \\
+  \addlinespace
+  503 & server\_error & Modèle en cours de chargement & Attendre 30 à 90~s et réessayer \\
+  \addlinespace
+  504 & server\_error & Timeout de génération & Réduire \texttt{max\_tokens} ou simplifier le prompt \\
+  \addlinespace
+  500 & server\_error & Erreur interne & Contacter l'admin avec l'heure et le contexte \\
+  \addlinespace
+  502 & server\_error & Moteur d'inférence injoignable & Transitoire — réessayer dans 30~s \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Format des messages d'erreur}
+
+Toutes les erreurs suivent le format OpenAI standard :
+
+\begin{lstlisting}[style=jsonstyle, caption={Format d'erreur standard}]
+{
+  "error": {
+    "message": "Modele 'modele-inconnu' non trouve dans le registre.",
+    "type": "not_found_error",
+    "code": "404"
+  }
+}
+\end{lstlisting}
+
+\subsection{Gestion complète des erreurs en Python}
+
+\begin{lstlisting}[style=pythonstyle, caption={Gestion exhaustive des erreurs avec openai-python}]
+from openai import (
+    OpenAI,
+    AuthenticationError,    # 401
+    PermissionDeniedError,  # 403 — modele desactive
+    NotFoundError,          # 404 — modele inconnu
+    RateLimitError,         # 429
+    APIStatusError,         # 4xx / 5xx generiques
+    APITimeoutError,        # timeout reseau
+    APIConnectionError,     # connexion impossible
+)
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=120.0,
+    max_retries=0,
+)
+
+try:
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-instruct",
+        messages=[{"role": "user", "content": "Bonjour"}],
+    )
+    print(response.choices[0].message.content)
+
+except AuthenticationError:
+    print("Erreur 401 : Verifiez votre cle API (variable UPPA_LLM_KEY).")
+    print("Contacter l'admin si vous pensez qu'elle a ete revoquee.")
+
+except NotFoundError:
+    print("Erreur 404 : Modele inconnu.")
+    print("Listez les modeles disponibles via GET /v1/models.")
+
+except PermissionDeniedError:
+    print("Erreur 403 : Ce modele est temporairement desactive.")
+    print("Essayez un autre modele ou contactez l'admin.")
+
+except RateLimitError as e:
+    retry_after = int(e.response.headers.get("Retry-After", 60))
+    print(f"Limite de debit atteinte. Reessayer dans {retry_after}s.")
+    time.sleep(retry_after)
+
+except APIStatusError as e:
+    if e.status_code == 503:
+        print("Modele en cours de chargement, reessayer dans 30-90s...")
+    elif e.status_code == 504:
+        print("Timeout : le prompt est peut-etre trop long.")
+    else:
+        print(f"Erreur {e.status_code} : {e.message}")
+
+except APITimeoutError:
+    print("Timeout reseau. Verifiez votre connexion au reseau UPPA.")
+
+except APIConnectionError:
+    print("Impossible de joindre llm.eva.univ-pau.fr.")
+    print("Etes-vous connecte au reseau ou VPN UPPA ?")
+\end{lstlisting}
+
+\subsection{Diagnostic des erreurs fréquentes}
+
+\textbf{Erreur 401 — clé invalide} : vérifications à effectuer dans l'ordre.
+
+\begin{lstlisting}[style=bashstyle, caption={Diagnostic d'une erreur 401}]
+# 1. La variable d'environnement est-elle definie ?
+echo $UPPA_LLM_KEY
+
+# 2. Le prefixe "Bearer" est-il present dans la requete ?
+curl -H "Authorization: Bearer $UPPA_LLM_KEY" ...
+#                         ^^^^^ obligatoire
+
+# 3. Y a-t-il des espaces ou caracteres invisibles dans la cle ?
+echo -n "$UPPA_LLM_KEY" | cat -A
+\end{lstlisting}
+
+\textbf{Erreur 429 — limite de débit} : espacer les requêtes dans les boucles de traitement.
+
+\begin{lstlisting}[style=pythonstyle, caption={Gestion du rate limit dans une boucle de traitement}]
+import time
+
+prompts = ["Question 1", "Question 2", "Question 3"]  # longue liste
+
+results = []
+for i, prompt in enumerate(prompts):
+    try:
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        results.append(r.choices[0].message.content)
+    except RateLimitError:
+        print(f"Rate limit sur requete {i}, attente 60s...")
+        time.sleep(60)
+        r = client.chat.completions.create(
+            model="llama-3.3-70b-instruct",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        results.append(r.choices[0].message.content)
+
+    # Espacer les requetes (~20 req/min max)
+    time.sleep(3)
+\end{lstlisting}
+
+% ============================================================
+\section{Limites et quotas}
+\label{sec:quotas}
+
+\begin{center}
+\begin{tabular}{L{5cm} C{3cm} L{5cm}}
+  \toprule
+  \textbf{Limite} & \textbf{Valeur par défaut} & \textbf{Notes} \\
+  \midrule
+  Requêtes par minute (RPM) & 20 & Ajustable sur demande auprès de l'admin \\
+  Tokens de contexte max    & 32\,768 par requête & Prompt + réponse combinés \\
+  Slots parallèles (70B)    & 4 & Partagés entre tous les utilisateurs \\
+  Slots parallèles (8B)     & 8 & Indépendants du 70B \\
+  Quota mensuel de tokens   & Illimité & Configurable par l'admin \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\begin{important}
+  Les slots parallèles sont indépendants par modèle. Des requêtes vers le modèle 70B et
+  le modèle 8B ne se bloquent pas mutuellement.
+\end{important}
+
+Si vous avez besoin de limites plus élevées (traitement de corpus volumineux, pipeline
+d'annotation automatique à grande échelle), contactez l'admin en précisant le volume
+attendu (nombre de requêtes, taille des textes).
+
+\subsection{Estimer sa consommation de tokens}
+
+\begin{lstlisting}[style=pythonstyle, caption={Estimation du nombre de tokens avec tiktoken}]
+# Regle approximative : 1 token ≈ 0.75 mot (francais/anglais)
+# Un paragraphe de 200 mots ≈ 270 tokens
+
+# Estimation precise avec tiktoken (compatible approximativement)
+pip install tiktoken
+
+import tiktoken
+enc = tiktoken.get_encoding("cl100k_base")
+text = "Votre texte ici..."
+tokens = len(enc.encode(text))
+print(f"Tokens estimes : {tokens}")
+
+# Ou utiliser l'endpoint /v1/tokenize pour un comptage exact
+# (voir section 8 de ce guide)
+\end{lstlisting}
+
+% ============================================================
+\section{Exemples complets par cas d'usage}
+\label{sec:exemples}
+
+Cette section présente des scripts autonomes et directement réutilisables pour les
+cas d'usage les plus courants en recherche académique.
+
+\subsection{Annotation automatique de corpus}
+
+Ce script annote automatiquement le sentiment de textes courts, avec gestion de la
+limite de débit et sauvegarde progressive des résultats.
+
+\begin{lstlisting}[style=pythonstyle, caption={Annotation de sentiment sur un corpus}]
+"""
+Exemple : annoter automatiquement le sentiment d'un corpus de textes.
+Avec gestion de la limite de debit et sauvegarde des resultats.
+"""
+import json, time, os
+from pathlib import Path
+from openai import OpenAI, RateLimitError
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=60.0,
+)
+
+SYSTEM_PROMPT = """Tu es un annotateur de sentiment. Pour chaque texte,
+reponds UNIQUEMENT avec un JSON : {"sentiment": "positif"|"negatif"|"neutre", "score": 0.0-1.0}"""
+
+
+def annotate_sentiment(text: str) -> dict:
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-instruct",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": text},
+        ],
+        max_tokens=64,
+        temperature=0.0,  # Deterministe pour l'annotation
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+texts = Path("corpus.txt").read_text().splitlines()
+results = []
+
+for i, text in enumerate(texts):
+    print(f"[{i+1}/{len(texts)}] {text[:50]}...", end=" ")
+
+    for attempt in range(3):
+        try:
+            result = annotate_sentiment(text)
+            results.append({"text": text, **result})
+            print(f"-> {result['sentiment']} ({result['score']:.2f})")
+            break
+        except RateLimitError:
+            print("rate limit, attente 60s...")
+            time.sleep(60)
+        except json.JSONDecodeError:
+            print("reponse non-JSON, ignoree")
+            results.append({"text": text, "sentiment": "erreur", "score": 0.0})
+            break
+
+    time.sleep(3)  # ~20 req/min
+
+with open("annotations.json", "w") as f:
+    json.dump(results, f, ensure_ascii=False, indent=2)
+
+print(f"\nTermine : {len(results)} textes annotes -> annotations.json")
+\end{lstlisting}
+
+\subsection{Résumé automatique de publications scientifiques}
+
+\begin{lstlisting}[style=pythonstyle, caption={Résumé d'abstracts scientifiques pour un public non-spécialiste}]
+"""
+Exemple : resumer automatiquement des abstracts de publications.
+"""
+from openai import OpenAI
+import os
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=120.0,
+)
+
+
+def summarize_abstract(abstract: str, language: str = "francais") -> str:
+    """Resume un abstract scientifique pour un public non-specialiste."""
+    prompt = f"""Resume cet abstract scientifique en {language} en 2-3 phrases
+claires pour un public non-specialiste. Mets en avant la contribution principale.
+
+Abstract :
+{abstract}"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-instruct",
+        messages=[
+            {"role": "system", "content": "Tu es un expert en vulgarisation scientifique."},
+            {"role": "user",   "content": prompt},
+        ],
+        max_tokens=256,
+        temperature=0.5,
+    )
+    return response.choices[0].message.content
+
+
+abstract = """
+We present LLaMA, a collection of foundation language models ranging from 7B to 65B parameters.
+We train our models on trillions of tokens, and show that it is possible to train
+state-of-the-art models using publicly available datasets exclusively...
+"""
+
+print(summarize_abstract(abstract))
+\end{lstlisting}
+
+\subsection{Extraction d'entités nommées}
+
+\begin{lstlisting}[style=pythonstyle, caption={Extraction d'entités nommées avec sortie JSON structurée}]
+"""
+Exemple : extraire des entites nommees depuis des textes de recherche.
+"""
+import json
+from openai import OpenAI
+import os
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=120.0,
+)
+
+
+def extract_entities(text: str) -> dict:
+    """Extrait les entites nommees d'un texte."""
+    prompt = f"""Extrais les entites nommees du texte suivant.
+Reponds UNIQUEMENT avec un JSON valide :
+{{
+  "personnes": ["..."],
+  "organisations": ["..."],
+  "lieux": ["..."],
+  "dates": ["..."],
+  "concepts_cles": ["..."]
+}}
+
+Texte : {text}"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-instruct",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=512,
+        temperature=0.0,
+    )
+
+    content = response.choices[0].message.content
+    # Nettoyer le JSON si le modele a ajoute du texte autour
+    start = content.find("{")
+    end = content.rfind("}") + 1
+    if start >= 0 and end > start:
+        content = content[start:end]
+
+    return json.loads(content)
+
+
+text = """
+En 2023, Yann LeCun, directeur scientifique de Meta AI, a presente ses travaux
+sur les architectures Joint Embedding Predictive Architecture (JEPA) a l'universite
+de New York. Ces travaux s'opposent aux approches generatives popularisees par
+OpenAI avec GPT-4.
+"""
+
+entities = extract_entities(text)
+print(json.dumps(entities, ensure_ascii=False, indent=2))
+# {
+#   "personnes": ["Yann LeCun"],
+#   "organisations": ["Meta AI", "OpenAI"],
+#   "lieux": ["New York"],
+#   "dates": ["2023"],
+#   "concepts_cles": ["JEPA", "GPT-4"]
+# }
+\end{lstlisting}
+
+\subsection{Question-réponse sur vos propres documents (RAG simple)}
+
+Ce patron simple permet de faire du RAG sans aucun framework externe. Il est adapté à
+des corpus de quelques documents. Pour des corpus plus larges, utiliser LangChain + FAISS
+(voir section~\ref{sec:langchain}).
+
+\begin{lstlisting}[style=pythonstyle, caption={RAG simple sans framework externe}]
+"""
+RAG basique : injection des documents dans le contexte du prompt.
+Pour des corpus plus grands, utiliser LangChain + FAISS.
+"""
+from openai import OpenAI
+import os
+
+client = OpenAI(
+    base_url="https://llm.eva.univ-pau.fr/v1",
+    api_key=os.environ["UPPA_LLM_KEY"],
+    timeout=120.0,
+)
+
+
+def simple_rag(question: str, documents: list[str],
+               model: str = "llama-3.3-70b-instruct") -> str:
+    """Injecte les documents dans le contexte et repond a la question."""
+    context = "\n\n---\n\n".join(documents)
+
+    prompt = f"""Reponds a la question en te basant UNIQUEMENT sur les documents fournis.
+Si la reponse ne se trouve pas dans les documents, indique-le clairement.
+
+Documents :
+{context}
+
+Question : {question}"""
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Tu es un assistant de recherche documentaire."},
+            {"role": "user",   "content": prompt},
+        ],
+        max_tokens=1024,
+        temperature=0.2,
+    )
+    return response.choices[0].message.content
+
+
+# Exemple
+docs = [
+    "Le projet EVARuntime est une gateway d'inference LLM developpee pour l'UPPA...",
+    "Le GPU L40S dispose de 48Go de VRAM et d'une architecture Ada Lovelace...",
+]
+
+answer = simple_rag("Quelle est la quantite de VRAM du GPU utilise ?", docs)
+print(answer)
+\end{lstlisting}
+
+% ============================================================
+\section{Bonnes pratiques}
+\label{sec:bonnes-pratiques}
+
+\subsection{Sécurité}
+
+\begin{enumerate}
+  \item \textbf{Ne jamais exposer votre clé API} dans du code partagé, des notebooks publics
+        ou des dépôts Git.
+  \item \textbf{Utiliser une clé par projet} : ainsi, la révocation d'un accès n'impacte pas
+        vos autres travaux.
+  \item \textbf{Stocker la clé dans une variable d'environnement} ou un fichier \texttt{.env}
+        exclu du contrôle de version (\texttt{.gitignore}).
+\end{enumerate}
+
+\subsection{Performance et efficacité}
+
+\begin{enumerate}
+  \item \textbf{Dimensionner \texttt{max\_tokens}} à la valeur réellement nécessaire. Des
+        valeurs trop élevées augmentent le temps d'attente même si le modèle s'arrête avant.
+  \item \textbf{Réutiliser le client} plutôt que d'en créer un nouveau à chaque requête.
+        La création d'un client est coûteuse (négociation TLS, pool de connexions).
+  \item \textbf{Utiliser le streaming} pour les générations longues : l'utilisateur voit
+        le début de la réponse bien avant la fin de la génération.
+  \item \textbf{Espacer les requêtes en boucle} (3~s minimum entre deux appels) pour éviter
+        de déclencher la limite de débit (erreur 429).
+  \item \textbf{Choisir le modèle adapté} : le modèle 8B est 3 à 5 fois plus rapide que
+        le 70B et suffit pour de nombreuses tâches simples (classification, résumé court).
+\end{enumerate}
+
+\subsection{Conception des prompts}
+
+\begin{enumerate}
+  \item \textbf{Utiliser le rôle \texttt{system}} pour définir le comportement général du
+        modèle (expertise, format de sortie, langue). Ce rôle est particulièrement efficace
+        pour forcer un format de sortie JSON ou Markdown.
+  \item \textbf{Être explicite sur le format attendu} : si vous attendez un JSON, indiquez-le
+        dans le prompt et fournissez un exemple de la structure souhaitée.
+  \item \textbf{Fixer \texttt{temperature = 0.0}} pour les tâches de classification, d'extraction
+        ou de génération de code, où la reproductibilité est importante.
+  \item \textbf{Utiliser le paramètre \texttt{seed}} avec \texttt{temperature = 0.0} pour
+        des résultats strictement reproductibles.
+\end{enumerate}
+
+% ============================================================
+\section{Référence rapide}
+\label{sec:reference}
+
+\subsection{URL de base et format d'authentification}
+
+\begin{lstlisting}[style=bashstyle]
+BASE_URL = "https://llm.eva.univ-pau.fr"
+Authorization: Bearer llmgw-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+\end{lstlisting}
+
+\subsection{Endpoints utilisateur}
+
+\begin{center}
+\small
+\begin{tabular}{L{2cm} L{5.5cm} L{6cm}}
+  \toprule
+  \textbf{Méthode} & \textbf{Route} & \textbf{Description} \\
+  \midrule
+  \texttt{GET}  & \texttt{/health}                & État du service (sans authentification) \\
+  \texttt{GET}  & \texttt{/v1/models}             & Liste des modèles activés \\
+  \texttt{POST} & \texttt{/v1/chat/completions}   & Génération (format OpenAI, streaming supporté) \\
+  \texttt{POST} & \texttt{/v1/completions}        & Completion legacy (format OpenAI) \\
+  \texttt{POST} & \texttt{/completion}            & Completion native llama.cpp \\
+  \texttt{POST} & \texttt{/v1/completion}         & Alias de \texttt{/completion} \\
+  \texttt{POST} & \texttt{/v1/tokenize}           & Tokenisation (compte les tokens) \\
+  \texttt{POST} & \texttt{/v1/detokenize}         & Détokenisation (IDs $\to$ texte) \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Modèles côté client}
+
+\begin{center}
+\small
+\begin{tabular}{L{4.5cm} L{4cm} L{4cm}}
+  \toprule
+  \textbf{Librairie} & \textbf{Paramètre à modifier} & \textbf{Clé} \\
+  \midrule
+  \texttt{openai} (Python) & \texttt{base\_url} & \texttt{os.environ["UPPA\_LLM\_KEY"]} \\
+  \texttt{openai} (JS/TS)  & \texttt{baseURL}   & \texttt{process.env.UPPA\_LLM\_KEY} \\
+  LangChain Python         & \texttt{openai\_api\_base} & \texttt{openai\_api\_key} \\
+  \texttt{curl}            & URL de la requête  & \texttt{-H "Authorization: Bearer \$UPPA\_LLM\_KEY"} \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section*{Contacts et support}
+\addcontentsline{toc}{section}{Contacts et support}
+
+En cas de difficulté, voici les interlocuteurs et les démarches recommandées :
+
+\begin{center}
+\begin{tabular}{L{5cm} L{8.5cm}}
+  \toprule
+  \textbf{Problème} & \textbf{Démarche} \\
+  \midrule
+  Demande de clé API & Contacter Mohamad El Akhal El Bouzidi ou Benjamin Mascret \\
+  Clé invalide / révoquée (401) & Vérifier la variable d'environnement ; contacter l'admin \\
+  Modèle inconnu (404) & Vérifier les IDs disponibles via \texttt{GET /v1/models} \\
+  Quota dépassé (429) & Espacer les requêtes ; demander une augmentation si nécessaire \\
+  Comportement inattendu & Vérifier les paramètres \texttt{temperature} et \texttt{system} \\
+  Intégration avec un outil spécifique & Le gateway étant compatible OpenAI, la documentation
+    officielle OpenAI est applicable dans la quasi-totalité des cas \\
+  \bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{1cm}
+\begin{center}
+  \textbf{Contacts principaux}\\[0.5cm]
+  \begin{tabular}{ll}
+    Mohamad El Akhal El Bouzidi & --- Responsable technique \\
+    Benjamin Mascret            & --- Administrateur système \\
+  \end{tabular}
+\end{center}
+
+\vfill
+\begin{center}
+  \rule{0.5\textwidth}{0.4pt}\\[0.3cm]
+  {\small
+    Document rédigé par Mohamad El Akhal El Bouzidi\\
+    Université de Pau et des Pays de l'Adour (UPPA)\\
+    Version \version{} --- \today
+  }
+\end{center}
+
+\end{document}
+\end{antml:parameter>
+</invoke>
