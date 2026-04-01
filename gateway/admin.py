@@ -9,6 +9,7 @@ avec l'API OpenAI.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,37 +17,216 @@ from fastapi.responses import JSONResponse
 
 import database as db
 from auth import require_admin
+from config import settings
+from model_manager import model_manager
 from schemas import (
     GatewayStatus,
     KeyCreate,
     KeyCreateResponse,
     KeyResponse,
+    ModelEntryCreate,
+    ModelEntryUpdate,
+    ModelStatusResponse,
     UsageEntry,
     UsageSummaryEntry,
     UserCreate,
     UserResponse,
     UserUpdate,
 )
-from server_manager import server_manager
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-# ── Statut système ────────────────────────────────────────────────────────────
+# ── Statut système multi-modèles ──────────────────────────────────────────────
 
 @router.get("/status", response_model=GatewayStatus)
 async def get_status(_: None = Depends(require_admin)) -> dict:
-    """État du serveur : modèle chargé, PID, uptime, idle, params GPU."""
-    return {"status": "ok", **server_manager.status()}
+    """
+    État complet de la gateway : budget VRAM + état de chaque modèle.
+    """
+    return {"status": "ok", **model_manager.status()}
+
+
+# ── Registre des modèles ──────────────────────────────────────────────────────
+
+@router.get("/models", response_model=list[ModelStatusResponse])
+async def list_models(_: None = Depends(require_admin)) -> list[dict]:
+    """
+    Liste tous les modèles du registre avec leur état live (chargé / déchargé).
+    """
+    return model_manager.status()["models"]
+
+
+@router.post("/models", response_model=ModelStatusResponse, status_code=201)
+async def register_model(
+    body: ModelEntryCreate,
+    _: None = Depends(require_admin),
+) -> dict:
+    """
+    Enregistre un nouveau modèle dans le registre.
+
+    Validations de sécurité :
+    - path doit être absolu et pointer vers un fichier .gguf
+    - path doit être sous un répertoire autorisé (si ALLOWED_MODEL_DIRS est configuré)
+    - Le fichier .gguf doit exister sur le serveur
+    - vram_gb doit être raisonnable (≤ budget VRAM net)
+    - Le modèle n'est PAS chargé automatiquement après enregistrement
+    """
+    # Vérification du fichier (existence sur disque)
+    model_path = Path(body.path)
+    if not model_path.exists():
+        raise HTTPException(
+            status_code=422,
+            detail=f"Fichier introuvable sur le serveur : {body.path}",
+        )
+
+    # Vérification budget VRAM (avertissement si vram_gb dépasse le budget net)
+    budget = settings.effective_vram_budget_gb()
+    if body.vram_gb > budget:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"vram_gb ({body.vram_gb:.1f} GB) dépasse le budget VRAM net disponible "
+                f"({budget:.1f} GB). Ce modèle ne pourra jamais être chargé seul."
+            ),
+        )
+
+    try:
+        entry_dict = {
+            "id": body.id,
+            "path": body.path,
+            "description": body.description,
+            "vram_gb": body.vram_gb,
+            "enabled": body.enabled,
+            "capabilities": body.capabilities,
+            "llama_params": body.llama_params.model_dump(),
+        }
+        model = model_manager.registry.add(entry_dict)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    log.info("Admin : nouveau modèle enregistré '%s'", body.id)
+    return {
+        "id": model.id,
+        "description": model.description,
+        "enabled": model.enabled,
+        "vram_gb": model.vram_gb,
+        "capabilities": model.capabilities,
+        "state": "unloaded",
+        "path": str(model.path),
+        "pid": None,
+        "port": None,
+        "uptime_seconds": None,
+        "idle_seconds": None,
+        "llama_params": None,
+    }
+
+
+@router.patch("/models/{model_id}", response_model=ModelStatusResponse)
+async def update_model(
+    model_id: str,
+    body: ModelEntryUpdate,
+    _: None = Depends(require_admin),
+) -> dict:
+    """
+    Met à jour les métadonnées d'un modèle (enabled, vram_gb, description).
+    Si le modèle est actuellement chargé et qu'on le désactive (enabled=false),
+    il est déchargé immédiatement.
+    """
+    if not model_manager.registry.get(model_id):
+        raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
+
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=422, detail="Aucun champ à mettre à jour.")
+
+    try:
+        model = model_manager.registry.update(model_id, **updates)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Si désactivé, décharger immédiatement s'il est en mémoire
+    if updates.get("enabled") is False:
+        await model_manager.unload_model(model_id)
+        log.info("Admin : modèle '%s' désactivé et déchargé", model_id)
+
+    # Récupérer l'état live
+    status_list = model_manager.status()["models"]
+    entry = next((m for m in status_list if m["id"] == model_id), None)
+    return entry or {"id": model_id, "state": "unloaded", **model.__dict__}
+
+
+@router.delete("/models/{model_id}", status_code=200)
+async def delete_model(
+    model_id: str,
+    _: None = Depends(require_admin),
+) -> dict:
+    """
+    Supprime un modèle du registre.
+    Le modèle doit être déchargé au préalable (ou sera déchargé automatiquement).
+    """
+    if not model_manager.registry.get(model_id):
+        raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
+
+    # Décharger d'abord si chargé
+    await model_manager.unload_model(model_id)
+
+    try:
+        model_manager.registry.remove(model_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    log.info("Admin : modèle '%s' supprimé du registre", model_id)
+    return {"message": f"Modèle '{model_id}' supprimé du registre."}
+
+
+@router.post("/models/{model_id}/load")
+async def load_model(
+    model_id: str,
+    _: None = Depends(require_admin),
+) -> dict:
+    """
+    Pré-charge un modèle en mémoire (warm-up).
+    Utile pour éviter la latence de cold-start sur la première requête.
+    Évinçe un modèle LRU si le budget VRAM est dépassé.
+    """
+    try:
+        await model_manager.ensure_model_loaded(model_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except (RuntimeError, TimeoutError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    log.info("Admin : modèle '%s' pré-chargé", model_id)
+    return {"message": f"Modèle '{model_id}' chargé et prêt."}
+
+
+@router.post("/models/{model_id}/unload")
+async def unload_model(
+    model_id: str,
+    _: None = Depends(require_admin),
+) -> dict:
+    """
+    Décharge un modèle spécifique et libère sa VRAM.
+    Sans effet si le modèle n'est pas chargé.
+    """
+    if not model_manager.registry.get(model_id):
+        raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
+
+    await model_manager.unload_model(model_id)
+    log.info("Admin : modèle '%s' déchargé", model_id)
+    return {"message": f"Modèle '{model_id}' déchargé. VRAM libérée."}
 
 
 @router.post("/unload")
-async def force_unload(_: None = Depends(require_admin)) -> dict:
-    """Force le déchargement du modèle et la libération de la VRAM."""
-    await server_manager.unload(reason="admin request")
-    return {"message": "Modèle déchargé. GPU libéré."}
+async def unload_all(_: None = Depends(require_admin)) -> dict:
+    """Décharge tous les modèles chargés et libère toute la VRAM."""
+    await model_manager.shutdown()
+    return {"message": "Tous les modèles déchargés. GPU entièrement libéré."}
 
 
 # ── Gestion utilisateurs ──────────────────────────────────────────────────────
@@ -69,7 +249,7 @@ async def create_user(
         if "UNIQUE constraint" in str(exc):
             raise HTTPException(
                 status_code=409,
-                detail=f"Un utilisateur avec ce nom ou cet email existe déjà."
+                detail="Un utilisateur avec ce nom ou cet email existe déjà."
             )
         raise
     return user

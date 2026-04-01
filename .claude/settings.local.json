@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebSearch",
-      "Bash(wc -l /c/Users/zhiri/Nextcloud2/mo/Projects/EVARuntime/docs/*.md)"
-    ]
-  }
-}

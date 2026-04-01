@@ -22,7 +22,7 @@ from rich.table import Table
 
 import database as db
 from config import settings
-from server_manager import server_manager
+from model_registry import ModelRegistry
 
 app = typer.Typer(
     name="llm-gateway",
@@ -328,25 +328,44 @@ def usage_report(
 
 @app.command("status")
 def status():
-    """Affiche l'état courant du modèle et de la configuration."""
-    s = server_manager.status()
+    """Affiche le registre des modèles et la configuration VRAM."""
+    try:
+        registry = ModelRegistry(
+            config_path=settings.models_config_path,
+            allowed_model_dirs=settings.allowed_model_dirs if settings.allowed_model_dirs else None,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Erreur registre :[/red] {exc}")
+        raise typer.Exit(1)
+
+    budget = settings.effective_vram_budget_gb()
     console.print()
-    console.print(f"  État du modèle  : [bold]{s['model_state']}[/bold]")
-    console.print(f"  Modèle          : {s['model_name']}")
-    console.print(f"  Chemin          : {s['model_path']}")
-    console.print(f"  PID             : {s['pid'] or '—'}")
-    uptime = f"{s['uptime_seconds']:.0f}s" if s['uptime_seconds'] else '—'
-    idle = f"{s['idle_seconds']}s" if s['idle_seconds'] else '—'
-    console.print(f"  Uptime          : {uptime}")
-    console.print(f"  Idle depuis     : {idle}")
-    console.print(f"  Idle timeout    : {s['idle_timeout_seconds']}s")
+    console.print("[bold cyan]Configuration VRAM[/bold cyan]")
+    console.print(f"  Total GPU       : {settings.total_vram_gb:.1f} GB")
+    console.print(f"  Overhead        : {settings.vram_overhead_gb:.1f} GB")
+    console.print(f"  Marge sécurité  : {settings.vram_safety_margin * 100:.0f}%")
+    console.print(f"  Budget net      : [bold green]{budget:.1f} GB[/bold green]")
+    console.print(f"  Max modèles     : {settings.max_loaded_models}")
+    console.print(f"  Pool de ports   : {settings.base_llama_port}–{settings.base_llama_port + settings.max_loaded_models - 1}")
+    console.print(f"  Idle timeout    : {settings.idle_timeout_seconds}s")
     console.print()
-    p = s["llama_params"]
-    console.print(f"  GPU layers      : {p['n_gpu_layers']}")
-    console.print(f"  Context size    : {p['ctx_size']}")
-    console.print(f"  Parallel slots  : {p['parallel']}")
-    console.print(f"  Flash Attention : {p['flash_attn']}")
-    console.print(f"  KV cache type   : K={p['cache_type_k']} / V={p['cache_type_v']}")
+
+    models = registry.list_all()
+    table = Table(title="Registre des modèles", header_style="bold cyan")
+    table.add_column("ID", min_width=20)
+    table.add_column("VRAM", width=8, justify="right")
+    table.add_column("Activé", width=8)
+    table.add_column("Capacités", min_width=24)
+    table.add_column("Chemin", min_width=30)
+
+    for m in models:
+        enabled = "[green]oui[/green]" if m.enabled else "[red]non[/red]"
+        caps = ", ".join(m.capabilities)
+        table.add_row(m.id, f"{m.vram_gb:.1f} GB", enabled, caps, str(m.path))
+
+    console.print(table)
+    console.print()
+    console.print("[dim]Note : L'état live (READY/LOADING) n'est visible que via GET /admin/status[/dim]")
     console.print()
 
 

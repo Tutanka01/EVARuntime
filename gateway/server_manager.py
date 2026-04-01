@@ -1,5 +1,5 @@
 """
-Gestionnaire du cycle de vie de llama-server.
+Gestionnaire du cycle de vie d'un llama-server.
 
 Principe fondamental : la SEULE façon de libérer 100% la VRAM GPU est de
 tuer le processus. L'option --sleep-idle-seconds de llama-server laisse un
@@ -14,6 +14,9 @@ Gestion de la concurrence :
     - asyncio.Event pour les waiters pendant le chargement
       (N requêtes simultanées pendant le boot → toutes attendent, toutes
        reprennent dès que le serveur est prêt, aucune n'est perdue)
+
+Cette classe est maintenant paramétrique : une instance par modèle chargé.
+Le ModelManager crée et détruit les instances dynamiquement.
 """
 from __future__ import annotations
 
@@ -22,11 +25,13 @@ import logging
 import os
 import signal
 import time
+from collections.abc import Callable
 from enum import Enum
 
 import httpx
 
 from config import settings
+from model_registry import ModelDefinition
 
 log = logging.getLogger(__name__)
 
@@ -40,23 +45,34 @@ class ModelState(str, Enum):
 
 class ServerManager:
     """
-    Singleton gérant le sous-processus llama-server.
-    Instancié une fois dans main.py et injecté via dependency injection FastAPI.
+    Gère le sous-processus llama-server pour un modèle donné sur un port donné.
+    Instancié dynamiquement par ModelManager.
+
+    Args:
+        model      : définition du modèle à charger
+        port       : port sur lequel llama-server écoutera
+        on_unload  : callback appelé après déchargement complet —
+                     permet à ModelManager de libérer le port et nettoyer son état
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model: ModelDefinition,
+        port: int,
+        on_unload: Callable[[str], None] | None = None,
+    ) -> None:
+        self._model = model
+        self._port = port
+        self._on_unload = on_unload
+
         self._process: asyncio.subprocess.Process | None = None
         self._state: ModelState = ModelState.UNLOADED
         self._last_request_time: float = 0.0
         self._load_start_time: float = 0.0
 
-        # Lock pour serialiser les transitions d'état
         self._state_lock = asyncio.Lock()
-        # Event signalé quand le chargement se termine (succès ou échec)
         self._ready_event: asyncio.Event | None = None
-        # Exception capturée pendant le chargement pour la propager aux waiters
         self._load_error: Exception | None = None
-
         self._idle_task: asyncio.Task | None = None
 
     # ── Propriétés publiques ──────────────────────────────────────────────────
@@ -64,6 +80,14 @@ class ServerManager:
     @property
     def state(self) -> ModelState:
         return self._state
+
+    @property
+    def port(self) -> int:
+        return self._port
+
+    @property
+    def model(self) -> ModelDefinition:
+        return self._model
 
     @property
     def uptime_seconds(self) -> float | None:
@@ -77,6 +101,10 @@ class ServerManager:
             return 0.0
         return time.monotonic() - self._last_request_time
 
+    def llama_url(self, path: str) -> str:
+        """URL complète vers llama-server pour ce modèle."""
+        return f"http://{settings.llama_server_host}:{self._port}{path}"
+
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
     async def ensure_loaded(self) -> None:
@@ -84,7 +112,7 @@ class ServerManager:
         Appelé avant chaque requête proxy.
         - Si READY → met à jour le timestamp et retourne immédiatement.
         - Si LOADING → attend la fin du chargement (Event).
-        - Si UNLOADED → lance le chargement (un seul thread le fait, les autres attendent).
+        - Si UNLOADED → lance le chargement (un seul coroutine le fait, les autres attendent).
         Lance une exception si le chargement échoue ou dépasse le timeout.
         """
         # Fast path — aucun lock nécessaire si déjà prêt
@@ -93,26 +121,24 @@ class ServerManager:
             return
 
         async with self._state_lock:
-            # Re-vérifier après acquisition du lock
             if self._state == ModelState.READY:
                 self._last_request_time = time.monotonic()
                 return
 
             if self._state == ModelState.LOADING:
-                # Un autre coroutine charge déjà : récupérer l'event courant
                 event = self._ready_event
             elif self._state == ModelState.UNLOADED:
-                # On est le premier : on démarre le chargement
                 event = asyncio.Event()
                 self._ready_event = event
                 self._load_error = None
                 self._state = ModelState.LOADING
                 asyncio.create_task(self._load_and_signal(event))
             else:
-                # UNLOADING — on attend et on réessaie
-                raise RuntimeError("Le modèle est en cours de déchargement, réessayez dans quelques secondes.")
+                raise RuntimeError(
+                    f"Le modèle '{self._model.id}' est en cours de déchargement, "
+                    f"réessayez dans quelques secondes."
+                )
 
-        # Attendre que le chargement se termine (hors du lock)
         try:
             await asyncio.wait_for(
                 event.wait(),
@@ -120,7 +146,7 @@ class ServerManager:
             )
         except asyncio.TimeoutError:
             raise TimeoutError(
-                f"Le modèle n'a pas démarré dans les "
+                f"Le modèle '{self._model.id}' n'a pas démarré dans les "
                 f"{settings.model_load_timeout_seconds + 10}s imparties."
             )
 
@@ -143,34 +169,36 @@ class ServerManager:
                 self._state = ModelState.READY
 
             log.info(
-                "llama-server prêt — modèle '%s' chargé (PID %d)",
-                settings.model_path.name,
+                "llama-server prêt — modèle '%s' chargé sur port %d (PID %d)",
+                self._model.id,
+                self._port,
                 self._process.pid if self._process else -1,
             )
 
-            # Démarrer le moniteur d'inactivité
             self._idle_task = asyncio.create_task(self._idle_monitor())
 
         except Exception as exc:
-            log.error("Échec du chargement du modèle : %s", exc)
+            log.error("Échec du chargement du modèle '%s' : %s", self._model.id, exc)
             self._load_error = exc
-            # Nettoyer le processus si lancé
             await self._kill_process()
             async with self._state_lock:
                 self._state = ModelState.UNLOADED
         finally:
-            # Toujours signaler pour débloquer les waiters
             event.set()
 
     async def _start_process(self) -> None:
-        cmd = settings.build_llama_cmd()
-        log.info("Lancement llama-server : %s", " ".join(cmd))
+        cmd = self._model.build_llama_cmd(
+            binary=settings.llama_server_bin,
+            host=settings.llama_server_host,
+            port=self._port,
+            internal_api_key=settings.internal_api_key,
+            log_path=settings.log_dir / f"llama-server-{self._model.id}.log",
+        )
+        log.info("Lancement llama-server '%s' : %s", self._model.id, " ".join(cmd))
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = settings.cuda_visible_devices
 
-        # start_new_session=True : crée un nouveau process group.
-        # os.killpg() tuera llama-server ET tous ses enfants éventuels.
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -179,14 +207,13 @@ class ServerManager:
             start_new_session=True,
         )
 
-        # Lancer une tâche de lecture des logs pour éviter le blocage du pipe
         asyncio.create_task(self._drain_logs())
 
     async def _drain_logs(self) -> None:
         """Lit les sorties de llama-server pour éviter le blocage du pipe."""
         if not self._process:
             return
-        llama_log = logging.getLogger("llama-server")
+        llama_log = logging.getLogger(f"llama-server.{self._model.id}")
         try:
             while True:
                 if self._process.stderr:
@@ -203,15 +230,14 @@ class ServerManager:
         Lève TimeoutError si le serveur ne répond pas dans le délai configuré.
         Lève RuntimeError si le processus meurt avant d'être prêt.
         """
-        url = f"{settings.llama_server_url()}/health"
+        url = self.llama_url("/health")
         deadline = time.monotonic() + settings.model_load_timeout_seconds
 
         async with httpx.AsyncClient(timeout=3.0) as client:
             while time.monotonic() < deadline:
-                # Vérifier que le processus est encore vivant
                 if self._process and self._process.returncode is not None:
                     raise RuntimeError(
-                        f"llama-server s'est terminé prématurément "
+                        f"llama-server '{self._model.id}' s'est terminé prématurément "
                         f"(code {self._process.returncode})"
                     )
 
@@ -227,7 +253,7 @@ class ServerManager:
                 await asyncio.sleep(2)
 
         raise TimeoutError(
-            f"llama-server n'a pas répondu sur {url} "
+            f"llama-server '{self._model.id}' n'a pas répondu sur {url} "
             f"dans les {settings.model_load_timeout_seconds}s."
         )
 
@@ -237,15 +263,15 @@ class ServerManager:
         """
         Termine llama-server et libère 100% de la VRAM GPU.
         Idempotent : sans effet si déjà UNLOADED.
+        Appelle le callback on_unload après déchargement complet.
         """
         async with self._state_lock:
             if self._state in (ModelState.UNLOADED, ModelState.UNLOADING):
                 return
             self._state = ModelState.UNLOADING
 
-        log.info("Déchargement du modèle (%s)…", reason)
+        log.info("Déchargement du modèle '%s' (%s)…", self._model.id, reason)
 
-        # Annuler le moniteur d'inactivité
         if self._idle_task and not self._idle_task.done():
             self._idle_task.cancel()
             try:
@@ -260,9 +286,15 @@ class ServerManager:
             self._state = ModelState.UNLOADED
 
         log.info(
-            "Modèle déchargé — GPU libéré. Vérifier avec : "
-            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits"
+            "Modèle '%s' déchargé — port %d libéré. "
+            "Vérifier avec : nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits",
+            self._model.id,
+            self._port,
         )
+
+        # Notifier ModelManager pour qu'il retourne le port au pool et nettoie son état
+        if self._on_unload:
+            self._on_unload(self._model.id)
 
     async def _kill_process(self) -> None:
         """SIGTERM → attente 10s → SIGKILL. Opère sur le process group entier."""
@@ -278,20 +310,20 @@ class ServerManager:
             return
 
         try:
-            log.debug("SIGTERM → process group %d", pgid)
+            log.debug("SIGTERM → process group %d (modèle '%s')", pgid, self._model.id)
             os.killpg(pgid, signal.SIGTERM)
 
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=10.0)
-                log.debug("llama-server terminé proprement (PID %d)", pid)
+                log.debug("llama-server '%s' terminé proprement (PID %d)", self._model.id, pid)
             except asyncio.TimeoutError:
-                log.warning("SIGTERM ignoré, envoi SIGKILL → PID %d", pid)
+                log.warning("SIGTERM ignoré, SIGKILL → '%s' PID %d", self._model.id, pid)
                 os.killpg(pgid, signal.SIGKILL)
                 await self._process.wait()
-                log.debug("llama-server tué (PID %d)", pid)
+                log.debug("llama-server '%s' tué (PID %d)", self._model.id, pid)
 
         except ProcessLookupError:
-            pass  # Déjà mort
+            pass
 
         self._process = None
 
@@ -306,8 +338,8 @@ class ServerManager:
         timeout  = settings.idle_timeout_seconds
 
         log.debug(
-            "Moniteur d'inactivité démarré (timeout=%ds, check=%ds)",
-            timeout, interval,
+            "Moniteur d'inactivité '%s' démarré (timeout=%ds, check=%ds)",
+            self._model.id, timeout, interval,
         )
 
         while True:
@@ -317,12 +349,12 @@ class ServerManager:
                 break
 
             idle_for = time.monotonic() - self._last_request_time
-            log.debug("Idle depuis %.0fs / %ds", idle_for, timeout)
+            log.debug("'%s' idle depuis %.0fs / %ds", self._model.id, idle_for, timeout)
 
             if idle_for >= timeout:
                 log.info(
-                    "Inactivité détectée (%.0fs sans requête) — déchargement du modèle.",
-                    idle_for,
+                    "Inactivité détectée sur '%s' (%.0fs sans requête) — déchargement.",
+                    self._model.id, idle_for,
                 )
                 await self.unload(reason=f"inactivité ({idle_for:.0f}s)")
                 break
@@ -330,27 +362,25 @@ class ServerManager:
     # ── Statut ────────────────────────────────────────────────────────────────
 
     def status(self) -> dict:
-        """Retourne un dict de statut pour le endpoint /health et /admin/status."""
+        """Retourne un dict de statut pour l'endpoint /admin/status."""
         return {
-            "model_state": self._state.value,
-            "model_path": str(settings.model_path),
-            "model_name": settings.model_public_name,
+            "id": self._model.id,
+            "description": self._model.description,
+            "enabled": self._model.enabled,
+            "vram_gb": self._model.vram_gb,
+            "capabilities": self._model.capabilities,
+            "state": self._state.value,
+            "path": str(self._model.path),
             "pid": self._process.pid if self._process else None,
+            "port": self._port,
             "uptime_seconds": self.uptime_seconds,
             "idle_seconds": round(self.idle_seconds, 1) if self._last_request_time else None,
-            "idle_timeout_seconds": settings.idle_timeout_seconds,
             "llama_params": {
-                "n_gpu_layers": settings.llama_n_gpu_layers,
-                "ctx_size": settings.llama_ctx_size,
-                "parallel": settings.llama_parallel,
-                "flash_attn": settings.llama_flash_attn,
-                "cache_type_k": settings.llama_cache_type_k,
-                "cache_type_v": settings.llama_cache_type_v,
+                "n_gpu_layers": self._model.llama_params.n_gpu_layers,
+                "ctx_size": self._model.llama_params.ctx_size,
+                "parallel": self._model.llama_params.parallel,
+                "flash_attn": self._model.llama_params.flash_attn,
+                "cache_type_k": self._model.llama_params.cache_type_k,
+                "cache_type_v": self._model.llama_params.cache_type_v,
             },
         }
-
-
-# ── Instance globale ──────────────────────────────────────────────────────────
-# Créée ici, injectée dans l'app via app.state.server_manager
-
-server_manager = ServerManager()

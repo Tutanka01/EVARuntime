@@ -10,15 +10,16 @@ de la mise en production.
 
 1. [Prérequis](#1-prérequis)
 2. [Installation de llama.cpp](#2-installation-de-llamacpp)
-3. [Téléchargement du modèle](#3-téléchargement-du-modèle)
+3. [Téléchargement des modèles](#3-téléchargement-des-modèles)
 4. [Installation du gateway](#4-installation-du-gateway)
 5. [Configuration](#5-configuration)
-6. [Certificat TLS](#6-certificat-tls)
-7. [Configuration nginx](#7-configuration-nginx)
-8. [Démarrage et vérification](#8-démarrage-et-vérification)
-9. [Dashboard de monitoring](#9-dashboard-de-monitoring)
-10. [Mise à jour](#10-mise-à-jour)
-11. [Dépannage](#11-dépannage)
+6. [Registre des modèles (models.yaml)](#6-registre-des-modèles-modelsyaml)
+7. [Certificat TLS](#7-certificat-tls)
+8. [Configuration nginx](#8-configuration-nginx)
+9. [Démarrage et vérification](#9-démarrage-et-vérification)
+10. [Dashboard de monitoring](#10-dashboard-de-monitoring)
+11. [Mise à jour](#11-mise-à-jour)
+12. [Dépannage](#12-dépannage)
 
 ---
 
@@ -33,7 +34,7 @@ de la mise en production.
 | CUDA toolkit | 12.x | Pour llama.cpp GPU |
 | Pilotes NVIDIA | 535+ | `nvidia-smi` doit fonctionner |
 | nginx | 1.18+ | `apt install nginx` |
-| Espace disque | 80 GB+ | Modèle 70B Q4_K_M ≈ 42 GB |
+| Espace disque | 100 GB+ | Modèle 70B Q4_K_M ≈ 42 GB, 8B Q4_K_M ≈ 5 GB |
 
 ### Vérifications initiales
 
@@ -97,45 +98,57 @@ llama-server --version
 
 ---
 
-## 3. Téléchargement du modèle
+## 3. Téléchargement des modèles
 
-### Option A — Llama 3.3 70B (recommandé)
-
-Qualité maximale, tient dans 48GB avec les paramètres configurés.
+Le gateway supporte plusieurs modèles simultanément. Chaque modèle est un fichier
+`.gguf` indépendant. Télécharger ceux que vous souhaitez proposer, puis les déclarer
+dans le [registre des modèles](#6-registre-des-modèles-modelsyaml).
 
 ```bash
 # Installer huggingface-cli
 pip3 install huggingface-hub
 
-# Télécharger uniquement le fichier Q4_K_M (~42 GB)
+# Créer le répertoire des modèles
+sudo mkdir -p /models
+```
+
+### Modèle principal — Llama 3.3 70B Q4_K_M (~42 GB)
+
+Qualité maximale, utilise la quasi-totalité du budget VRAM du L40S.
+
+```bash
 huggingface-cli download bartowski/Llama-3.3-70B-Instruct-GGUF \
   --include "*Q4_K_M*" \
   --local-dir /models/
 
-# Vérifier le fichier
 ls -lh /models/*.gguf
 # → Llama-3.3-70B-Instruct-Q4_K_M.gguf  ~42G
 ```
 
-### Option B — Qwen 2.5 34B Q8_0 (plus de marge VRAM)
+### Modèle léger — Llama 3.1 8B Q4_K_M (~5 GB)
 
-Idéal si vous avez besoin de plus de slots concurrents ou de contextes plus longs.
+Idéal en complément du 70B : faible consommation VRAM, démarrage rapide.
+Peut tourner en parallèle du 70B si le budget VRAM le permet.
 
 ```bash
-huggingface-cli download bartowski/Qwen2.5-34B-Instruct-GGUF \
-  --include "*Q8_0*" \
+huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
+  --include "*Q4_K_M*" \
   --local-dir /models/
 
-# Adapter ensuite dans la config :
-# MODEL_PATH=/models/Qwen2.5-34B-Instruct-Q8_0.gguf
-# MODEL_PUBLIC_NAME=qwen2.5-34b-instruct
-# LLAMA_CTX_SIZE=65536
-# LLAMA_PARALLEL=8
+# → Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf  ~5G
 ```
 
-### Option C — Modèle local existant
+### Budget VRAM — planification
 
-Copier simplement le fichier `.gguf` dans `/models/` et adapter `MODEL_PATH`.
+| Modèle | Fichier | Poids VRAM | KV cache | Total estimé |
+|--------|---------|------------|----------|--------------|
+| Llama 3.3 70B Q4_K_M | `Llama-3.3-70B-Instruct-Q4_K_M.gguf` | ~38–40 GB | ~2.5 GB (4 slots × 8K, Q8) | ~42 GB |
+| Llama 3.1 8B Q4_K_M | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | ~4.5 GB | ~1 GB (8 slots × 8K, Q8) | ~5.5 GB |
+
+**L40S 48 GB :**
+- Budget net disponible = 48 − 2 (overhead) − 2.4 (marge 5%) = **43.6 GB**
+- 70B seul : 42 GB ≤ 43.6 GB ✓
+- 70B + 8B simultanément : 42 + 5.5 = 47.5 GB > 43.6 GB → éviction LRU automatique
 
 ---
 
@@ -153,12 +166,13 @@ Le script effectue automatiquement :
 
 1. Création de l'utilisateur système `llmservice` (sans shell, sans home)
 2. Ajout au groupe `render,video` pour l'accès GPU
-3. Création des répertoires (`/opt/llm-gateway`, `/var/lib/llm-gateway`, `/var/log/llm-gateway`)
+3. Création des répertoires (`/opt/llm-gateway`, `/var/lib/llm-gateway`, `/var/log/llm-gateway`, `/etc/llm-gateway`)
 4. Copie du code source et création du virtualenv Python
 5. Installation des dépendances Python
 6. **Génération automatique des secrets** (`INTERNAL_API_KEY`, `ADMIN_SECRET`) dans `/etc/llm-gateway/env`
-7. Enregistrement du service systemd et activation
-8. Initialisation de la base de données SQLite
+7. Copie du fichier `models.yaml` initial dans `/etc/llm-gateway/models.yaml`
+8. Enregistrement du service systemd et activation
+9. Initialisation de la base de données SQLite
 
 À la fin du script, les prochaines étapes sont affichées avec les valeurs générées.
 
@@ -170,7 +184,9 @@ Le script effectue automatiquement :
 ## 5. Configuration
 
 Le fichier de configuration se trouve dans `/etc/llm-gateway/env`.
-C'est là que vivent **tous les secrets et paramètres** — jamais dans le code source.
+C'est là que vivent **tous les secrets et paramètres globaux** — jamais dans le code source.
+Les paramètres spécifiques à chaque modèle (taille de contexte, nombre de slots, etc.)
+se trouvent dans `models.yaml` (voir section 6).
 
 ```bash
 sudo nano /etc/llm-gateway/env
@@ -179,52 +195,145 @@ sudo nano /etc/llm-gateway/env
 ### Paramètres critiques à vérifier
 
 ```bash
-# ── Chemin du modèle ──────────────────────────────────────────────────────────
-# Adapter au fichier téléchargé à l'étape 3
-MODEL_PATH=/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
-MODEL_PUBLIC_NAME=llama-3.3-70b-instruct
+# ── Registre des modèles ──────────────────────────────────────────────────────
+# Chemin vers le fichier YAML listant tous les modèles disponibles
+MODELS_CONFIG_PATH=/etc/llm-gateway/models.yaml
 
-# ── Paramètres GPU (déjà optimisés pour L40S 48GB + 70B Q4_K_M) ──────────────
-LLAMA_N_GPU_LAYERS=999          # offload toutes les couches sur le GPU
-LLAMA_CTX_SIZE=32768            # 4 slots × 8192 tokens ≈ 2.5GB KV cache
-LLAMA_PARALLEL=4                # 4 utilisateurs simultanés
-LLAMA_FLASH_ATTN=true           # Flash Attention 2 (supporté sur L40S)
-LLAMA_CACHE_TYPE_K=q8_0         # KV cache quantisé : -50% VRAM, qualité identique
-LLAMA_CACHE_TYPE_V=q8_0
+# ── Budget VRAM (L40S 48 GB) ──────────────────────────────────────────────────
+# Ajuster si vous utilisez un GPU différent
+TOTAL_VRAM_GB=48.0
+VRAM_OVERHEAD_GB=2.0        # réservé pour le contexte CUDA et le framework
+VRAM_SAFETY_MARGIN=0.05     # 5% de marge de sécurité supplémentaire
+
+# ── Pool de ports multi-modèles ───────────────────────────────────────────────
+# Chaque llama-server chargé occupe un port de ce pool
+BASE_LLAMA_PORT=8081
+MAX_LOADED_MODELS=5         # taille max du pool (ports 8081–8085)
+
+# ── Modèle par défaut ─────────────────────────────────────────────────────────
+# ID du modèle utilisé quand le client ne précise pas de champ "model"
+# Laisser vide pour utiliser automatiquement le premier modèle activé
+DEFAULT_MODEL_ID=llama-3.3-70b-instruct
+
+# ── Répertoires autorisés pour les fichiers .gguf ─────────────────────────────
+# Liste séparée par des virgules. Vide = pas de restriction.
+ALLOWED_MODEL_DIRS=/models
+
+# ── GPU ────────────────────────────────────────────────────────────────────────
 CUDA_VISIBLE_DEVICES=0          # index du GPU (0 = premier)
 
-# ── Comportement idle ─────────────────────────────────────────────────────────
+# ── Comportement idle (commun à tous les modèles) ────────────────────────────
 IDLE_TIMEOUT_SECONDS=300        # décharger après 5 min sans requête
 # ↑ Augmenter si les utilisateurs reviennent souvent (ex: 600 pour 10 min)
 # ↓ Diminuer pour économiser l'électricité (ex: 120 pour 2 min)
-```
 
-### Budget VRAM — vérification
-
-Pour `70B Q4_K_M` avec les paramètres par défaut :
-
-```
-Poids du modèle (Q4_K_M)  : ~38–40 GB
-KV cache (4 slots × 8K, Q8) : ~2.5 GB
-─────────────────────────────────────
-Total estimé               : ~40.5 GB
-Disponible sur L40S        : 48 GB
-Marge                      : ~7.5 GB  ✓
-```
-
-### Adapter pour un modèle 34B (plus de marge)
-
-```bash
-MODEL_PATH=/models/Qwen2.5-34B-Instruct-Q8_0.gguf
-MODEL_PUBLIC_NAME=qwen2.5-34b-instruct
-LLAMA_CTX_SIZE=65536            # 8 slots × 8192 tokens
-LLAMA_PARALLEL=8                # 8 utilisateurs simultanés
-# Budget VRAM : ~36GB poids + ~5GB KV ≈ 41GB  ✓
+# ── Secrets (générés par install.sh — ne pas modifier manuellement) ───────────
+INTERNAL_API_KEY=<généré>
+ADMIN_SECRET=<généré>
 ```
 
 ---
 
-## 6. Certificat TLS
+## 6. Registre des modèles (models.yaml)
+
+Le fichier `models.yaml` est la **source de vérité** pour tous les modèles disponibles.
+Il est installé dans `/etc/llm-gateway/models.yaml`.
+
+```bash
+sudo nano /etc/llm-gateway/models.yaml
+```
+
+### Structure
+
+```yaml
+models:
+  - id: "llama-3.3-70b-instruct"          # identifiant unique (regex: ^[a-z0-9][a-z0-9._-]*$)
+    path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"   # chemin absolu vers le .gguf
+    description: "Llama 3.3 70B Instruct, Q4_K_M — modèle principal UPPA"
+    vram_gb: 42.0                          # estimation VRAM totale (poids + KV cache)
+    enabled: true                          # false = invisible aux clients
+    capabilities:
+      - text_generation
+      - tool_calls
+      - streaming
+    llama_params:
+      n_gpu_layers: 999                    # offload toutes les couches sur GPU
+      ctx_size: 32768                      # taille de contexte (tokens)
+      parallel: 4                          # slots parallèles (utilisateurs simultanés)
+      batch_size: 4096
+      ubatch_size: 512
+      cache_type_k: "q8_0"               # KV cache quantisé : -50% VRAM, qualité identique
+      cache_type_v: "q8_0"
+      flash_attn: true                     # Flash Attention 2 (supporté sur L40S)
+      threads: 8
+      threads_http: 4
+
+  - id: "llama-3.1-8b-instruct"
+    path: "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    description: "Llama 3.1 8B Instruct, Q4_K_M — modèle léger"
+    vram_gb: 5.5
+    enabled: false                         # activer quand le fichier .gguf est disponible
+    capabilities:
+      - text_generation
+      - streaming
+    llama_params:
+      n_gpu_layers: 999
+      ctx_size: 32768
+      parallel: 8
+      batch_size: 2048
+      ubatch_size: 512
+      cache_type_k: "q8_0"
+      cache_type_v: "q8_0"
+      flash_attn: true
+      threads: 4
+      threads_http: 2
+```
+
+### Activer un modèle
+
+```bash
+# 1. Vérifier que le fichier .gguf est présent
+ls -lh /models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+
+# 2. Éditer le registre
+sudo nano /etc/llm-gateway/models.yaml
+# → passer enabled: false à enabled: true pour le modèle voulu
+
+# 3. Redémarrer le gateway pour recharger le registre
+sudo systemctl restart llm-gateway
+```
+
+### Ajouter un nouveau modèle
+
+```bash
+# 1. Télécharger le fichier .gguf
+huggingface-cli download bartowski/Qwen2.5-32B-Instruct-GGUF \
+  --include "*Q4_K_M*" --local-dir /models/
+
+# 2. Ajouter une entrée dans models.yaml (respecter la structure ci-dessus)
+sudo nano /etc/llm-gateway/models.yaml
+
+# 3. Redémarrer
+sudo systemctl restart llm-gateway
+
+# 4. Vérifier que le modèle est bien détecté
+cd /opt/llm-gateway
+sudo -u llmservice ./venv/bin/python cli.py status
+```
+
+> **Alternative API REST :** Les modèles peuvent aussi être enregistrés à chaud
+> via `POST /admin/models` sans redémarrer le service (voir le guide administrateur).
+
+### Sécurité du registre
+
+Le registre est validé au démarrage :
+- Les `id` doivent correspondre à `^[a-z0-9][a-z0-9._-]*$` (pas de `/`, `..`, etc.)
+- Les `path` doivent être absolus et se terminer par `.gguf`
+- Si `ALLOWED_MODEL_DIRS` est configuré, les chemins doivent être sous ces répertoires
+
+---
+
+## 7. Certificat TLS
 
 L'accès HTTPS est **obligatoire** — les clés API transitent dans les headers.
 
@@ -242,7 +351,7 @@ sudo chmod 644 /etc/ssl/certs/llm-gateway.crt
 
 ---
 
-## 7. Configuration nginx
+## 8. Configuration nginx
 
 ```bash
 # Adapter le nom de domaine dans la config
@@ -264,7 +373,7 @@ sudo nginx -s reload
 
 ---
 
-## 8. Démarrage et vérification
+## 9. Démarrage et vérification
 
 ### Démarrer le service
 
@@ -283,12 +392,48 @@ Résultat attendu :
    Main PID: 12345 (uvicorn)
 ```
 
+### Vérifier le registre des modèles (CLI)
+
+```bash
+cd /opt/llm-gateway
+sudo -u llmservice ./venv/bin/python cli.py status
+```
+
+Sortie attendue :
+
+```
+Configuration VRAM
+  Total GPU       : 48.0 GB
+  Overhead        : 2.0 GB
+  Marge sécurité  : 5%
+  Budget net      : 43.6 GB
+  Max modèles     : 5
+  Pool de ports   : 8081–8085
+  Idle timeout    : 300s
+
+┌──────────────────────────┬──────────┬────────┬──────────────────────────────────┬──────────────────────────────────────────────────────────┐
+│ ID                       │ VRAM     │ Activé │ Capacités                        │ Chemin                                                   │
+├──────────────────────────┼──────────┼────────┼──────────────────────────────────┼──────────────────────────────────────────────────────────┤
+│ llama-3.3-70b-instruct   │ 42.0 GB  │ oui    │ text_generation, tool_calls, ... │ /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf               │
+│ llama-3.1-8b-instruct    │  5.5 GB  │ non    │ text_generation, streaming       │ /models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf           │
+└──────────────────────────┴──────────┴────────┴──────────────────────────────────┴──────────────────────────────────────────────────────────┘
+```
+
 ### Vérifier le health check
 
 ```bash
 curl http://127.0.0.1:8000/health
-# {"status":"ok","model_state":"unloaded"}
-# ↑ "unloaded" est normal — le modèle charge à la première requête
+```
+
+Réponse attendue (aucun modèle chargé au démarrage) :
+
+```json
+{
+  "status": "ok",
+  "models_loaded": [],
+  "vram_used_gb": 0.0,
+  "vram_available_gb": 43.6
+}
 ```
 
 ### Première requête (déclenche le chargement du modèle)
@@ -300,12 +445,45 @@ sudo -u llmservice ./venv/bin/python cli.py add-user test --email test@univ-pau.
 sudo -u llmservice ./venv/bin/python cli.py create-key test --name "test"
 # → Copier la clé affichée : llmgw-XXXX...
 
-# Tester (le modèle va charger, attendre ~60-90s)
+# Tester (le modèle 70B va charger, attendre ~60-90s à la première requête)
 curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer llmgw-VOTRE_CLE" \
   -H "Content-Type: application/json" \
   -d '{"model":"llama-3.3-70b-instruct","messages":[{"role":"user","content":"Dis bonjour"}]}' \
   | python3 -m json.tool
+```
+
+### Vérifier le statut multi-modèles (API)
+
+```bash
+export ADMIN_SECRET=$(sudo grep ADMIN_SECRET /etc/llm-gateway/env | cut -d= -f2)
+curl -s http://127.0.0.1:8000/admin/status \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+```
+
+Réponse après chargement du 70B :
+
+```json
+{
+  "status": "ok",
+  "vram_budget": {
+    "total_gb": 48.0,
+    "overhead_gb": 2.0,
+    "used_gb": 42.0,
+    "available_gb": 1.6
+  },
+  "models": [
+    {
+      "id": "llama-3.3-70b-instruct",
+      "state": "ready",
+      "vram_gb": 42.0,
+      "pid": 18432,
+      "uptime_seconds": 125.3,
+      "idle_seconds": 12.1,
+      "path": "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+    }
+  ]
+}
 ```
 
 ### Vérifier la libération GPU après idle
@@ -325,7 +503,7 @@ watch -n 5 'nvidia-smi --query-gpu=name,memory.used,memory.free,power.draw \
 # Logs de la gateway (temps réel)
 sudo journalctl -u llm-gateway -f
 
-# Logs de llama-server (séparés)
+# Logs de llama-server (chaque modèle est préfixé dans les logs)
 tail -f /var/log/llm-gateway/llama-server.log
 
 # Filtrer les erreurs uniquement
@@ -334,12 +512,12 @@ sudo journalctl -u llm-gateway -p err --since "1 hour ago"
 
 ---
 
-## 9. Dashboard de monitoring
+## 10. Dashboard de monitoring
 
 Le gateway embarque un dashboard d'administration accessible depuis le navigateur.
 Il affiche en temps réel les KPIs d'usage, les graphiques de consommation de tokens,
 la distribution des erreurs, les statistiques par utilisateur et les métriques GPU
-de llama-server.
+de chaque llama-server chargé.
 
 ### Accès
 
@@ -370,60 +548,38 @@ sudo grep ADMIN_SECRET /etc/llm-gateway/env
 
 | Section | Contenu |
 |---------|---------|
-| **KPI cards** | Requêtes aujourd'hui (Δ% vs hier), tokens, utilisateurs actifs (7j), latence moyenne, taux d'erreur, état du modèle |
+| **KPI cards** | Requêtes aujourd'hui (Δ% vs hier), tokens, utilisateurs actifs (7j), latence moyenne, taux d'erreur |
+| **Budget VRAM** | VRAM totale / utilisée / disponible, état de chaque modèle chargé |
 | **Requêtes / heure** | Graphique ligne, dernières 24h/7j/30j, avec courbe d'erreurs |
 | **Token usage** | Graphique barres empilées (prompt vs completion), dernières 24h/7j/30j |
 | **Distribution HTTP** | Graphique donut des codes de statut (200, 429, 503…) |
-| **Latence** | Courbe de latence moyenne, dernières 24h/7j/30j |
 | **Tableau utilisateurs** | Requêtes, tokens consommés, barre de quota, RPM, dernière activité |
-| **Statut système** | État du modèle, PID, uptime, paramètres GPU, métriques llama-server en direct (KV cache, slots actifs, tokens/s) |
+| **Statut système** | État de chaque modèle chargé (READY/LOADING), VRAM par modèle, métriques llama-server en direct |
 
-Le dashboard se rafraîchit automatiquement toutes les **30 secondes**. Un bouton
-de rafraîchissement manuel est disponible en haut à droite.
+Le dashboard se rafraîchit automatiquement toutes les **30 secondes**.
 
 ### Endpoints metrics (pour l'automatisation)
 
-Les données du dashboard sont exposées en JSON via les routes suivantes,
-toutes protégées par le même `ADMIN_SECRET` :
-
 ```bash
-# Vue d'ensemble KPI
+# Vue d'ensemble KPI + état multi-modèles
 curl -s "$GW/admin/metrics/overview" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
 
-# Série temporelle (period=24h|7d|30d)
-curl -s "$GW/admin/metrics/timeseries?period=7d" \
-  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
-
-# Statistiques par utilisateur (period=7d|30d|90d)
-curl -s "$GW/admin/metrics/users?period=30d" \
-  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
-
-# Distribution des codes HTTP
-curl -s "$GW/admin/metrics/status-codes?period=24h" \
-  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
-
-# Métriques llama-server en direct (retourne {} si le modèle est déchargé)
+# Métriques llama-server en direct (indexées par model_id)
 curl -s "$GW/admin/metrics/llama" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+# Exemple de réponse avec deux modèles chargés :
+# {
+#   "llama-3.3-70b-instruct": { "kv_cache_usage_ratio": 0.12, "tokens_per_second": 18.4, ... },
+#   "llama-3.1-8b-instruct":  { "kv_cache_usage_ratio": 0.05, "tokens_per_second": 62.1, ... }
+# }
 ```
-
-### Sécurité
-
-| Couche | Mécanisme |
-|--------|-----------|
-| Réseau | nginx restreint `/admin/*` aux IP campus |
-| API | Tous les `/admin/metrics/*` exigent `Authorization: Bearer <ADMIN_SECRET>` |
-| Navigateur | Token dans `sessionStorage` — jamais dans `localStorage`, détruit à la fermeture |
-| Transport | TLS 1.2/1.3 (nginx) |
 
 ---
 
-## 10. Mise à jour
+## 11. Mise à jour
 
 ### Mettre à jour le code de la gateway
-
-Un script dédié gère le cycle complet : `git pull` → sync des fichiers → mise à jour des dépendances → redémarrage → health check.
 
 ```bash
 # Sur le serveur GPU, dans le répertoire du dépôt cloné
@@ -439,14 +595,8 @@ Ce que fait le script :
 5. Copie le fichier systemd et recharge `daemon-reload`
 6. Redémarre le service proprement et attend le health check
 
-Pour mettre à jour aussi la configuration nginx en même temps :
-
-```bash
-sudo bash gateway/deploy/update.sh --nginx
-```
-
 > **Note :** Le script ne touche jamais à `/etc/llm-gateway/env` (secrets),
-> à la base de données, ni aux modèles GGUF.
+> à `/etc/llm-gateway/models.yaml` (registre), à la base de données, ni aux modèles GGUF.
 
 ### Mettre à jour llama.cpp
 
@@ -461,24 +611,64 @@ sudo cp build/bin/llama-server /usr/local/bin/
 sudo systemctl restart llm-gateway
 ```
 
-### Changer de modèle
+### Ajouter ou modifier des modèles
+
+Les modèles se gèrent via `models.yaml` — aucun redémarrage requis si vous utilisez l'API REST.
+
+**Via models.yaml (redémarrage requis) :**
 
 ```bash
-# 1. Télécharger le nouveau modèle
-huggingface-cli download bartowski/Qwen2.5-72B-Instruct-GGUF \
+# 1. Télécharger le fichier .gguf
+huggingface-cli download bartowski/Qwen2.5-32B-Instruct-GGUF \
   --include "*Q4_K_M*" --local-dir /models/
 
-# 2. Mettre à jour la config
-sudo nano /etc/llm-gateway/env
-# → modifier MODEL_PATH et MODEL_PUBLIC_NAME
+# 2. Ajouter l'entrée dans le registre
+sudo nano /etc/llm-gateway/models.yaml
 
 # 3. Redémarrer
 sudo systemctl restart llm-gateway
 ```
 
+**Via API REST (sans redémarrage) :**
+
+```bash
+export ADMIN_SECRET=$(sudo grep ADMIN_SECRET /etc/llm-gateway/env | cut -d= -f2)
+
+# Enregistrer un nouveau modèle
+curl -s -X POST "https://llm.eva.univ-pau.fr/admin/models" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "qwen2.5-32b-instruct",
+    "path": "/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+    "description": "Qwen 2.5 32B Instruct Q4_K_M",
+    "vram_gb": 20.0,
+    "enabled": true,
+    "capabilities": ["text_generation", "streaming"],
+    "llama_params": {
+      "n_gpu_layers": 999,
+      "ctx_size": 32768,
+      "parallel": 6,
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": true,
+      "threads": 6,
+      "threads_http": 3
+    }
+  }'
+
+# Activer / désactiver un modèle existant
+curl -s -X PATCH "https://llm.eva.univ-pau.fr/admin/models/llama-3.1-8b-instruct" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+```
+
 ---
 
-## 11. Dépannage
+## 12. Dépannage
 
 ### Le service ne démarre pas
 
@@ -491,9 +681,11 @@ Causes fréquentes :
 | Symptôme dans les logs | Cause | Solution |
 |------------------------|-------|----------|
 | `ModuleNotFoundError` | venv corrompu | `sudo bash deploy/install.sh` |
+| `FileNotFoundError: models.yaml` | Registre absent | Vérifier `MODELS_CONFIG_PATH` dans `/etc/llm-gateway/env` |
 | `Permission denied` sur `/models/` | Droits incorrects | `sudo chown -R root:llmservice /models && chmod -R 750 /models` |
 | `Address already in use` | Port 8000 occupé | `sudo ss -tlnp \| grep 8000` |
 | `ValidationError` | Config invalide dans `.env` | Vérifier `/etc/llm-gateway/env` |
+| `ValueError: model_id invalide` | ID dans models.yaml non conforme | L'ID doit correspondre à `^[a-z0-9][a-z0-9._-]*$` |
 
 ### llama-server ne démarre pas (timeout de chargement)
 
@@ -501,25 +693,34 @@ Causes fréquentes :
 tail -100 /var/log/llm-gateway/llama-server.log
 ```
 
+Les logs sont préfixés par le model_id (ex: `[llama-3.3-70b-instruct]`) pour
+distinguer les instances quand plusieurs modèles sont chargés.
+
 Causes fréquentes :
 
 | Symptôme | Cause | Solution |
 |----------|-------|----------|
-| `CUDA error: out of memory` | Modèle trop grand | Réduire `LLAMA_CTX_SIZE` ou `LLAMA_PARALLEL` |
-| `failed to load model` | Chemin incorrect | Vérifier `MODEL_PATH` dans la config |
+| `CUDA error: out of memory` | Modèle trop grand pour le budget VRAM | Réduire `ctx_size` ou `parallel` dans `models.yaml` |
+| `failed to load model` | Chemin incorrect | Vérifier `path` dans `models.yaml` |
 | `llama-server: command not found` | llama.cpp non installé | Refaire l'étape 2 |
-| Timeout après 180s | Modèle trop lent à charger | Augmenter `MODEL_LOAD_TIMEOUT_SECONDS=300` |
+| Timeout après 180s | Modèle trop lent à charger | Augmenter `MODEL_LOAD_TIMEOUT_SECONDS=300` dans `env` |
+| `Port already in use` | Deux modèles sur le même port | Vérifier `BASE_LLAMA_PORT` et `MAX_LOADED_MODELS` |
 
-### Vérifier que la VRAM est bien libérée
+### Vérifier le budget VRAM
 
 ```bash
-# Après l'idle timeout, la mémoire GPU doit être quasi-nulle
-nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
-# Résultat attendu : < 500 MiB
+# Snapshot rapide
+nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader,nounits
 
-# Si la mémoire n'est pas libérée : vérifier les processus
+# Après idle timeout, la mémoire GPU doit être quasi-nulle
+# Résultat attendu : < 500 MiB utilisés
+
+# Statut détaillé via l'API (VRAM comptabilisée par le gateway)
+curl -s http://127.0.0.1:8000/admin/status \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Si la mémoire n'est pas libérée : vérifier les processus orphelins
 sudo fuser /dev/nvidia0
-# Tuer les processus orphelins si nécessaire
 ```
 
 ### Streaming SSE bloqué (pas de réponse en temps réel)

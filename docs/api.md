@@ -59,12 +59,21 @@ echo ".env" >> .gitignore
 ## 2. Premier test — curl
 
 ```bash
-# Vérifier que le service répond
-curl -s https://llm.univ-pau.fr/health
-# → {"status":"ok","model_state":"unloaded"}
+# Vérifier que le service répond et voir les modèles disponibles
+curl -s https://llm.eva.univ-pau.fr/health
+# → {
+#     "status": "ok",
+#     "models_loaded": [],
+#     "vram_used_gb": 0.0,
+#     "vram_available_gb": 43.6
+#   }
+
+# Lister les modèles disponibles
+curl -s https://llm.eva.univ-pau.fr/v1/models \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
 
 # Requête simple (le modèle peut mettre 60-90s à charger la première fois)
-curl -s https://llm.univ-pau.fr/v1/chat/completions \
+curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -116,7 +125,7 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     # Augmenter le timeout : le modèle peut mettre 60-90s à charger
     timeout=120.0,
@@ -138,13 +147,40 @@ print(response.choices[0].message.content)
 print(f"\n--- Tokens utilisés : {response.usage.total_tokens} ---")
 ```
 
+### Choisir un modèle spécifique
+
+Le champ `model` de la requête détermine quel modèle traite la demande.
+Si plusieurs modèles sont activés, vous pouvez cibler le plus approprié :
+
+```python
+# Modèle principal : qualité maximale
+response = client.chat.completions.create(
+    model="llama-3.3-70b-instruct",
+    messages=[{"role": "user", "content": "Analyse en détail ce texte..."}],
+)
+
+# Modèle léger : latence réduite, moins de VRAM
+response = client.chat.completions.create(
+    model="llama-3.1-8b-instruct",
+    messages=[{"role": "user", "content": "Résume en 2 phrases."}],
+)
+```
+
+Pour connaître les modèles disponibles :
+
+```python
+models = client.models.list()
+for m in models.data:
+    print(m.id)
+```
+
 ### Conversation multi-tours
 
 ```python
-def chat(messages: list[dict]) -> str:
+def chat(messages: list[dict], model: str = "llama-3.3-70b-instruct") -> str:
     """Envoie une conversation et retourne la réponse."""
     response = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model=model,
         messages=messages,
         max_tokens=2048,
         temperature=0.7,
@@ -176,14 +212,15 @@ import time
 from openai import OpenAI, APIStatusError, APITimeoutError, APIConnectionError
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=120.0,
     max_retries=0,  # On gère nous-mêmes les retries
 )
 
 
-def query_with_retry(messages: list[dict], max_attempts: int = 3) -> str:
+def query_with_retry(messages: list[dict], model: str = "llama-3.3-70b-instruct",
+                     max_attempts: int = 3) -> str:
     """
     Envoie une requête avec retry automatique.
     Attend le chargement du modèle si nécessaire (503).
@@ -191,7 +228,7 @@ def query_with_retry(messages: list[dict], max_attempts: int = 3) -> str:
     for attempt in range(1, max_attempts + 1):
         try:
             response = client.chat.completions.create(
-                model="llama-3.3-70b-instruct",
+                model=model,
                 messages=messages,
                 max_tokens=2048,
             )
@@ -209,6 +246,10 @@ def query_with_retry(messages: list[dict], max_attempts: int = 3) -> str:
                 time.sleep(60)
             elif e.status_code == 401:
                 raise ValueError("Clé API invalide ou révoquée.") from e
+            elif e.status_code == 404:
+                raise ValueError(f"Modèle '{model}' inconnu ou désactivé.") from e
+            elif e.status_code == 403:
+                raise ValueError(f"Modèle '{model}' désactivé par l'administrateur.") from e
             else:
                 raise
 
@@ -240,16 +281,17 @@ Si vous n'utilisez pas `openai-python` et préférez un client HTTP bas niveau :
 import httpx
 import os
 
-API_URL = "https://llm.univ-pau.fr/v1/chat/completions"
+API_URL = "https://llm.eva.univ-pau.fr/v1/chat/completions"
 HEADERS = {
     "Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}",
     "Content-Type": "application/json",
 }
 
 
-def ask(prompt: str, system: str = "Tu es un assistant utile.") -> str:
+def ask(prompt: str, model: str = "llama-3.3-70b-instruct",
+        system: str = "Tu es un assistant utile.") -> str:
     payload = {
-        "model": "llama-3.3-70b-instruct",
+        "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user",   "content": prompt},
@@ -295,11 +337,11 @@ print()  # Saut de ligne final
 ### Python — streaming avec collecte du résultat complet
 
 ```python
-def stream_and_collect(messages: list[dict]) -> str:
+def stream_and_collect(messages: list[dict], model: str = "llama-3.3-70b-instruct") -> str:
     """Stream vers stdout et retourne le texte complet."""
     full_text = ""
     stream = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model=model,
         messages=messages,
         stream=True,
     )
@@ -324,15 +366,15 @@ import asyncio
 from openai import AsyncOpenAI
 
 async_client = AsyncOpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=120.0,
 )
 
 
-async def stream_response(prompt: str):
+async def stream_response(prompt: str, model: str = "llama-3.3-70b-instruct"):
     async with async_client.beta.chat.completions.stream(
-        model="llama-3.3-70b-instruct",
+        model=model,
         messages=[{"role": "user", "content": prompt}],
     ) as stream:
         async for text in stream.text_stream:
@@ -346,7 +388,7 @@ asyncio.run(stream_response("Explique le fine-tuning en 5 points."))
 ### curl — streaming SSE
 
 ```bash
-curl -sN https://llm.univ-pau.fr/v1/chat/completions \
+curl -sN https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -413,7 +455,7 @@ import os
 
 llm = ChatOpenAI(
     model="llama-3.3-70b-instruct",
-    openai_api_base="https://llm.univ-pau.fr/v1",
+    openai_api_base="https://llm.eva.univ-pau.fr/v1",
     openai_api_key=os.environ["UPPA_LLM_KEY"],
     temperature=0.7,
     max_tokens=2048,
@@ -440,7 +482,7 @@ from langchain_core.documents import Document
 # LLM local via le gateway
 llm = ChatOpenAI(
     model="llama-3.3-70b-instruct",
-    openai_api_base="https://llm.univ-pau.fr/v1",
+    openai_api_base="https://llm.eva.univ-pau.fr/v1",
     openai_api_key=os.environ["UPPA_LLM_KEY"],
     temperature=0.0,
 )
@@ -480,10 +522,14 @@ npm install openai
 import OpenAI from 'openai';
 
 const client = new OpenAI({
-  baseURL: 'https://llm.univ-pau.fr/v1',
+  baseURL: 'https://llm.eva.univ-pau.fr/v1',
   apiKey: process.env.UPPA_LLM_KEY,
   timeout: 120_000,  // 120 secondes
 });
+
+// Lister les modèles disponibles
+const models = await client.models.list();
+console.log(models.data.map(m => m.id));
 
 // Requête simple
 const response = await client.chat.completions.create({
@@ -514,38 +560,44 @@ console.log();
 
 ## 9. Comportement au premier appel
 
-Le modèle n'est **pas chargé en permanence** (pour économiser l'électricité et
-réduire le bruit des ventilateurs du serveur). Voici ce qui se passe :
+Les modèles ne sont **pas chargés en permanence** (pour économiser l'électricité et
+réduire le bruit des ventilateurs du serveur). Chaque modèle a son propre cycle
+de chargement/déchargement indépendant.
 
 ```
-Votre requête arrive
+Votre requête arrive (model: "llama-3.3-70b-instruct")
         │
         ▼
-Modèle déchargé ?  ──oui──→  Chargement en cours (~60-90s pour 70B)
+Ce modèle est-il chargé ?  ──non──→  Vérification du budget VRAM
+        │                                      │
+       oui                         Budget suffisant ?
+        │                             oui │   non → éviction LRU du modèle
+        │                                 ▼       le moins récemment utilisé
+        │                   Chargement en cours (~60-90s pour 70B, ~15s pour 8B)
         │                              │
-       non                    Toutes les requêtes en attente
-        │                     sont débloquées ensemble dès que
-        ▼                     le modèle est prêt
+        │                   Toutes les requêtes en attente
+        │                   pour ce modèle sont débloquées
+        ▼                   ensemble dès qu'il est prêt
   Réponse immédiate
   (~2-30s selon la longueur)
 ```
 
 **Conséquences pratiques :**
 
-- La **première requête après une période d'inactivité** peut prendre 60 à 120 secondes
-- Les requêtes **suivantes** sont rapides (~2-10s pour une réponse courte)
-- Si vous envoyez **plusieurs requêtes simultanément** pendant le chargement,
-  elles attendent toutes et repartent en parallèle dès que le modèle est prêt
-- Après **5 minutes** sans requête, le modèle est déchargé automatiquement
+- La **première requête vers un modèle** après une période d'inactivité peut prendre 60 à 120 secondes (70B) ou 10 à 20 secondes (8B)
+- Les requêtes **suivantes** vers ce modèle sont rapides (~2-10s pour une réponse courte)
+- Si le budget VRAM est saturé, le modèle **le moins récemment utilisé** est automatiquement déchargé avant de charger le nouveau
+- Après **5 minutes** sans requête, chaque modèle est déchargé individuellement
 
 **Comment gérer ce délai dans votre code :**
 
 ```python
 import time
 from openai import OpenAI, APIStatusError
+import httpx
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     # Timeout suffisant pour attendre le chargement du modèle
     timeout=150.0,
@@ -558,22 +610,15 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Bonjour"}],
 )
 
-# Option 2 : pré-vérifier l'état du modèle
-import httpx
+# Option 2 : vérifier l'état via /health avant d'envoyer
+def wait_for_any_model(max_wait: int = 30) -> dict:
+    """Retourne l'état du gateway (modèles chargés, VRAM)."""
+    r = httpx.get("https://llm.eva.univ-pau.fr/health", timeout=5)
+    return r.json()
 
-def wait_for_model_ready(max_wait: int = 120) -> bool:
-    """Attend que le modèle soit chargé. Retourne True si prêt."""
-    deadline = time.time() + max_wait
-    while time.time() < deadline:
-        r = httpx.get("https://llm.univ-pau.fr/health", timeout=5)
-        state = r.json().get("model_state")
-        if state == "ready":
-            return True
-        if state == "unloaded":
-            # Déclencher le chargement avec une requête légère
-            break
-        time.sleep(5)
-    return False
+status = wait_for_any_model()
+print("Modèles actuellement chargés :", status["models_loaded"])
+print("VRAM disponible :", status["vram_available_gb"], "GB")
 ```
 
 ---
@@ -587,8 +632,10 @@ def wait_for_model_ready(max_wait: int = 120) -> bool:
 | `200` | — | Succès | — |
 | `400` | `invalid_request_error` | JSON malformé ou paramètre invalide | Vérifier le body de la requête |
 | `401` | `authentication_error` | Clé absente, invalide ou révoquée | Vérifier la clé ; contacter l'admin si révoquée |
+| `403` | `permission_error` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible ; voir `GET /v1/models` |
+| `404` | `not_found_error` | Modèle inconnu (non enregistré dans le registre) | Vérifier l'ID du modèle via `GET /v1/models` |
 | `429` | `rate_limit_error` | Trop de requêtes (limite RPM dépassée) | Attendre 60s ; voir l'en-tête `Retry-After` |
-| `503` | `server_error` | Modèle en cours de chargement | Attendre 30-60s et réessayer |
+| `503` | `server_error` | Modèle en cours de chargement ou VRAM insuffisante | Attendre 30-90s et réessayer |
 | `504` | `server_error` | Timeout de génération (réponse trop longue) | Réduire `max_tokens` ou simplifier le prompt |
 | `500` | `server_error` | Erreur interne inattendue | Contacter l'admin avec l'heure et le contexte |
 | `502` | `server_error` | llama-server injoignable | Transitoire — réessayer dans 30s |
@@ -600,9 +647,9 @@ Toutes les erreurs suivent le format OpenAI standard :
 ```json
 {
   "error": {
-    "message": "Clé API invalide, révoquée ou expirée.",
-    "type": "authentication_error",
-    "code": "401"
+    "message": "Modèle 'modele-inconnu' non trouvé dans le registre.",
+    "type": "not_found_error",
+    "code": "404"
   }
 }
 ```
@@ -613,6 +660,8 @@ Toutes les erreurs suivent le format OpenAI standard :
 from openai import (
     OpenAI,
     AuthenticationError,    # 401
+    PermissionDeniedError,  # 403 — modèle désactivé
+    NotFoundError,          # 404 — modèle inconnu
     RateLimitError,         # 429
     APIStatusError,         # 4xx / 5xx
     APITimeoutError,        # timeout réseau
@@ -620,7 +669,7 @@ from openai import (
 )
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=120.0,
     max_retries=0,
@@ -634,23 +683,27 @@ try:
     print(response.choices[0].message.content)
 
 except AuthenticationError:
-    # Clé invalide ou révoquée
     print("Erreur 401 : Vérifiez votre clé API UPPA_LLM_KEY.")
     print("Contacter l'admin si vous pensez qu'elle a été révoquée.")
 
+except NotFoundError:
+    print("Erreur 404 : Modèle inconnu.")
+    print("Listez les modèles disponibles via GET /v1/models.")
+
+except PermissionDeniedError:
+    print("Erreur 403 : Ce modèle est temporairement désactivé.")
+    print("Essayez un autre modèle ou contactez l'admin.")
+
 except RateLimitError as e:
-    # Trop de requêtes — attendre et réessayer
     retry_after = int(e.response.headers.get("Retry-After", 60))
     print(f"Limite de débit atteinte. Réessayer dans {retry_after}s.")
     time.sleep(retry_after)
 
 except APIStatusError as e:
     if e.status_code == 503:
-        # Modèle en cours de chargement
-        print("Modèle en cours de chargement, réessayer dans 30s…")
-        time.sleep(30)
+        print("Modèle en cours de chargement, réessayer dans 30-90s…")
+        time.sleep(60)
     elif e.status_code == 504:
-        # Génération trop longue
         print("Timeout : le prompt est peut-être trop long. Essayez max_tokens plus petit.")
     else:
         print(f"Erreur {e.status_code} : {e.message}")
@@ -659,15 +712,24 @@ except APITimeoutError:
     print("Timeout réseau. Vérifiez votre connexion au réseau UPPA.")
 
 except APIConnectionError:
-    print("Impossible de joindre llm.univ-pau.fr. Êtes-vous sur le réseau UPPA ?")
+    print("Impossible de joindre llm.eva.univ-pau.fr. Êtes-vous sur le réseau UPPA ?")
+```
+
+### Erreur 404 — Modèle inconnu
+
+```bash
+# Symptôme
+# {"error": {"message": "Modèle 'mon-modele' non trouvé dans le registre.", "type": "not_found_error"}}
+
+# Solution : lister les modèles disponibles
+curl -s https://llm.eva.univ-pau.fr/v1/models \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
+# → Liste les IDs de tous les modèles activés
 ```
 
 ### Erreur 401 — Authentification
 
 ```bash
-# Symptôme
-# {"error": {"message": "Clé API invalide, révoquée ou expirée.", "type": "authentication_error"}}
-
 # Vérifications :
 # 1. La variable d'environnement est-elle définie ?
 echo $UPPA_LLM_KEY
@@ -701,7 +763,6 @@ for i, prompt in enumerate(prompts):
     except RateLimitError:
         print(f"Rate limit sur prompt {i}, attente 60s…")
         time.sleep(60)
-        # Réessayer
         r = client.chat.completions.create(
             model="llama-3.3-70b-instruct",
             messages=[{"role": "user", "content": prompt}],
@@ -719,9 +780,12 @@ for i, prompt in enumerate(prompts):
 | Limite | Valeur par défaut | Notes |
 |--------|-------------------|-------|
 | Requêtes par minute (RPM) | 20 | Ajustable par l'admin sur demande |
-| Tokens de contexte max | 8 192 par requête | Prompt + réponse |
-| Connexions simultanées | 4 | Partagées entre tous les utilisateurs |
+| Tokens de contexte max | 32 768 par requête | Prompt + réponse (dépend du modèle) |
+| Slots parallèles par modèle | 4 (70B) / 8 (8B) | Partagés entre tous les utilisateurs du même modèle |
 | Quota mensuel tokens | Illimité | Configurable par l'admin |
+
+> **Note :** Les slots parallèles sont indépendants par modèle. Requêtes vers le 70B
+> et vers le 8B ne se bloquent pas mutuellement.
 
 **Si vous avez besoin de limites plus élevées** (traitement de corpus, pipeline
 d'annotation, etc.), contacter l'admin en expliquant le volume attendu.
@@ -760,7 +824,7 @@ from pathlib import Path
 from openai import OpenAI, RateLimitError
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=60.0,
 )
@@ -823,7 +887,7 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=120.0,
 )
@@ -872,7 +936,7 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=120.0,
 )
@@ -939,13 +1003,14 @@ from openai import OpenAI
 import os
 
 client = OpenAI(
-    base_url="https://llm.univ-pau.fr/v1",
+    base_url="https://llm.eva.univ-pau.fr/v1",
     api_key=os.environ["UPPA_LLM_KEY"],
     timeout=120.0,
 )
 
 
-def simple_rag(question: str, documents: list[str]) -> str:
+def simple_rag(question: str, documents: list[str],
+               model: str = "llama-3.3-70b-instruct") -> str:
     """
     RAG basique : injecte les documents dans le contexte.
     Pour des corpus plus grands, utiliser LangChain + FAISS.
@@ -961,7 +1026,7 @@ Documents :
 Question : {question}"""
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model=model,
         messages=[
             {"role": "system", "content": "Tu es un assistant de recherche documentaire."},
             {"role": "user",   "content": prompt},
@@ -987,6 +1052,7 @@ print(answer)
 ## Besoin d'aide ?
 
 - **Problème d'accès** (clé invalide, accès révoqué) → Contacter l'administrateur
+- **Modèle inconnu (404)** → Vérifier les IDs disponibles via `GET /v1/models`
 - **Comportement inattendu du modèle** → Vérifier les paramètres `temperature` et `system`
 - **Quota dépassé** → Contacter l'admin pour augmenter la limite
 - **Intégration avec un outil spécifique** → Le gateway étant compatible OpenAI,

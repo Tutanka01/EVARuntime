@@ -1,12 +1,12 @@
 # Guide administrateur — Cluster EVA Inference Gateway
 
 Ce document s'adresse à l'administrateur du gateway : gestion des utilisateurs,
-des clés API, surveillance du système et reporting d'usage.
+des clés API, du registre des modèles, surveillance du système et reporting d'usage.
 
 Trois interfaces sont disponibles :
 - **Dashboard** (`/admin/dashboard`) : interface web avec graphiques, tableaux et métriques en temps réel — recommandé pour la surveillance quotidienne
-- **CLI** (`cli.py`) : à utiliser directement sur le serveur, idéal pour la gestion des utilisateurs et des clés
-- **API REST** (`/admin/...`) : accessible depuis le réseau campus uniquement, utile pour l'automatisation
+- **CLI** (`cli.py`) : à utiliser directement sur le serveur, idéal pour la gestion des utilisateurs, des clés et la vérification du registre
+- **API REST** (`/admin/...`) : accessible depuis le réseau campus uniquement, utile pour l'automatisation et la gestion des modèles à chaud
 
 ---
 
@@ -17,7 +17,7 @@ Trois interfaces sont disponibles :
 3. [Gestion des clés API](#3-gestion-des-clés-api)
 4. [Surveillance du système](#4-surveillance-du-système)
 5. [Rapports d'usage](#5-rapports-dusage)
-6. [Contrôle du modèle](#6-contrôle-du-modèle)
+6. [Contrôle des modèles](#6-contrôle-des-modèles)
 7. [Référence API REST admin](#7-référence-api-rest-admin)
 
 ---
@@ -52,7 +52,7 @@ sudo grep ADMIN_SECRET /etc/llm-gateway/env
 
 # L'exporter pour les exemples suivants
 export ADMIN_SECRET="votre_secret_ici"
-export GW="https://llm.univ-pau.fr"
+export GW="https://llm.eva.univ-pau.fr"
 ```
 
 ---
@@ -249,37 +249,87 @@ Connexion avec l'`ADMIN_SECRET`. Le token est stocké dans `sessionStorage` et d
 **Ce qui est visible en un coup d'œil :**
 - Requêtes et tokens du jour (avec Δ% par rapport à hier)
 - Taux d'erreur et latence sur 24h (P50/P95/P99)
-- État du modèle avec uptime et temps d'inactivité restant
+- Budget VRAM : total / utilisé / disponible, avec état de chaque modèle chargé
 - Graphiques par heure / par jour sur 24h, 7j ou 30j
 - Tableau de tous les utilisateurs avec leur consommation et leur quota
-- Métriques GPU en direct : KV cache fill, slots actifs, tokens/s
+- Métriques GPU en direct par modèle : KV cache fill, slots actifs, tokens/s
 
 Le dashboard se rafraîchit automatiquement toutes les **30 secondes**.
 
-### État en temps réel (CLI / API)
+### Registre des modèles (CLI)
 
 ```bash
-# CLI
+# Affiche la configuration VRAM et tous les modèles du registre
 llmgw status
+```
 
-# Sortie :
-#   État du modèle  : ready
-#   Modèle          : llama-3.3-70b-instruct
-#   Chemin          : /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
-#   PID             : 18432
-#   Uptime          : 3742s
-#   Idle depuis     : 42.3s
-#   Idle timeout    : 300s
-#
-#   GPU layers      : 999
-#   Context size    : 32768
-#   Parallel slots  : 4
-#   Flash Attention : True
-#   KV cache type   : K=q8_0 / V=q8_0
+Sortie :
 
-# API REST
+```
+Configuration VRAM
+  Total GPU       : 48.0 GB
+  Overhead        : 2.0 GB
+  Marge sécurité  : 5%
+  Budget net      : 43.6 GB
+  Max modèles     : 5
+  Pool de ports   : 8081–8085
+  Idle timeout    : 300s
+
+┌──────────────────────────┬──────────┬────────┬──────────────────────────────────┬──────────────────────────────────────────────────────────┐
+│ ID                       │ VRAM     │ Activé │ Capacités                        │ Chemin                                                   │
+├──────────────────────────┼──────────┼────────┼──────────────────────────────────┼──────────────────────────────────────────────────────────┤
+│ llama-3.3-70b-instruct   │ 42.0 GB  │ oui    │ text_generation, tool_calls, ... │ /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf               │
+│ llama-3.1-8b-instruct    │  5.5 GB  │ non    │ text_generation, streaming       │ /models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf           │
+└──────────────────────────┴──────────┴────────┴──────────────────────────────────┴──────────────────────────────────────────────────────────┘
+
+Note : L'état live (READY/LOADING) n'est visible que via GET /admin/status
+```
+
+> **Note :** Le CLI affiche l'état statique du registre (fichier `models.yaml`).
+> Pour voir l'état dynamique en temps réel (READY, LOADING, usage VRAM), utiliser
+> `GET /admin/status` ou le dashboard.
+
+### État en temps réel (API)
+
+```bash
+# Statut multi-modèles avec budget VRAM
 curl -s "$GW/admin/status" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Réponse exemple (deux modèles — l'un chargé, l'autre non) :
+# {
+#   "status": "ok",
+#   "vram_budget": {
+#     "total_gb": 48.0,
+#     "overhead_gb": 2.0,
+#     "used_gb": 42.0,
+#     "available_gb": 1.6
+#   },
+#   "models": [
+#     {
+#       "id": "llama-3.3-70b-instruct",
+#       "description": "Llama 3.3 70B Instruct, Q4_K_M",
+#       "enabled": true,
+#       "vram_gb": 42.0,
+#       "state": "ready",
+#       "pid": 18432,
+#       "uptime_seconds": 3742.1,
+#       "idle_seconds": 42.3,
+#       "path": "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+#     },
+#     {
+#       "id": "llama-3.1-8b-instruct",
+#       "description": "Llama 3.1 8B Instruct, Q4_K_M",
+#       "enabled": true,
+#       "vram_gb": 5.5,
+#       "state": "unloaded",
+#       "pid": null,
+#       "uptime_seconds": null,
+#       "idle_seconds": null,
+#       "path": "/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+#     }
+#   ]
+# }
 ```
 
 ### Surveiller la VRAM GPU
@@ -294,9 +344,9 @@ watch -n 5 'nvidia-smi --query-gpu=memory.used,memory.free,power.draw \
   --format=csv,noheader'
 
 # Valeurs typiques :
-# Modèle chargé, inactif  : ~40500 MiB utilisés, ~130W
-# Inférence active (70B)  : ~41000 MiB utilisés, ~320W
-# Modèle déchargé (idle)  : ~200 MiB,            ~28W  ← GPU libéré ✓
+# 70B seul, inactif         : ~40500 MiB utilisés, ~130W
+# 70B seul, inférence       : ~41000 MiB utilisés, ~320W
+# Aucun modèle chargé       : ~200 MiB,            ~28W  ← GPU libéré ✓
 ```
 
 ### Logs en temps réel
@@ -305,7 +355,8 @@ watch -n 5 'nvidia-smi --query-gpu=memory.used,memory.free,power.draw \
 # Gateway (démarrages, requêtes, erreurs)
 sudo journalctl -u llm-gateway -f
 
-# llama-server (chargement, inférence)
+# llama-server (chargement, inférence — préfixé par model_id)
+# Ex: [llama-3.3-70b-instruct] llama_init: warming up model...
 tail -f /var/log/llm-gateway/llama-server.log
 
 # Filtrer les erreurs uniquement
@@ -317,11 +368,12 @@ sudo journalctl -u llm-gateway --since "24 hours ago" | less
 
 ### Métriques Prometheus (intégrées à llama-server)
 
-Lorsque le modèle est chargé, les métriques sont disponibles directement
-depuis le serveur :
+Lorsque des modèles sont chargés, les métriques sont accessibles par modèle
+via leur port respectif (localement uniquement) :
 
 ```bash
 # Métriques brutes (format Prometheus) — accès local uniquement
+# Port attribué dynamiquement (8081 = premier modèle chargé, 8082 = second, etc.)
 curl http://127.0.0.1:8081/metrics
 
 # Métriques intéressantes :
@@ -333,13 +385,29 @@ curl http://127.0.0.1:8081/metrics
 # llamacpp:requests_deferred          — requêtes en attente de slot
 ```
 
-Ces métriques sont également disponibles en JSON via le gateway (depuis le réseau campus),
+Ces métriques sont également disponibles en JSON via le gateway (indexées par model_id),
 ce qui évite d'avoir à ouvrir un accès direct à llama-server :
 
 ```bash
 curl -s "$GW/admin/metrics/llama" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
-# Retourne {} si le modèle est déchargé
+# Exemple de réponse avec deux modèles chargés :
+# {
+#   "llama-3.3-70b-instruct": {
+#     "kv_cache_usage_ratio": 0.12,
+#     "kv_cache_tokens": 3932,
+#     "requests_processing": 1.0,
+#     "requests_deferred": 0.0,
+#     "tokens_per_second": 18.4,
+#     "prompt_tokens_total": 45230.0,
+#     "tokens_predicted_total": 12880.0
+#   },
+#   "llama-3.1-8b-instruct": {
+#     "kv_cache_usage_ratio": 0.05,
+#     ...
+#   }
+# }
+# Retourne {} si aucun modèle n'est chargé
 ```
 
 ---
@@ -399,28 +467,140 @@ w.writerows(data)
 
 ---
 
-## 6. Contrôle du modèle
+## 6. Contrôle des modèles
 
-### Forcer le déchargement du modèle
-
-Utile pour libérer le GPU pour d'autres tâches (entraînement, etc.)
-ou pour vérifier que la VRAM se libère correctement.
+### Voir l'état de tous les modèles
 
 ```bash
-# API REST
-curl -s -X POST "$GW/admin/unload" \
-  -H "Authorization: Bearer $ADMIN_SECRET"
-# → {"message": "Modèle déchargé. GPU libéré."}
+# Via API (état live)
+curl -s "$GW/admin/models" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+# → liste tous les modèles (registre + état READY/LOADING/UNLOADED)
 
-# Vérifier dans les 3s
+# Via CLI (registre uniquement, sans état live)
+llmgw status
+```
+
+### Pré-charger un modèle
+
+Par défaut, les modèles chargent à la première requête. Pour les pré-charger
+afin d'éliminer le délai de la première requête :
+
+```bash
+# Pré-charger le modèle 8B
+curl -s -X POST "$GW/admin/models/llama-3.1-8b-instruct/load" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# → {"message": "Modèle 'llama-3.1-8b-instruct' en cours de chargement."}
+
+# Vérifier le statut après quelques secondes
+curl -s "$GW/admin/models/llama-3.1-8b-instruct" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+```
+
+### Décharger un modèle spécifique
+
+Utile pour libérer de la VRAM pour un autre modèle, ou forcer le rechargement
+d'un modèle dont les paramètres ont changé.
+
+```bash
+# Décharger le 70B
+curl -s -X POST "$GW/admin/models/llama-3.3-70b-instruct/unload" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# → {"message": "Modèle 'llama-3.3-70b-instruct' déchargé."}
+
+# Vérifier la VRAM libérée
 nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
 # → ~200  (MiB)
+```
+
+### Décharger tous les modèles
+
+```bash
+# Décharger tous les modèles chargés (libère toute la VRAM)
+curl -s -X POST "$GW/admin/unload" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# → {"message": "Tous les modèles déchargés. GPU libéré."}
+```
+
+### Activer / désactiver un modèle du registre
+
+Désactiver un modèle le rend **invisible aux clients** (`GET /v1/models` ne le liste plus)
+et les requêtes vers cet ID reçoivent un `403`. Si le modèle est actuellement chargé,
+il est automatiquement déchargé.
+
+```bash
+# Désactiver le modèle 8B (ex: fichier .gguf absent)
+curl -s -X PATCH "$GW/admin/models/llama-3.1-8b-instruct" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+# Réactiver
+curl -s -X PATCH "$GW/admin/models/llama-3.1-8b-instruct" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+```
+
+### Enregistrer un nouveau modèle (sans redémarrage)
+
+```bash
+# 1. S'assurer que le fichier .gguf est présent
+ls -lh /models/Qwen2.5-32B-Instruct-Q4_K_M.gguf
+
+# 2. Enregistrer via API (persiste dans models.yaml)
+curl -s -X POST "$GW/admin/models" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "qwen2.5-32b-instruct",
+    "path": "/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+    "description": "Qwen 2.5 32B Instruct Q4_K_M",
+    "vram_gb": 20.0,
+    "enabled": true,
+    "capabilities": ["text_generation", "streaming"],
+    "llama_params": {
+      "n_gpu_layers": 999,
+      "ctx_size": 32768,
+      "parallel": 6,
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": true,
+      "threads": 6,
+      "threads_http": 3
+    }
+  }' | python3 -m json.tool
+
+# 3. Le modèle est maintenant visible dans GET /v1/models
+#    Il chargera automatiquement à la première requête qui le cible
+```
+
+**Validations appliquées lors de l'enregistrement :**
+- L'`id` doit correspondre à `^[a-z0-9][a-z0-9._-]*$`
+- Le `path` doit être absolu et se terminer par `.gguf`
+- Le fichier `.gguf` doit exister sur disque
+- Si `ALLOWED_MODEL_DIRS` est configuré, le chemin doit être sous ces répertoires
+- `vram_gb` doit être entre 0.5 et le budget VRAM net
+
+### Supprimer un modèle du registre
+
+```bash
+# Un modèle chargé ne peut pas être supprimé — le décharger d'abord
+curl -s -X POST "$GW/admin/models/qwen2.5-32b-instruct/unload" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+
+# Puis supprimer
+curl -s -X DELETE "$GW/admin/models/qwen2.5-32b-instruct" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+# → {"message": "Modèle 'qwen2.5-32b-instruct' supprimé du registre."}
 ```
 
 ### Redémarrer le service
 
 ```bash
-# Arrêt propre : décharge le modèle avant d'arrêter
+# Arrêt propre : décharge tous les modèles avant d'arrêter
 sudo systemctl restart llm-gateway
 
 # Vérifier le redémarrage
@@ -457,6 +637,72 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 | `GET` | `/admin/users/{username}/keys` | Lister les clés (sans valeur brute) |
 | `DELETE` | `/admin/keys/{key_prefix}` | Révoquer une clé |
 
+### Registre des modèles
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/admin/models` | Lister tous les modèles (registre + état live) |
+| `POST` | `/admin/models` | Enregistrer un nouveau modèle (persiste dans models.yaml) |
+| `GET` | `/admin/models/{model_id}` | Détail d'un modèle (registre + état live) |
+| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle (enabled, vram_gb, description) |
+| `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (seulement si non chargé) |
+| `POST` | `/admin/models/{model_id}/load` | Pré-charger un modèle en VRAM |
+| `POST` | `/admin/models/{model_id}/unload` | Décharger un modèle spécifique |
+
+**Exemple — lister les modèles avec état live :**
+
+```bash
+curl -s "$GW/admin/models" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+# [
+#   {
+#     "id": "llama-3.3-70b-instruct",
+#     "description": "Llama 3.3 70B Instruct, Q4_K_M",
+#     "enabled": true,
+#     "vram_gb": 42.0,
+#     "capabilities": ["text_generation", "tool_calls", "streaming"],
+#     "state": "ready",
+#     "pid": 18432,
+#     "uptime_seconds": 3742.1,
+#     "idle_seconds": 42.3,
+#     "path": "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+#   },
+#   {
+#     "id": "llama-3.1-8b-instruct",
+#     ...
+#     "state": "unloaded",
+#     "pid": null
+#   }
+# ]
+```
+
+### Système
+
+| Méthode | Route | Description |
+|---------|-------|-------------|
+| `GET` | `/admin/status` | Budget VRAM + état de tous les modèles |
+| `POST` | `/admin/unload` | Décharger tous les modèles chargés |
+
+**Exemple — vue d'ensemble du statut système :**
+
+```bash
+curl -s "$GW/admin/status" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+# {
+#   "status": "ok",
+#   "vram_budget": {
+#     "total_gb": 48.0,
+#     "overhead_gb": 2.0,
+#     "used_gb": 42.0,
+#     "available_gb": 1.6
+#   },
+#   "models": [
+#     { "id": "llama-3.3-70b-instruct", "state": "ready", "vram_gb": 42.0, ... },
+#     { "id": "llama-3.1-8b-instruct", "state": "unloaded", ... }
+#   ]
+# }
+```
+
 ### Usage (données brutes)
 
 | Méthode | Route | Paramètres |
@@ -468,13 +714,13 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 
 | Méthode | Route | Paramètres | Description |
 |---------|-------|------------|-------------|
-| `GET` | `/admin/metrics/overview` | — | KPIs globaux, latence (P50/P95/P99), état du modèle |
+| `GET` | `/admin/metrics/overview` | — | KPIs globaux, latence (P50/P95/P99), état multi-modèles |
 | `GET` | `/admin/metrics/timeseries` | `period=24h\|7d\|30d` | Série temporelle (requêtes, tokens, erreurs, latence) |
 | `GET` | `/admin/metrics/users` | `period=7d\|30d\|90d` | Statistiques par utilisateur avec quota |
 | `GET` | `/admin/metrics/status-codes` | `period=24h\|7d` | Distribution des codes HTTP |
-| `GET` | `/admin/metrics/llama` | — | Métriques llama-server en direct (JSON) — retourne `{}` si déchargé |
+| `GET` | `/admin/metrics/llama` | — | Métriques llama-server en direct par model_id — retourne `{}` si aucun chargé |
 
-**Exemple — vue d'ensemble :**
+**Exemple — vue d'ensemble KPI :**
 
 ```bash
 curl -s "$GW/admin/metrics/overview" \
@@ -487,16 +733,13 @@ curl -s "$GW/admin/metrics/overview" \
 #   "error_rate_24h": 0.007,
 #   "latency_p50_ms": 2940.0,
 #   "latency_p95_ms": 8210.0,
-#   "model": { "model_state": "ready", "uptime_seconds": 1842, ... }
+#   "models": {
+#     "status": "ok",
+#     "vram_budget": { "total_gb": 48.0, "used_gb": 42.0, ... },
+#     "models": [...]
+#   }
 # }
 ```
-
-### Système
-
-| Méthode | Route | Description |
-|---------|-------|-------------|
-| `GET` | `/admin/status` | État du modèle, PID, uptime, params GPU |
-| `POST` | `/admin/unload` | Forcer le déchargement du modèle |
 
 ---
 
@@ -508,6 +751,15 @@ curl -s "$GW/admin/metrics/overview" \
   révoquer un accès spécifique sans impacter les autres travaux
 - Fixer une **date d'expiration** pour les accès temporaires (stagiaires, visiteurs)
 - Revoir les accès inactifs chaque début de semestre (`llmgw list-users`)
+
+### Politique de gestion des modèles
+
+- Maintenir `vram_gb` à jour dans `models.yaml` si vous modifiez `ctx_size` ou `parallel`
+  (la VRAM réelle change avec le KV cache)
+- Désactiver (`enabled: false`) les modèles dont le fichier `.gguf` n'est pas encore
+  téléchargé, plutôt que de les supprimer
+- Surveiller `idle_seconds` dans `/admin/status` pour identifier les modèles rarement
+  utilisés qui pourraient être désactivés pour libérer du budget VRAM
 
 ### Sécurité de l'`ADMIN_SECRET`
 
@@ -528,6 +780,9 @@ echo "Nouveau ADMIN_SECRET : $NEW_SECRET"
 ```bash
 # Sauvegarde manuelle (SQLite WAL — utiliser sqlite3 pour une copie cohérente)
 sqlite3 /var/lib/llm-gateway/gateway.db ".backup '/backup/gateway-$(date +%Y%m%d).db'"
+
+# Sauvegarder aussi le registre des modèles
+cp /etc/llm-gateway/models.yaml "/backup/models-$(date +%Y%m%d).yaml"
 
 # Sauvegarde automatique quotidienne (cron)
 echo "0 3 * * * llmservice sqlite3 /var/lib/llm-gateway/gateway.db \

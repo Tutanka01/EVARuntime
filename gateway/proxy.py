@@ -4,10 +4,11 @@ Proxy OpenAI-compatible vers llama-server.
 Endpoints gérés :
   POST /v1/chat/completions   — streaming SSE + non-streaming
   POST /v1/completions        — legacy completions
-  GET  /v1/models             — liste statique des modèles configurés
+  GET  /v1/models             — liste dynamique depuis le registre
 
 Design :
-- On forward le body JSON tel quel vers llama-server (compatibilité maximale)
+- On extrait le champ "model" du body JSON pour router vers le bon llama-server
+- Si "model" est absent, on utilise le modèle par défaut configuré
 - On injecte l'Authorization interne (clé gateway ↔ llama-server)
 - On log l'usage en fire-and-forget après chaque requête terminée
 - Pour le streaming : on désactive tout buffering nginx/uvicorn via les headers
@@ -31,7 +32,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import database as db
 from config import settings
-from server_manager import ModelState, ServerManager
+from model_manager import ModelManager
+from server_manager import ServerManager
 
 log = logging.getLogger(__name__)
 
@@ -43,8 +45,23 @@ _INTERNAL_HEADERS = {
 }
 
 
-def _llama_url(path: str) -> str:
-    return f"{settings.llama_server_url()}{path}"
+def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
+    """
+    Résout l'ID du modèle à utiliser pour une requête.
+    Priorité : champ "model" du body → default_model_id → premier modèle enabled.
+    """
+    requested = body.get("model", "").strip()
+    if requested:
+        return requested
+
+    if settings.default_model_id:
+        return settings.default_model_id
+
+    first = model_manager.registry.first_enabled_id()
+    if first:
+        return first
+
+    return ""
 
 
 # ── Handler principal ─────────────────────────────────────────────────────────
@@ -53,25 +70,15 @@ async def proxy_request(
     request: Request,
     path: str,
     user: dict,
-    manager: ServerManager,
+    model_manager: ModelManager,
 ) -> StreamingResponse | JSONResponse:
     """
     Point d'entrée générique.
-    - Assure que le modèle est chargé (charge si nécessaire)
-    - Proxy la requête vers llama-server
+    - Lit le body et résout le modèle cible
+    - Assure que le modèle est chargé (charge si nécessaire, évinçe LRU si besoin)
+    - Proxy la requête vers le bon llama-server
     - Log l'usage
     """
-    # ── Chargement du modèle si nécessaire ────────────────────────────────────
-    try:
-        await manager.ensure_loaded()
-    except TimeoutError as exc:
-        return _openai_error(503, str(exc), "server_error")
-    except RuntimeError as exc:
-        return _openai_error(503, str(exc), "server_error")
-    except Exception as exc:
-        log.exception("Erreur inattendue lors du chargement du modèle")
-        return _openai_error(500, "Erreur interne du serveur.", "server_error")
-
     # ── Lire le body ──────────────────────────────────────────────────────────
     try:
         body_bytes = await request.body()
@@ -79,23 +86,47 @@ async def proxy_request(
     except json.JSONDecodeError:
         return _openai_error(400, "Corps JSON invalide.", "invalid_request_error")
 
+    # ── Résoudre le modèle ────────────────────────────────────────────────────
+    model_id = _resolve_model_id(body, model_manager)
+    if not model_id:
+        return _openai_error(
+            400,
+            "Aucun modèle spécifié et aucun modèle activé dans le registre. "
+            "Précisez le champ 'model' dans votre requête.",
+            "invalid_request_error",
+        )
+
+    # ── Charger le modèle ─────────────────────────────────────────────────────
+    try:
+        manager = await model_manager.ensure_model_loaded(model_id)
+    except LookupError as exc:
+        return _openai_error(404, str(exc), "model_not_found")
+    except PermissionError as exc:
+        return _openai_error(403, str(exc), "model_disabled")
+    except TimeoutError as exc:
+        return _openai_error(503, str(exc), "server_error")
+    except RuntimeError as exc:
+        return _openai_error(503, str(exc), "server_error")
+    except Exception:
+        log.exception("Erreur inattendue lors du chargement du modèle '%s'", model_id)
+        return _openai_error(500, "Erreur interne du serveur.", "server_error")
+
     is_streaming = body.get("stream", False)
     request_id = str(uuid.uuid4())
     start_time = time.monotonic()
 
     if is_streaming:
         return StreamingResponse(
-            _stream_proxy(path, body, user, request_id, start_time),
+            _stream_proxy(path, body, user, request_id, start_time, manager),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                # Signale à nginx de ne pas bufferiser cette réponse
                 "X-Accel-Buffering": "no",
             },
         )
     else:
-        return await _non_stream_proxy(path, body, user, request_id, start_time)
+        return await _non_stream_proxy(path, body, user, request_id, start_time, manager)
 
 
 # ── Proxy non-streaming ───────────────────────────────────────────────────────
@@ -106,25 +137,25 @@ async def _non_stream_proxy(
     user: dict,
     request_id: str,
     start_time: float,
+    manager: ServerManager,
 ) -> JSONResponse:
     try:
         async with httpx.AsyncClient(timeout=_INFERENCE_TIMEOUT) as client:
             response = await client.post(
-                _llama_url(path),
+                manager.llama_url(path),
                 json=body,
                 headers=_INTERNAL_HEADERS,
             )
     except httpx.TimeoutException:
         return _openai_error(504, "Timeout : le modèle n'a pas répondu à temps.", "server_error")
     except httpx.RequestError as exc:
-        log.error("Erreur de connexion à llama-server : %s", exc)
+        log.error("Erreur de connexion à llama-server '%s' : %s", manager.model.id, exc)
         return _openai_error(502, "Impossible de joindre le backend d'inférence.", "server_error")
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
     data = response.json()
 
-    # Normaliser le nom du modèle
-    data["model"] = settings.model_public_name
+    data["model"] = manager.model.id
 
     has_any_tool_calls = any(
         choice.get("message", {}).get("tool_calls")
@@ -133,7 +164,6 @@ async def _non_stream_proxy(
     for choice in data.get("choices", []):
         msg = choice.get("message", {})
         msg.pop("reasoning_content", None)
-        # Si le modèle fait un tool_call, supprimer le content textuel superflu
         if has_any_tool_calls and msg.get("content"):
             msg["content"] = None
 
@@ -141,7 +171,7 @@ async def _non_stream_proxy(
     asyncio.create_task(db.log_usage(
         user_id=user["user_id"],
         key_id=user["key_id"],
-        model=body.get("model", settings.model_public_name),
+        model=manager.model.id,
         prompt_tokens=usage.get("prompt_tokens", 0),
         completion_tokens=usage.get("completion_tokens", 0),
         duration_ms=duration_ms,
@@ -160,6 +190,7 @@ async def _stream_proxy(
     user: dict,
     request_id: str,
     start_time: float,
+    manager: ServerManager,
 ) -> AsyncGenerator[bytes, None]:
     """
     Générateur async qui pipe les chunks SSE de llama-server vers le client.
@@ -174,14 +205,13 @@ async def _stream_proxy(
     status_code = 200
     has_tools = bool(body.get("tools"))
 
-    # Demander à llama-server d'inclure l'usage dans le stream
     body_with_usage = {**body, "stream_options": {"include_usage": True}}
 
     try:
         async with httpx.AsyncClient(timeout=_INFERENCE_TIMEOUT) as client:
             async with client.stream(
                 "POST",
-                _llama_url(path),
+                manager.llama_url(path),
                 json=body_with_usage,
                 headers=_INTERNAL_HEADERS,
             ) as response:
@@ -199,7 +229,7 @@ async def _stream_proxy(
                             try:
                                 chunk = json.loads(line[6:])
                                 if "model" in chunk:
-                                    chunk["model"] = settings.model_public_name
+                                    chunk["model"] = manager.model.id
                                 for choice in chunk.get("choices", []):
                                     delta = choice.get("delta", {})
                                     delta.pop("reasoning_content", None)
@@ -212,8 +242,6 @@ async def _stream_proxy(
                             except json.JSONDecodeError:
                                 pass
 
-                    # Si tool_calls détectés → supprimer le texte superflu (non-standard)
-                    # On garde content: null (premier chunk de rôle), on strip le texte réel
                     for chunk in chunks:
                         if has_tool_calls:
                             for choice in chunk.get("choices", []):
@@ -221,7 +249,6 @@ async def _stream_proxy(
                                 if delta.get("content") and not delta.get("tool_calls"):
                                     delta.pop("content", None)
 
-                        # Émettre uniquement les chunks non-vides
                         choices = chunk.get("choices", [])
                         all_empty = all(
                             not choice.get("delta") and choice.get("finish_reason") is None
@@ -243,7 +270,7 @@ async def _stream_proxy(
                             try:
                                 chunk = json.loads(line[6:])
                                 if "model" in chunk:
-                                    chunk["model"] = settings.model_public_name
+                                    chunk["model"] = manager.model.id
                                 for choice in chunk.get("choices", []):
                                     delta = choice.get("delta", {})
                                     reasoning = delta.pop("reasoning_content", None)
@@ -263,7 +290,7 @@ async def _stream_proxy(
         yield err.encode()
         status_code = 504
     except httpx.RequestError as exc:
-        log.error("Erreur stream llama-server : %s", exc)
+        log.error("Erreur stream llama-server '%s' : %s", manager.model.id, exc)
         err = _sse_error("Erreur de connexion au backend d'inférence.")
         yield err.encode()
         status_code = 502
@@ -273,7 +300,7 @@ async def _stream_proxy(
     asyncio.create_task(db.log_usage(
         user_id=user["user_id"],
         key_id=user["key_id"],
-        model=body.get("model", settings.model_public_name),
+        model=manager.model.id,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         duration_ms=duration_ms,
@@ -284,20 +311,23 @@ async def _stream_proxy(
 
 # ── /v1/models ────────────────────────────────────────────────────────────────
 
-def models_response() -> JSONResponse:
+def models_response(model_manager: ModelManager) -> JSONResponse:
     """
-    Retourne une liste statique du modèle configuré.
+    Retourne la liste des modèles activés dans le registre.
     Compatible avec openai.models.list().
     """
+    enabled_models = model_manager.registry.list_enabled()
     return JSONResponse(content={
         "object": "list",
         "data": [
             {
-                "id": settings.model_public_name,
+                "id": model.id,
                 "object": "model",
                 "created": 1704067200,
                 "owned_by": "local-uppa",
+                "description": model.description,
             }
+            for model in enabled_models
         ],
     })
 

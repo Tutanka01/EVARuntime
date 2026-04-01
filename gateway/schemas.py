@@ -6,9 +6,9 @@ on ne les revalide pas pour éviter de casser la compatibilité avec les futurs 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Utilisateurs ──────────────────────────────────────────────────────────────
@@ -51,7 +51,6 @@ class KeyCreate(BaseModel):
     def validate_expiry(cls, v: object) -> str | None:
         if v is None:
             return None
-        # Accepter datetime ou string ISO
         if isinstance(v, datetime):
             return v.isoformat()
         return str(v)
@@ -106,15 +105,82 @@ class UsageSummaryEntry(BaseModel):
     last_request: Optional[str]
 
 
-# ── Statut système ────────────────────────────────────────────────────────────
+# ── Registre des modèles ──────────────────────────────────────────────────────
 
-class GatewayStatus(BaseModel):
-    status: str
-    model_state: str
-    model_name: str
-    model_path: str
+class LlamaParamsSchema(BaseModel):
+    """Paramètres llama-server configurables par modèle."""
+    n_gpu_layers: int = Field(999, ge=0)
+    ctx_size: int = Field(32768, ge=512)
+    parallel: int = Field(4, ge=1)
+    batch_size: int = Field(4096, ge=1)
+    ubatch_size: int = Field(512, ge=1)
+    cache_type_k: Literal["f16", "bf16", "q8_0", "q5_0", "q4_0"] = "q8_0"
+    cache_type_v: Literal["f16", "bf16", "q8_0", "q5_0", "q4_0"] = "q8_0"
+    flash_attn: bool = True
+    threads: int = Field(8, ge=1)
+    threads_http: int = Field(4, ge=1)
+
+    @field_validator("ubatch_size")
+    @classmethod
+    def ubatch_lte_batch(cls, v: int, info) -> int:
+        batch = (info.data or {}).get("batch_size", v)
+        if v > batch:
+            raise ValueError(f"ubatch_size ({v}) doit être ≤ batch_size ({batch})")
+        return v
+
+
+class ModelEntryCreate(BaseModel):
+    """Corps de requête pour POST /admin/models."""
+    id: str = Field(
+        ...,
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,62}$",
+        description="Identifiant unique du modèle (minuscules, chiffres, tirets, points, underscores)",
+    )
+    path: str = Field(..., description="Chemin absolu vers le fichier .gguf sur le serveur")
+    description: str = Field("", max_length=200)
+    vram_gb: float = Field(..., gt=0.0, description="VRAM estimée en GB (poids + KV cache à charge nominale)")
+    enabled: bool = True
+    capabilities: list[str] = Field(default_factory=lambda: ["text_generation"])
+    llama_params: LlamaParamsSchema = Field(default_factory=LlamaParamsSchema)
+
+
+class ModelEntryUpdate(BaseModel):
+    """Corps de requête pour PATCH /admin/models/{model_id}."""
+    enabled: Optional[bool] = None
+    vram_gb: Optional[float] = Field(None, gt=0.0)
+    description: Optional[str] = Field(None, max_length=200)
+
+
+# ── Statut système multi-modèles ──────────────────────────────────────────────
+
+class ModelStatusResponse(BaseModel):
+    """État live d'un modèle (chargé ou non)."""
+    id: str
+    description: str
+    enabled: bool
+    vram_gb: float
+    capabilities: list[str]
+    state: str  # "unloaded" | "loading" | "ready" | "unloading"
+    path: str
     pid: Optional[int]
+    port: Optional[int]
     uptime_seconds: Optional[float]
     idle_seconds: Optional[float]
-    idle_timeout_seconds: int
-    llama_params: dict
+    llama_params: Optional[dict]
+
+
+class VramBudgetResponse(BaseModel):
+    """Budget VRAM global de la gateway."""
+    total_gb: float
+    overhead_gb: float
+    safety_margin: float
+    used_gb: float
+    available_gb: float
+    budget_net_gb: float
+
+
+class GatewayStatus(BaseModel):
+    """Statut complet de la gateway — retourné par GET /admin/status."""
+    status: str
+    vram_budget: VramBudgetResponse
+    models: list[ModelStatusResponse]

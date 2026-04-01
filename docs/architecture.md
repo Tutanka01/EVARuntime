@@ -15,118 +15,241 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 │  Clients inférence            Admin (réseau campus uniquement)          │
 │  ┌──────────┐  ┌──────────┐   ┌──────────────────────────────────┐     │
 │  │ Python   │  │ curl     │   │ Navigateur → /admin/dashboard    │     │
-│  │ openai   │  │ LangChain│   │ curl → /admin/metrics/*          │     │
+│  │ openai   │  │ LangChain│   │ curl → /admin/models/*           │     │
 │  └────┬─────┘  └────┬─────┘   └────────────────┬─────────────────┘     │
 │       └─────────────┘                           │                       │
-│                         │ HTTPS / TLS 1.3       │ HTTPS (campus only)   │
-└─────────────────────────┼─────────────────────────────────────────────┘
-                          │                       │
-┌─────────────────────────┼───────────────────────┼─────────────────────┐
-│  Cluster EVA — hébergé à l'UPPA (GPU L40S)      │                     │
-│                         ▼                       ▼                     │
+│              │ HTTPS / TLS 1.3                  │ HTTPS (campus only)   │
+└──────────────┼──────────────────────────────────┼─────────────────────┘
+               │                                  │
+┌──────────────┼──────────────────────────────────┼─────────────────────┐
+│  Cluster EVA — hébergé à l'UPPA (GPU L40S)       │                     │
+│              ▼                                  ▼                     │
 │  ┌──────────────────────────────────────────────────────────────────┐ │
 │  │  nginx  (TLS termination, rate limiting, IP filtering /admin)    │ │
 │  └──────────────────────────┬─────────────────────────────────────┘ │
 │                              │ HTTP/1.1 (127.0.0.1:8000)             │
 │  ┌───────────────────────────▼──────────────────────────────────────┐ │
-│  │                    FastAPI Gateway                                │ │
+│  │                    FastAPI Gateway (main.py)                      │ │
 │  │                                                                   │ │
 │  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │ │
 │  │  │    auth.py  │  │rate_limiter  │  │     proxy.py             │ │ │
-│  │  │  Bearer SHA │  │sliding window│  │  forward + SSE streaming  │ │ │
-│  │  └─────────────┘  └──────────────┘  └────────────┬─────────────┘ │ │
+│  │  │  Bearer SHA │  │sliding window│  │  routing model_id        │ │ │
+│  │  └─────────────┘  └──────────────┘  │  forward + SSE streaming  │ │ │
+│  │                                      └────────────┬─────────────┘ │ │
 │  │                                                   │               │ │
-│  │  ┌─────────────────────────────┐  ┌──────────────┴─────────────┐ │ │
-│  │  │  metrics.py + dashboard.html│  │   server_manager.py        │ │ │
-│  │  │  /admin/metrics/*  (JSON)   │  │  UNLOADED→LOADING→READY    │ │ │
-│  │  │  /admin/dashboard  (HTML)   │  │  asyncio.Lock + Event      │ │ │
-│  │  └─────────────┬───────────────┘  └──────────────┬─────────────┘ │ │
-│  │                │ (lit usage_log,                  │               │ │
-│  │                │  proxie /metrics)    subprocess  │               │ │
-│  │  ┌─────────────▼───────────────┐  ┌──────────────▼─────────────┐ │ │
-│  │  │  SQLite WAL (database.py)   │  │  llama-server (llama.cpp)  │ │ │
-│  │  │  users | api_keys           │  │  port 8081 — 127.0.0.1     │ │ │
-│  │  │  usage_log                  │  │  --metrics (Prometheus)    │ │ │
-│  │  └─────────────────────────────┘  └──────────────┬─────────────┘ │ │
-│  │                                                   │ CUDA          │ │
-│  │                                   ┌──────────────▼─────────────┐ │ │
-│  │                                   │  NVIDIA L40S 48GB          │ │ │
-│  │                                   │  Chargé : ~40.5GB VRAM     │ │ │
-│  │                                   │  Déchargé : ~0.2GB         │ │ │
-│  │                                   └────────────────────────────┘ │ │
-│  └───────────────────────────────────────────────────────────────────┘ │
+│  │  ┌──────────────────────────────┐  ┌─────────────▼─────────────┐ │ │
+│  │  │  metrics.py + dashboard.html │  │   ModelManager            │ │ │
+│  │  │  /admin/metrics/*  (JSON)    │  │   model_manager.py        │ │ │
+│  │  │  /admin/dashboard  (HTML)    │  │  ┌─────────────────────┐  │ │ │
+│  │  └──────────────┬───────────────┘  │  │ Budget VRAM + LRU   │  │ │ │
+│  │                 │                  │  │ Pool de ports        │  │ │ │
+│  │  ┌──────────────▼───────────────┐  │  └─────────────────────┘  │ │ │
+│  │  │  ModelRegistry               │  │  ServerManager[70B] :8081  │ │ │
+│  │  │  model_registry.py           │◄─┤  ServerManager[8B]  :8082  │ │ │
+│  │  │  models.yaml (source vérité) │  └──────────┬────────────────┘ │ │
+│  │  └──────────────────────────────┘             │ subprocesses      │ │
+│  │                                               │                   │ │
+│  │  ┌───────────────────────────┐  ┌─────────────▼────────────────┐ │ │
+│  │  │  SQLite WAL (database.py) │  │  llama-server (llama.cpp)    │ │ │
+│  │  │  users | api_keys         │  │  :8081 llama-3.3-70b (~42GB) │ │ │
+│  │  │  usage_log                │  │  :8082 llama-3.1-8b (~5.5GB) │ │ │
+│  │  └───────────────────────────┘  │  (pool de ports dynamique)   │ │ │
+│  └──────────────────────────────────└────────────┬─────────────────┘ │ │
+│                                                   │ CUDA              │ │
+│                                   ┌──────────────▼─────────────┐ │ │
+│                                   │  NVIDIA L40S 48GB           │ │ │
+│                                   │  Budget net : ~43.6 GB      │ │ │
+│                                   │  (48 - 2 overhead - 5%)     │ │ │
+│                                   └────────────────────────────┘ │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Flux d'une requête
+## Registre des modèles (models.yaml)
 
-### 1. Requête authentifiée, modèle prêt
+### Source de vérité
+
+Le fichier `models.yaml` est la source de vérité unique pour tous les modèles
+disponibles sur la gateway. Il est lu au démarrage et peut être modifié en
+direct via l'API admin (écriture atomique : temp + rename).
+
+```yaml
+models:
+  - id: "llama-3.3-70b-instruct"    # identifiant OpenAI-compatible
+    path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+    description: "Modèle principal UPPA"
+    vram_gb: 42.0                    # poids + KV cache à charge nominale
+    enabled: true
+    capabilities: [text_generation, tool_calls, streaming]
+    llama_params:                    # paramètres par modèle — remplace l'ancienne config globale
+      n_gpu_layers: 999
+      ctx_size: 32768
+      parallel: 4
+      cache_type_k: "q8_0"
+      ...
+```
+
+### Validation à la charge
+
+`ModelRegistry._load()` applique plusieurs couches de validation avant d'accepter une entrée :
+
+1. `yaml.safe_load()` — jamais `yaml.load()` (protège contre l'injection YAML)
+2. `model_id` validé par regex `^[a-z0-9][a-z0-9._-]*$` (pas de `/`, `..`, espaces)
+3. `path` doit être absolu (`path.is_absolute()`) et pointer vers un `.gguf`
+4. Si `ALLOWED_MODEL_DIRS` est configuré : path doit être sous un répertoire autorisé
+5. `vram_gb > 0` et `ubatch_size ≤ batch_size`
+
+---
+
+## Budget VRAM et éviction LRU
+
+### Calcul du budget
 
 ```
-Client          nginx           FastAPI         llama-server     GPU
-  │               │                │                  │           │
-  │─POST /v1/──→  │                │                  │           │
-  │  chat/comp.   │─forward──────→ │                  │           │
-  │               │                │─check auth       │           │
-  │               │                │  (SHA-256 lookup DB)         │
-  │               │                │─check rate limit │           │
-  │               │                │  (sliding window)            │
-  │               │                │─ensure_loaded()  │           │
-  │               │                │  state==READY ✓  │           │
-  │               │                │─forward POST ──→ │           │
-  │               │                │                  │─infer──→  │
-  │               │                │                  │←──────────│
-  │               │                │←─── response ────│           │
-  │               │                │ (log_usage async)│           │
-  │←──────────────│←─── response ──│                  │           │
+budget_net = total_vram_gb - vram_overhead_gb - (total_vram_gb × vram_safety_margin)
+           = 48.0          - 2.0              - (48.0 × 0.05)
+           = 48.0          - 2.0              - 2.4
+           = 43.6 GB disponibles pour les modèles
 ```
 
-**Latence typique (modèle chargé) :**
-- Auth + rate limit : < 5ms (in-memory)
-- Génération courte (100 tokens) : 2–4s
-- Génération longue (1000 tokens) : 15–30s
+| Couche | GB réservés | Raison |
+|--------|-------------|--------|
+| Driver NVIDIA + contexte CUDA | ~0.2–0.5 GB | Toujours présent |
+| Framework (llama.cpp allocateurs) | ~1.5 GB | Par instance llama-server |
+| Marge de sécurité (5%) | 2.4 GB | Pics imprévus / quantisation incomplète |
 
-### 2. Requête avec chargement du modèle
+### Machine à états d'un modèle
 
 ```
-Client          nginx           FastAPI         llama-server     GPU
-  │               │                │                  │           │
-  │─POST /v1/──→  │─forward──────→ │                  │           │
-  │               │                │─ensure_loaded()  │           │
-  │               │                │  state==UNLOADED │           │
-  │               │                │  → acquire Lock  │           │
-  │               │                │  → spawn process─────────→  │
-  │               │                │  → poll /health  │           │
-  │               │                │  [60-120s]       │─load──→   │
-  │               │                │                  │←──────────│
-  │               │                │  /health → "ok" ✓│           │
-  │               │                │  state → READY   │           │
-  │               │                │  Event.set()     │           │
-  │               │                │─forward POST ──→ │           │
-  │←──────────────│←─── response ──│←─── response ────│           │
+UNLOADED ──► LOADING ──► READY ──► UNLOADING ──► UNLOADED
+               │                        ▲
+               │ (erreur)               │
+               └──── UNLOADED ──────────┘
+```
+
+### Flux de décision avant chargement
+
+```
+ensure_model_loaded("llama-3.1-8b")
+        │
+        ▼
+Modèle dans le registre ? ──non──► LookupError → 404
+        │
+       oui
+        ▼
+Modèle enabled ? ──non──► PermissionError → 403
+        │
+       oui
+        ▼
+Déjà READY ? ──oui──► retourner le manager (fast path, sans lock)
+        │
+       non
+        ▼
+[LOCK acquis]
+available_vram ≥ model.vram_gb ?
+    ──oui──► allouer port, créer ServerManager, lancer
+    ──non──► éviction LRU (modèle READY le plus ancien)
+                    │
+                    ├─ modèle idle trouvé → unload → recommencer
+                    └─ aucun idle disponible → RuntimeError → 503
+```
+
+### Éviction LRU
+
+L'algorithme évinçe uniquement les modèles en état `READY` (pas ceux avec des
+inférences en cours — le `last_request_time` reflète la fin de la dernière
+requête). Le modèle avec le `_last_request_time` le plus ancien est choisi.
+
+**Propriété de sécurité :** une inférence en cours ne peut jamais être
+interrompue par l'éviction. Seuls les modèles idle (aucune requête active)
+sont candidats.
+
+---
+
+## Flux d'une requête multi-modèle
+
+### 1. Requête vers un modèle chargé (fast path)
+
+```
+Client          nginx           FastAPI/proxy       ModelManager      llama-server[70B]
+  │               │                  │                   │                 │
+  │─POST /v1/ ──► │                  │                   │                 │
+  │ model:"70b"   │─forward ────────►│                   │                 │
+  │               │                  │─check auth        │                 │
+  │               │                  │─check rate limit  │                 │
+  │               │                  │─extract model_id  │                 │
+  │               │                  │─ensure_loaded ───►│                 │
+  │               │                  │  state==READY ✓   │                 │
+  │               │                  │◄─ manager ────────│                 │
+  │               │                  │─ POST :8081 ──────────────────────►│
+  │               │                  │◄──────────────────────── response ──│
+  │               │                  │ (log_usage async)                   │
+  │◄──────────────│◄── response ─────│                                     │
+```
+
+### 2. Requête avec chargement + éviction LRU
+
+```
+Client          FastAPI/proxy     ModelManager     ServerManager[8B]    GPU
+  │                  │                 │                  │              │
+  │─POST model:8b──►│                 │                  │              │
+  │                  │─ensure_loaded─►│                  │              │
+  │                  │                │ budget < 5.5 GB  │              │
+  │                  │                │ → évict LRU(70B) │              │
+  │                  │                │   [70B déchargé] │              │
+  │                  │                │ → allouer port   │              │
+  │                  │                │ → créer manager ►│              │
+  │                  │                │                  │─spawn llama-►│
+  │                  │                │                  │─poll /health │
+  │                  │                │                  │  [60-90s]    │
+  │                  │                │                  │◄─ "ok" ──────│
+  │                  │                │◄─ READY ─────────│              │
+  │                  │◄─ manager ─────│                  │              │
+  │                  │─ POST :8082 ───────────────────────────────────►│
+  │◄── response ─────│                │                  │              │
 ```
 
 ### 3. Requêtes concurrentes pendant le chargement
 
 ```
-Client A        Client B        FastAPI
-    │               │              │
-    │─POST ────────────────────→  │
-    │               │              │  state=LOADING, Event créé
-    │               │─POST ──────→ │  state==LOADING → await Event
-    │               │              │  [les deux attendent l'Event]
-    │               │              │
-    │               │              │  ... chargement ...
-    │               │              │
-    │               │              │  Event.set() → les deux repartent
-    │←── response ──│←── response ─│  en parallèle sur le modèle chargé
+Client A        Client B        FastAPI         ModelManager
+    │               │              │                  │
+    │─POST(70b) ────────────────►  │                  │
+    │               │              │─ensure_loaded ──►│  state=LOADING, Event créé
+    │               │─POST(70b)──► │                  │
+    │               │              │─ensure_loaded ──►│  state==LOADING → await Event
+    │               │              │                  │  [les deux attendent]
+    │               │              │                  │  ... chargement ...
+    │               │              │                  │  Event.set()
+    │◄── response ──│◄── response ─│◄─────────────────│  → les deux repartent
 ```
 
-**Invariant :** aucune requête n'est perdue. Le `asyncio.Lock` garantit
-qu'un seul coroutine lance le subprocess. L'`asyncio.Event` débloque tous
-les waiters simultanément dès que le modèle est prêt.
+**Invariant :** aucune requête n'est perdue. Un seul coroutine lance le
+subprocess (`asyncio.Lock`), tous les waiters repartent ensemble
+(`asyncio.Event`).
+
+---
+
+## Pool de ports dynamique
+
+Chaque modèle chargé consomme un port du pool (`base_llama_port` à
+`base_llama_port + max_loaded_models - 1`, défaut : 8081–8085).
+
+```python
+# Allocation à la création du ServerManager
+port = self._port_pool.pop(0)          # 8081
+
+# Libération via callback on_unload
+def _on_model_unloaded(self, model_id):
+    port = self._allocated_ports.pop(model_id)
+    self._port_pool.append(port)        # 8081 retourné au pool
+```
+
+Le callback `on_unload` est appelé par `ServerManager.unload()` après
+déchargement complet — quelle que soit la cause (idle timeout, admin, LRU
+eviction, shutdown). Cette conception garantit qu'aucun port ne fuit.
 
 ---
 
@@ -134,44 +257,38 @@ les waiters simultanément dès que le modèle est prêt.
 
 ### Pourquoi llama-server n'est pas un service systemd séparé
 
-Deux approches étaient possibles :
-
-**Option A — Service systemd séparé (rejeté)**
+**Option A — Service systemd (rejeté)**
 ```
 systemd → llm-gateway.service (FastAPI)
-systemd → llama-server.service (llama.cpp)
+systemd → llama-server.service (llama.cpp)  ← redémarré automatiquement
 ```
 
-Problème : si on utilise `--sleep-idle-seconds` pour décharger le modèle,
-le processus llama-server reste vivant avec un contexte CUDA actif (~600MB).
-Pour libérer 100% la VRAM, il faut tuer le processus. Mais si c'est un service
-systemd indépendant, systemd le redémarre immédiatement.
+Problème : `--sleep-idle-seconds` laisse un contexte CUDA actif (~600 MB).
+Pour libérer 100% la VRAM, il faut tuer le processus. Mais systemd le
+redémarre immédiatement.
 
-**Option B — Subprocess géré par la gateway (adopté)**
+**Option B — Subprocess géré (adopté)**
 ```
 systemd → llm-gateway.service (FastAPI)
-               └── subprocess → llama-server (llama.cpp)
+               └── subprocesses → llama-server[70B] PID A
+               └── subprocesses → llama-server[8B]  PID B
 ```
 
-La gateway peut tuer le subprocess à volonté. Le système d'exploitation
-récupère toute la mémoire allouée par le processus fils, y compris la VRAM GPU.
-
-**Preuve :** `nvidia-smi` après `os.killpg(pgid, SIGTERM)` montre < 500MB utilisés
-(driver NVIDIA uniquement, pas de contexte CUDA).
+La gateway peut tuer et créer des subprocesses à volonté. Le pool de ports
++ le callback `on_unload` garantissent un nettoyage propre.
 
 ### Pourquoi `start_new_session=True`
 
 ```python
 self._process = await asyncio.create_subprocess_exec(
     *cmd,
-    start_new_session=True,  # ← crée un nouveau process group
+    start_new_session=True,  # nouveau process group
 )
+# ...
+os.killpg(pgid, signal.SIGTERM)  # tue llama-server + ses enfants, pas la gateway
 ```
 
-Sans cette option, `os.killpg()` tuerait aussi la gateway elle-même
-(car elle fait partie du même process group). Avec `start_new_session=True`,
-llama-server obtient son propre process group, qu'on peut tuer proprement
-sans affecter la gateway.
+Sans cette option, `os.killpg()` tuerait aussi la gateway elle-même.
 
 ---
 
@@ -180,63 +297,59 @@ sans affecter la gateway.
 ### Séparation des clés
 
 ```
-Utilisateur ──→ clé_utilisateur (llmgw-xxx) ──→ hash SHA-256 en DB
+Utilisateur ──► clé_utilisateur (llmgw-xxx) ──► hash SHA-256 en DB
                                                                 │
-Gateway ──────→ INTERNAL_API_KEY ────────────→ llama-server    │
-                (jamais exposée)              (127.0.0.1 only)  │
+Gateway ──────► INTERNAL_API_KEY ─────────────► llama-server   │
+                (injectée dans chaque                           │
+                 llama-server du pool)         (127.0.0.1 only) │
                                                                 │
-DB stocke uniquement : key_hash, key_prefix (8 chars lisibles) ←┘
+DB stocke uniquement : key_hash, key_prefix (8 chars)  ◄───────┘
                        jamais : raw_key
 ```
 
-**Propriété :** même en accès total à la base de données, un attaquant ne peut
-pas retrouver les clés API des utilisateurs (SHA-256 non-inversible sans bruteforce).
+### Sécurité du registre des modèles
+
+| Vecteur | Protection |
+|---------|-----------|
+| Injection YAML | `yaml.safe_load()` obligatoire — jamais `yaml.load()` |
+| Path traversal | `path.is_absolute()` + regex model_id sans `/` ni `..` |
+| Modèles non autorisés | `ALLOWED_MODEL_DIRS` (liste blanche) si configuré |
+| OOM GPU | Budget VRAM strict avec marge 5% avant chaque chargement |
+| DoS via modèles | `MAX_LOADED_MODELS` = taille du pool de ports |
+| Accès non autorisé | `require_admin` sur tous les endpoints `/admin/models/*` |
+| Injection model_id | Regex `^[a-z0-9][a-z0-9._-]*$` sur tous les model_id |
 
 ### Isolation réseau
 
 ```
-Internet ──→ nginx :443 ──→ FastAPI :8000 (127.0.0.1 only)
-                                    ──→ llama-server :8081 (127.0.0.1 only)
+Internet ──► nginx :443 ──► FastAPI :8000 (127.0.0.1 only)
+                                    ──► llama-server :8081 (127.0.0.1 only)
+                                    ──► llama-server :8082 (127.0.0.1 only)
+                                    ...
 
 /admin/* : allow 10.0.0.0/8 (campus) + deny all
 ```
 
-llama-server écoute uniquement sur `127.0.0.1` — il n'est jamais accessible
-depuis le réseau, même en cas de mauvaise configuration nginx.
-
-### Pas de stockage de secrets
-
-```python
-# Ce qu'on stocke en DB (database.py)
-key_hash   = SHA-256(raw_key)   # non-inversible
-key_prefix = raw_key[:14]       # pour identification humaine uniquement
-
-# Ce qu'on ne stocke jamais
-raw_key    # affiché une seule fois à la création, puis oublié
-```
+Tous les llama-server du pool écoutent uniquement sur `127.0.0.1` —
+ils ne sont jamais accessibles depuis le réseau, même en cas de
+mauvaise configuration nginx.
 
 ---
 
 ## Base de données SQLite WAL
 
-### Pourquoi SQLite et pas PostgreSQL
+### Pourquoi SQLite
 
 Pour une centaine d'utilisateurs avec des accès intermittents, SQLite suffit.
-PostgreSQL apporterait de la complexité sans bénéfice réel.
+Le mode WAL permet des lectures concurrentes pendant les écritures (auth
+pendant le log d'usage).
 
-Le mode WAL (Write-Ahead Log) est activé car :
-- Il permet des lectures concurrentes pendant les écritures (important car
-  on lit pour l'auth pendant qu'on log l'usage)
-- Il est plus performant pour les workloads en lecture-majorité
-- Il évite les corruptions en cas d'arrêt brutal
-
-```python
-# Pragmas appliqués (database.py)
-PRAGMA journal_mode = WAL;       # concurrent reads + single writer
-PRAGMA synchronous  = NORMAL;    # performance sans risque de corruption
-PRAGMA cache_size   = -65536;    # 64MB cache mémoire
-PRAGMA foreign_keys = ON;        # intégrité référentielle
-PRAGMA temp_store   = MEMORY;    # temp tables en RAM
+```sql
+-- Pragmas appliqués (database.py)
+PRAGMA journal_mode = WAL;       -- concurrent reads + single writer
+PRAGMA synchronous  = NORMAL;    -- performance sans risque de corruption
+PRAGMA cache_size   = -65536;    -- 64MB cache mémoire
+PRAGMA foreign_keys = ON;        -- intégrité référentielle
 ```
 
 ### Schéma
@@ -259,160 +372,114 @@ Index : usage_log(user_id, timestamp), usage_log(timestamp),
         api_keys(key_hash), api_keys(user_id)
 ```
 
-### Performances d'auth
-
-Le path critique auth (à chaque requête) :
-1. Hash SHA-256 du token entrant : ~0.1ms
-2. Lookup `api_keys` par `key_hash` (index) : < 1ms
-3. JOIN `users` : < 1ms
-4. Update `last_used` : fire-and-forget (hors du critical path)
-
-Total auth : < 2ms pour 99% des requêtes.
+Le champ `model` dans `usage_log` stocke l'ID du modèle tel que résolu
+par le routing (ex : `"llama-3.3-70b-instruct"`), permettant les rapports
+d'usage par modèle.
 
 ---
 
 ## Rate limiting in-memory
 
-### Pourquoi pas Redis
-
-Redis est sur-dimensionné pour ce cas d'usage. L'état du rate limiter
-est en mémoire dans le processus Python :
-
 ```python
-# rate_limiter.py
+# rate_limiter.py — sliding window log
 _windows: dict[int, deque[float]] = {}
 # user_id → deque de timestamps dans la fenêtre d'1 minute
 ```
 
 **Propriété :** si la gateway redémarre, les compteurs se remettent à zéro.
-C'est acceptable — les limites sont par minute, pas par heure.
-
-### Algorithme sliding window log
-
-Versus le token bucket (plus simple), le sliding window offre une fenêtre
-glissante précise sans les pics en début de fenêtre fixe.
-
-```
-t=0   t=10  t=20  t=30  t=40  t=50  t=60  t=70
- │     │     │     │     │     │     │     │
- R     R     R           R     R     R        ← requêtes (R)
-                                     │
-                    fenêtre de 60s ──┤
-                    [t=10 → t=70]    │
-                    3 requêtes dans  │
-                    la fenêtre       │
-```
+Acceptable — les limites sont par minute.
 
 ---
 
 ## Streaming SSE — flux technique
 
 ```
-Client                nginx               FastAPI             llama-server
-  │                     │                    │                     │
-  │─POST stream:true──→ │                    │                     │
-  │                     │─forward──────────→ │                     │
-  │                     │                    │─POST /v1/chat ────→ │
-  │                     │                    │                     │─generate
-  │                     │                    │←── chunk1 ──────────│
-  │                     │←── chunk1 ─────────│                     │─generate
-  │←── chunk1 ──────────│                    │                     │
-  │                     │                    │←── chunk2 ──────────│
-  │←── chunk2 ──────────│                    │                     │
-  ...                  ...                  ...                   ...
-  │←── data: [DONE] ────│                    │                     │
+Client             nginx               FastAPI             llama-server
+  │                  │                    │                      │
+  │─POST stream:true►│                    │                      │
+  │                  │─forward ──────────►│                      │
+  │                  │                    │─routing model_id     │
+  │                  │                    │─POST :808X ─────────►│
+  │                  │                    │                      │─generate
+  │                  │                    │◄── chunk1 ───────────│
+  │                  │◄── chunk1 ─────────│                      │─generate
+  │◄── chunk1 ────── │                    │                      │
+  ...               ...                  ...                    ...
+  │◄── data: [DONE] ─│                    │                      │
 ```
 
 **Points critiques nginx :**
 ```nginx
-proxy_buffering        off;   # ne pas bufferiser côté nginx
-add_header X-Accel-Buffering no always;  # signal upstream
-chunked_transfer_encoding on;            # HTTP/1.1 chunked
-proxy_read_timeout     600s;  # 10min pour les longues générations
+proxy_buffering        off;
+add_header X-Accel-Buffering no always;
+chunked_transfer_encoding on;
+proxy_read_timeout     600s;
 ```
-
-Sans `proxy_buffering off`, nginx accumule tous les chunks et envoie
-la réponse complète en une fois — le streaming est annulé.
 
 ---
 
 ## Paramètres llama-server — justification
 
+Les paramètres sont maintenant **par modèle** (dans `models.yaml`),
+non plus globaux. Les valeurs ci-dessous correspondent au modèle 70B par défaut.
+
 ### `-ngl 999` (GPU layers)
 
-999 est un sentinel signifiant "offloader toutes les couches disponibles".
-llama-server le plafonne automatiquement au nombre réel de couches du modèle.
-On ne met pas le nombre exact de couches (ex: 80 pour 70B) car il est
-différent selon les architectures.
+Sentinel signifiant "tout en GPU". Plafonné automatiquement au nombre
+réel de couches du modèle par llama.cpp.
 
-### `-c 32768 --parallel 4` (contexte et parallélisme)
+### `-c 32768 --parallel 4` (contexte et parallélisme pour 70B)
 
 ```
 ctx_size = tokens_per_slot × n_parallel
 32768    = 8192             × 4
 
-VRAM KV cache (Q8) ≈ 2 × layers × heads × head_dim × ctx_size × sizeof(q8)
-                   ≈ 2 × 80 × 8 × 128 × 32768 × 1 octet
+VRAM KV cache (Q8) ≈ 2 × 80 couches × 8 têtes × 128 dim × 32768 × 1 octet
                    ≈ ~2.7 GB
 ```
 
-4 slots parallèles = 4 utilisateurs peuvent générer simultanément.
-Au-delà, les requêtes supplémentaires attendent qu'un slot se libère
-(géré nativement par llama-server avec continuous batching).
+Pour le modèle 8B, on peut passer à `parallel: 8` car le budget VRAM
+restant est bien plus large.
 
 ### `-ctk q8_0 -ctv q8_0` (KV cache quantization)
 
-Le KV cache en FP16 (défaut) utiliserait ~5GB pour ce contexte.
-En Q8_0, il tombe à ~2.7GB avec une dégradation de perplexité de +0.003
-(imperceptible). C'est le meilleur compromis qualité/VRAM.
+KV cache FP16 (défaut) → ~5 GB pour ce contexte.
+En Q8_0 → ~2.7 GB. Dégradation perplexité : +0.003 (imperceptible).
 
 ### `-fa on` (Flash Attention)
 
-Flash Attention 2 est supporté sur Ada Lovelace (compute capability 8.9).
-Il réduit la mémoire d'attention de O(n²) à O(n) et améliore le débit
-de préfill de ~15%. Activé inconditionnellement.
+Supporté sur Ada Lovelace (compute capability 8.9). Réduit la mémoire
+d'attention de O(n²) à O(n), améliore le débit prefill de ~15%.
 
 ### `--cont-batching` (continuous batching)
 
-Sans continuous batching, les slots d'inférence ne commencent un nouveau
-token que quand **tous** les slots ont terminé leur génération en cours.
-Avec continuous batching, chaque slot avance indépendamment : le GPU
-est utilisé de façon optimale même avec des requêtes de longueurs variables.
+Permet à chaque slot d'avancer indépendamment — GPU utilisé de façon
+optimale même avec des requêtes de longueurs variables.
 
 ---
 
 ## Couche monitoring (dashboard)
 
-### Composants
-
-| Fichier | Rôle |
-|---------|------|
-| `metrics.py` | Router FastAPI sous `/admin/metrics/` — agrège les données et les expose en JSON |
-| `static/dashboard.html` | SPA auto-contenue (Chart.js CDN + vanilla JS) servie par `GET /admin/dashboard` |
-
-### Flux de données du dashboard
+### Flux de données — multi-modèles
 
 ```
 Navigateur admin
   │
-  ├─ GET /admin/dashboard ──→ HTMLResponse(dashboard.html)   [synchronous file read]
+  ├─ GET /admin/dashboard ──► HTMLResponse(dashboard.html)
   │
   └─ GET /admin/metrics/overview
-     GET /admin/metrics/timeseries?period=24h
-     GET /admin/metrics/users?period=30d
-     GET /admin/metrics/status-codes
-     GET /admin/metrics/llama
+     GET /admin/metrics/llama         ← interroge TOUS les modèles READY
             │
-            ├─ usage_log / users (aiosqlite, index idx_usage_timestamp)
+            ├─ usage_log / users (SQLite)
             │
-            └─ llama-server :8081/metrics (Prometheus text → parsing Python → JSON)
-                 ↑ retourne {} si état ≠ READY (pas d'erreur pour le dashboard)
+            └─ pour chaque ServerManager READY :
+                 GET http://127.0.0.1:{port}/metrics
+                 → résultat indexé par model_id
 ```
 
 ### Calcul des percentiles de latence
 
-SQLite ne supporte pas `PERCENTILE_CONT`. Les percentiles (P50/P95/P99) sont
-calculés en Python depuis des échantillons bruts :
+SQLite ne supporte pas `PERCENTILE_CONT`. Calcul en Python :
 
 ```python
 samples = await db.get_latency_samples(period_hours=168, limit=10_000)
@@ -420,24 +487,12 @@ samples.sort()
 p95 = samples[int(0.95 * len(samples))]
 ```
 
-À l'échelle universitaire (milliers à dizaines de milliers de requêtes), ce calcul
-reste sous 10ms. Si le volume venait à dépasser ~100k requêtes par semaine, envisager
-une pré-agrégation horaire dans un job cron.
-
 ### Sécurité du dashboard
 
-Le dashboard ne stocke **aucune donnée sensible** :
 - Pas de contenu de prompt ou de réponse
 - Pas de clé API (ni hash ni préfixe)
-- Pas d'adresse IP des utilisateurs
-
-Le token admin est stocké dans `sessionStorage` (effacé à la fermeture de l'onglet,
-jamais dans `localStorage`, jamais envoyé à un tiers).
-
-La route `GET /admin/dashboard` ne requiert pas de bearer token — la protection réseau
-nginx (campus IP only) est suffisante pour servir le fichier HTML. En revanche, tous
-les endpoints `/admin/metrics/*` exigent le bearer token, de sorte qu'un accès direct
-à l'URL de la page sans connaissance du secret n'affiche aucune donnée.
+- Token admin dans `sessionStorage` (jamais `localStorage`)
+- La page HTML est servie sans auth — les données JSON exigent le bearer token
 
 ---
 
@@ -446,38 +501,33 @@ les endpoints `/admin/metrics/*` exigent le bearer token, de sorte qu'un accès 
 ### Rotation de l'ADMIN_SECRET
 
 ```bash
-# Sur le serveur
 NEW_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
 sudo sed -i "s/^ADMIN_SECRET=.*/ADMIN_SECRET=$NEW_SECRET/" /etc/llm-gateway/env
 sudo systemctl restart llm-gateway
-echo "Nouveau secret : $NEW_SECRET"
-# Mettre à jour tout script d'automatisation utilisant l'ancien secret
 ```
 
 ### Révocation d'urgence de tous les accès
 
 ```bash
-# Désactiver tous les utilisateurs sauf l'admin
-sqlite3 /var/lib/llm-gateway/gateway.db \
-  "UPDATE users SET is_active = 0;"
-
-# Ou révoquer toutes les clés
 sqlite3 /var/lib/llm-gateway/gateway.db \
   "UPDATE api_keys SET is_active = 0;"
-
 # Effet immédiat — aucun redémarrage nécessaire
 ```
 
 ### Audit des accès suspects
 
 ```bash
-# Utilisateurs avec le plus grand volume de tokens ce mois
+# Consommation par modèle ce mois
 sqlite3 /var/lib/llm-gateway/gateway.db "
-SELECT u.username, COUNT(*) as reqs, SUM(l.total_tokens) as tokens
+SELECT model, COUNT(*) as reqs, SUM(total_tokens) as tokens
+FROM usage_log
+WHERE timestamp >= date('now', 'start of month')
+GROUP BY model ORDER BY tokens DESC;"
+
+# Top 10 utilisateurs par tokens
+sqlite3 /var/lib/llm-gateway/gateway.db "
+SELECT u.username, l.model, COUNT(*) as reqs, SUM(l.total_tokens) as tokens
 FROM usage_log l JOIN users u ON u.id = l.user_id
 WHERE l.timestamp >= date('now', 'start of month')
-GROUP BY u.id ORDER BY tokens DESC LIMIT 10;"
-
-# Requêtes depuis une IP spécifique (dans les logs nginx)
-sudo grep "1.2.3.4" /var/log/nginx/access.log | tail -50
+GROUP BY u.id, l.model ORDER BY tokens DESC LIMIT 10;"
 ```

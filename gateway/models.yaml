@@ -1,0 +1,68 @@
+# Registre des modèles — EVA Inference Gateway (UPPA)
+#
+# Ce fichier est la source de vérité pour les modèles disponibles.
+# Il est lu au démarrage de la gateway et peut être modifié via l'API admin.
+# Les modifications via l'API sont persistées automatiquement.
+#
+# Champs obligatoires :
+#   id       : identifiant unique (minuscules, chiffres, tirets, points, underscores)
+#   path     : chemin absolu vers le fichier .gguf
+#   vram_gb  : estimation de la VRAM consommée (poids + KV cache à charge nominale)
+#
+# Champs optionnels :
+#   description : texte libre
+#   enabled     : true/false (défaut: true)
+#   capabilities: liste parmi [text_generation, tool_calls, streaming, vision, embedding]
+#   llama_params: paramètres llama-server (surcharge les défauts)
+#
+# IMPORTANT — estimation vram_gb :
+#   Inclure : poids du modèle + KV cache à concurrence nominale (parallel × ctx_size)
+#   Llama 70B Q4_K_M, 4 slots × 32K ctx, KV q8_0 → ~42 GB
+#   Llama 8B  Q4_K_M, 8 slots × 32K ctx, KV q8_0 → ~5.5 GB
+#
+# Budget VRAM L40S 48 GB :
+#   Overhead CUDA/framework : ~2.0 GB
+#   Marge de sécurité 5%   : ~2.4 GB
+#   Budget net disponible   : ~43.6 GB
+
+models:
+  - id: "llama-3.3-70b-instruct"
+    path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+    description: "Llama 3.3 70B Instruct, quantisé Q4_K_M — modèle principal UPPA (L40S 48 GB)"
+    vram_gb: 42.0
+    enabled: true
+    capabilities:
+      - text_generation
+      - tool_calls
+      - streaming
+    llama_params:
+      n_gpu_layers: 999       # 999 = tout en GPU (plafonné automatiquement)
+      ctx_size: 32768          # 4 slots × 8K effective = ~40.5 GB VRAM total
+      parallel: 4              # slots d'inférence concurrents
+      batch_size: 4096
+      ubatch_size: 512
+      cache_type_k: "q8_0"    # -50% VRAM KV, qualité quasi-identique à f16
+      cache_type_v: "q8_0"
+      flash_attn: true         # Ada Lovelace (compute cap 8.9) — supporté
+      threads: 8
+      threads_http: 4
+
+  - id: "llama-3.1-8b-instruct"
+    path: "/models/Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+    description: "Llama 3.1 8B Instruct, quantisé Q4_K_M — modèle léger / test"
+    vram_gb: 5.5
+    enabled: false             # Activer quand le fichier .gguf est disponible sur /models/
+    capabilities:
+      - text_generation
+      - streaming
+    llama_params:
+      n_gpu_layers: 999
+      ctx_size: 32768
+      parallel: 8              # Plus de slots car modèle léger
+      batch_size: 2048
+      ubatch_size: 512
+      cache_type_k: "q8_0"
+      cache_type_v: "q8_0"
+      flash_attn: true
+      threads: 4
+      threads_http: 2

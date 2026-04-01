@@ -22,7 +22,8 @@ from fastapi import APIRouter, Depends, Query
 import database as db
 from auth import require_admin
 from config import settings
-from server_manager import server_manager
+from model_manager import model_manager
+from server_manager import ModelState
 
 log = logging.getLogger(__name__)
 
@@ -94,15 +95,12 @@ async def metrics_overview(
     p95 = _percentile(latency_samples, 0.95)
     p99 = _percentile(latency_samples, 0.99)
 
-    # Statut du modèle
-    model_status = server_manager.status()
-
     return {
         **overview,
         "latency_p50_ms": p50,
         "latency_p95_ms": p95,
         "latency_p99_ms": p99,
-        "model": model_status,
+        "models": model_manager.status(),
     }
 
 
@@ -163,9 +161,10 @@ async def metrics_llama(
 ) -> dict:
     """
     Métriques temps réel de llama-server (format Prometheus → JSON).
-    Retourne {} si le serveur est déchargé ou inaccessible.
+    Interroge tous les modèles actuellement chargés (état READY).
+    Retourne {} si aucun modèle n'est chargé ou en cas d'erreur.
 
-    Métriques clés exposées :
+    Métriques clés exposées par modèle :
       llamacpp:kv_cache_usage_ratio   — occupation du cache KV (0–1)
       llamacpp:requests_processing    — requêtes en cours d'inférence
       llamacpp:requests_deferred      — requêtes en attente de slot
@@ -173,34 +172,44 @@ async def metrics_llama(
       llamacpp:prompt_tokens_total    — tokens prompt traités depuis démarrage
       llamacpp:tokens_predicted_total — tokens générés depuis démarrage
     """
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(
-                f"{settings.llama_server_url()}/metrics",
-                headers=_INTERNAL_HEADERS,
-            )
-        if resp.status_code != 200:
-            return {}
+    result: dict = {}
 
-        raw = _parse_prometheus(resp.text)
+    ready_managers = [
+        (mid, mgr)
+        for mid, mgr in model_manager._managers.items()
+        if mgr.state == ModelState.READY
+    ]
 
-        # Extraire les métriques pertinentes avec des noms propres
-        def _get(key: str) -> float | None:
-            return raw.get(key)
-
-        return {
-            "kv_cache_usage_ratio": _get("llamacpp:kv_cache_usage_ratio"),
-            "kv_cache_tokens": _get("llamacpp:kv_cache_tokens"),
-            "requests_processing": _get("llamacpp:requests_processing"),
-            "requests_deferred": _get("llamacpp:requests_deferred"),
-            "tokens_per_second": _get("llamacpp:tokens_per_second"),
-            "prompt_tokens_total": _get("llamacpp:prompt_tokens_total"),
-            "tokens_predicted_total": _get("llamacpp:tokens_predicted_total"),
-        }
-
-    except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
-        # Modèle non chargé ou llama-server inaccessible — cas normal
+    if not ready_managers:
         return {}
-    except Exception:
-        log.exception("Erreur inattendue lors de la récupération des métriques llama")
-        return {}
+
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        for model_id, mgr in ready_managers:
+            try:
+                resp = await client.get(
+                    mgr.llama_url("/metrics"),
+                    headers=_INTERNAL_HEADERS,
+                )
+                if resp.status_code != 200:
+                    continue
+
+                raw = _parse_prometheus(resp.text)
+
+                def _get(key: str) -> float | None:
+                    return raw.get(key)
+
+                result[model_id] = {
+                    "kv_cache_usage_ratio": _get("llamacpp:kv_cache_usage_ratio"),
+                    "kv_cache_tokens": _get("llamacpp:kv_cache_tokens"),
+                    "requests_processing": _get("llamacpp:requests_processing"),
+                    "requests_deferred": _get("llamacpp:requests_deferred"),
+                    "tokens_per_second": _get("llamacpp:tokens_per_second"),
+                    "prompt_tokens_total": _get("llamacpp:prompt_tokens_total"),
+                    "tokens_predicted_total": _get("llamacpp:tokens_predicted_total"),
+                }
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+                pass
+            except Exception:
+                log.exception("Erreur métriques llama pour '%s'", model_id)
+
+    return result

@@ -24,9 +24,9 @@ from admin import router as admin_router
 from auth import get_current_user
 from config import settings
 from metrics import router as metrics_router
+from model_manager import model_manager
 from proxy import models_response, proxy_request
 from rate_limiter import check_rate_limit
-from server_manager import server_manager
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -65,19 +65,45 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Initialisation au démarrage, nettoyage à l'arrêt."""
     log.info("=== LLM Gateway UPPA démarrage ===")
-    log.info("Modèle configuré : %s", settings.model_public_name)
-    log.info("Chemin           : %s", settings.model_path)
-    log.info("Idle timeout     : %ds", settings.idle_timeout_seconds)
 
-    # Initialiser la base de données (crée les tables si elles n'existent pas)
+    # Afficher le registre des modèles et le budget VRAM
+    registry = model_manager.registry
+    all_models = registry.list_all()
+    enabled_models = registry.list_enabled()
+    log.info(
+        "Registre : %d modèle(s) total, %d activé(s) — config : %s",
+        len(all_models), len(enabled_models), settings.models_config_path,
+    )
+    for model in all_models:
+        status = "ACTIVÉ " if model.enabled else "désactivé"
+        log.info(
+            "  [%s] %s — %.1f GB VRAM — %s",
+            status, model.id, model.vram_gb, model.path,
+        )
+
+    budget = settings.effective_vram_budget_gb()
+    log.info(
+        "Budget VRAM : %.1f GB total — %.1f GB overhead — %.0f%% marge → %.1f GB net disponible",
+        settings.total_vram_gb,
+        settings.vram_overhead_gb,
+        settings.vram_safety_margin * 100,
+        budget,
+    )
+    log.info(
+        "Pool de ports : %d-%d (%d modèles max simultanés)",
+        settings.base_llama_port,
+        settings.base_llama_port + settings.max_loaded_models - 1,
+        settings.max_loaded_models,
+    )
+    log.info("Idle timeout  : %ds", settings.idle_timeout_seconds)
+
     await db.init_db()
     log.info("Base de données initialisée : %s", settings.db_path)
 
     yield
 
-    # Arrêt propre : décharger le modèle et libérer le GPU
-    log.info("Arrêt de la gateway — déchargement du modèle…")
-    await server_manager.unload(reason="shutdown")
+    log.info("Arrêt de la gateway — déchargement de tous les modèles…")
+    await model_manager.shutdown()
     log.info("=== LLM Gateway UPPA arrêt propre ===")
 
 
@@ -87,17 +113,16 @@ app = FastAPI(
     title="LLM Inference Gateway UPPA",
     description=(
         "Inference gateway souverain du cluster EVA (hébergé à l'UPPA). "
-        "Compatible API OpenAI. Accès réservé aux membres authentifiés."
+        "Compatible API OpenAI. Multi-modèles avec gestion VRAM automatique. "
+        "Accès réservé aux membres authentifiés."
     ),
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
-    # Désactiver la doc Swagger publique en production
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
 )
 
-# CORS — restreindre aux domaines UPPA en production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Remplacer par ["https://your-domain.univ-pau.fr"] en production
@@ -106,7 +131,6 @@ app.add_middleware(
     max_age=600,
 )
 
-# Routes admin + métriques dashboard
 app.include_router(admin_router)
 app.include_router(metrics_router)
 
@@ -119,7 +143,6 @@ async def log_requests(request: Request, call_next):
     response = await call_next(request)
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    # Ne pas loguer les health checks ni les polls dashboard pour ne pas polluer les logs
     _silent = ("/health", "/v1/models")
     if not request.url.path.startswith("/admin/metrics") and request.url.path not in _silent:
         log.info(
@@ -144,16 +167,20 @@ async def dashboard_ui():
 @app.get("/health", include_in_schema=False)
 async def health():
     """Health check utilisé par nginx et le monitoring."""
+    status = model_manager.status()
+    loaded = [m["id"] for m in status["models"] if m["state"] == "ready"]
     return {
         "status": "ok",
-        "model_state": server_manager.state.value,
+        "models_loaded": loaded,
+        "vram_used_gb": status["vram_budget"]["used_gb"],
+        "vram_available_gb": status["vram_budget"]["available_gb"],
     }
 
 
 @app.get("/v1/models")
 async def list_models(user: dict = Depends(get_current_user)):
     """Liste les modèles disponibles — compatible openai.models.list()."""
-    return models_response()
+    return models_response(model_manager)
 
 
 # ── Routes d'inférence (protégées + rate limitées) ────────────────────────────
@@ -166,9 +193,10 @@ async def chat_completions(
     """
     Chat completions — compatible OpenAI.
     Supporte le streaming SSE (stream: true) et le mode classique.
-    Le modèle est chargé automatiquement si nécessaire.
+    Le modèle est sélectionné via le champ "model" du body JSON.
+    Chargé automatiquement si nécessaire, avec éviction LRU si besoin de VRAM.
     """
-    return await proxy_request(request, "/v1/chat/completions", user, server_manager)
+    return await proxy_request(request, "/v1/chat/completions", user, model_manager)
 
 
 @app.post("/v1/completions")
@@ -177,7 +205,7 @@ async def completions(
     user: dict = Depends(check_rate_limit),
 ):
     """Legacy text completions — compatible OpenAI."""
-    return await proxy_request(request, "/v1/completions", user, server_manager)
+    return await proxy_request(request, "/v1/completions", user, model_manager)
 
 
 # ── Gestionnaire d'erreurs global ────────────────────────────────────────────

@@ -1,0 +1,382 @@
+"""
+Registre des modèles — chargé depuis un fichier YAML (models.yaml).
+
+Principes de sécurité :
+- yaml.safe_load() obligatoire (pas yaml.load — prévient l'injection YAML)
+- model_id validé par regex stricte (pas de /, .., caractères spéciaux)
+- path doit être absolu et avec extension .gguf
+- Si allowed_model_dirs configuré : path doit être sous un répertoire autorisé
+- Écriture atomique du YAML (tmp + rename) pour éviter la corruption
+
+Structure du fichier YAML :
+  models:
+    - id: "llama-3.3-70b-instruct"
+      path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+      description: "..."
+      vram_gb: 42.0
+      enabled: true
+      capabilities: [text_generation, tool_calls, streaming]
+      llama_params:
+        n_gpu_layers: 999
+        ctx_size: 32768
+        ...
+"""
+from __future__ import annotations
+
+import re
+import tempfile
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
+
+import yaml
+
+log = logging.getLogger(__name__)
+
+# Regex stricte pour les model_id : minuscules, chiffres, tirets, points, underscores
+_MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+
+# Types valides pour la quantisation du KV cache
+_CACHE_TYPES = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
+
+
+@dataclass
+class LlamaParams:
+    """Paramètres de lancement llama-server, configurables par modèle."""
+    n_gpu_layers: int = 999
+    ctx_size: int = 32768
+    parallel: int = 4
+    batch_size: int = 4096
+    ubatch_size: int = 512
+    cache_type_k: str = "q8_0"
+    cache_type_v: str = "q8_0"
+    flash_attn: bool = True
+    threads: int = 8
+    threads_http: int = 4
+
+    def __post_init__(self) -> None:
+        if self.ubatch_size > self.batch_size:
+            raise ValueError(
+                f"ubatch_size ({self.ubatch_size}) doit être ≤ batch_size ({self.batch_size})"
+            )
+        if self.cache_type_k not in _CACHE_TYPES:
+            raise ValueError(f"cache_type_k invalide : {self.cache_type_k!r}. Valeurs : {_CACHE_TYPES}")
+        if self.cache_type_v not in _CACHE_TYPES:
+            raise ValueError(f"cache_type_v invalide : {self.cache_type_v!r}. Valeurs : {_CACHE_TYPES}")
+        if self.n_gpu_layers < 0:
+            raise ValueError(f"n_gpu_layers doit être ≥ 0, reçu : {self.n_gpu_layers}")
+        if self.ctx_size < 512:
+            raise ValueError(f"ctx_size doit être ≥ 512, reçu : {self.ctx_size}")
+        if self.parallel < 1:
+            raise ValueError(f"parallel doit être ≥ 1, reçu : {self.parallel}")
+
+
+@dataclass
+class ModelDefinition:
+    """
+    Définition complète d'un modèle enregistré dans le registre.
+    Immuable après création — toute modification passe par ModelRegistry.
+    """
+    id: str
+    path: Path
+    description: str
+    vram_gb: float
+    enabled: bool
+    capabilities: list[str]
+    llama_params: LlamaParams
+
+    def build_llama_cmd(
+        self,
+        binary: Path,
+        host: str,
+        port: int,
+        internal_api_key: str,
+        log_path: Path,
+    ) -> list[str]:
+        """Construit la liste d'arguments pour lancer llama-server."""
+        p = self.llama_params
+        cmd = [
+            str(binary),
+            "--model", str(self.path),
+            "--host", host,
+            "--port", str(port),
+            "-ngl", str(p.n_gpu_layers),
+            "-c", str(p.ctx_size),
+            "--parallel", str(p.parallel),
+            "-b", str(p.batch_size),
+            "-ub", str(p.ubatch_size),
+            "-ctk", p.cache_type_k,
+            "-ctv", p.cache_type_v,
+            "-t", str(p.threads),
+            "--threads-http", str(p.threads_http),
+            "--cont-batching",
+            "--cache-prompt",
+            "--metrics",
+            "--api-key", internal_api_key,
+            "--log-file", str(log_path),
+        ]
+        if p.flash_attn:
+            cmd += ["-fa", "on"]
+        return cmd
+
+    def to_dict(self) -> dict:
+        """Sérialise vers le format YAML."""
+        p = self.llama_params
+        return {
+            "id": self.id,
+            "path": str(self.path),
+            "description": self.description,
+            "vram_gb": self.vram_gb,
+            "enabled": self.enabled,
+            "capabilities": list(self.capabilities),
+            "llama_params": {
+                "n_gpu_layers": p.n_gpu_layers,
+                "ctx_size": p.ctx_size,
+                "parallel": p.parallel,
+                "batch_size": p.batch_size,
+                "ubatch_size": p.ubatch_size,
+                "cache_type_k": p.cache_type_k,
+                "cache_type_v": p.cache_type_v,
+                "flash_attn": p.flash_attn,
+                "threads": p.threads,
+                "threads_http": p.threads_http,
+            },
+        }
+
+
+class ModelRegistry:
+    """
+    Registre des modèles disponibles sur la gateway.
+
+    - Source de vérité : fichier YAML (models.yaml)
+    - Chargé au démarrage, modifiable via l'API admin
+    - Toute écriture est atomique (write tmp → rename)
+    """
+
+    def __init__(self, config_path: Path, allowed_model_dirs: list[str] | None = None) -> None:
+        self._path = config_path
+        self._allowed_dirs: list[Path] = [Path(d) for d in (allowed_model_dirs or [])]
+        self._models: dict[str, ModelDefinition] = {}
+        self._load()
+
+    # ── Chargement ────────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"Fichier de registre des modèles introuvable : {self._path}\n"
+                f"Créez ce fichier ou définissez MODELS_CONFIG_PATH dans .env"
+            )
+
+        with self._path.open(encoding="utf-8") as f:
+            data = yaml.safe_load(f)  # safe_load — jamais yaml.load()
+
+        if not isinstance(data, dict) or "models" not in data:
+            raise ValueError(f"Format invalide dans {self._path} : clé 'models' manquante")
+
+        models: dict[str, ModelDefinition] = {}
+        for entry in data["models"]:
+            model = self._parse_entry(entry)
+            if model.id in models:
+                raise ValueError(f"ID de modèle dupliqué dans {self._path} : '{model.id}'")
+            models[model.id] = model
+
+        self._models = models
+        enabled_count = sum(1 for m in models.values() if m.enabled)
+        log.info(
+            "Registre chargé depuis %s — %d modèle(s), %d activé(s)",
+            self._path, len(models), enabled_count,
+        )
+
+    def _parse_entry(self, entry: dict) -> ModelDefinition:
+        """Parse et valide une entrée du YAML. Lève ValueError si invalide."""
+        model_id = str(entry.get("id", ""))
+        self._validate_model_id(model_id)
+
+        raw_path = str(entry.get("path", ""))
+        path = self._validate_model_path(raw_path)
+
+        vram_gb = float(entry.get("vram_gb", 0))
+        if vram_gb <= 0:
+            raise ValueError(f"[{model_id}] vram_gb doit être > 0, reçu : {vram_gb}")
+
+        llama_raw = entry.get("llama_params", {})
+        llama_params = LlamaParams(**llama_raw)
+
+        return ModelDefinition(
+            id=model_id,
+            path=path,
+            description=str(entry.get("description", "")),
+            vram_gb=vram_gb,
+            enabled=bool(entry.get("enabled", True)),
+            capabilities=list(entry.get("capabilities", ["text_generation"])),
+            llama_params=llama_params,
+        )
+
+    def _validate_model_id(self, model_id: str) -> None:
+        if not model_id:
+            raise ValueError("L'ID de modèle ne peut pas être vide")
+        if not _MODEL_ID_RE.match(model_id):
+            raise ValueError(
+                f"ID de modèle invalide : {model_id!r}. "
+                f"Autorisé : lettres minuscules, chiffres, tirets, points, underscores. "
+                f"Doit commencer par une lettre ou un chiffre. Max 63 caractères."
+            )
+
+    def _validate_model_path(self, raw_path: str) -> Path:
+        if not raw_path:
+            raise ValueError("Le chemin du modèle ne peut pas être vide")
+
+        path = Path(raw_path)
+
+        if not path.is_absolute():
+            raise ValueError(
+                f"Le chemin du modèle doit être absolu : {raw_path!r}"
+            )
+        if path.suffix.lower() != ".gguf":
+            raise ValueError(
+                f"Le chemin du modèle doit pointer vers un fichier .gguf : {raw_path!r}"
+            )
+
+        # Vérification des répertoires autorisés (si configuré)
+        if self._allowed_dirs:
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if not any(
+                resolved == allowed or resolved.is_relative_to(allowed)
+                for allowed in self._allowed_dirs
+            ):
+                allowed_str = ", ".join(str(d) for d in self._allowed_dirs)
+                raise ValueError(
+                    f"Chemin refusé : {raw_path!r} n'est pas sous un répertoire autorisé. "
+                    f"Répertoires autorisés : {allowed_str}"
+                )
+
+        return path
+
+    # ── Lecture ────────────────────────────────────────────────────────────────
+
+    def get(self, model_id: str) -> ModelDefinition | None:
+        """Retourne un modèle par son ID, ou None s'il n'existe pas."""
+        return self._models.get(model_id)
+
+    def list_all(self) -> list[ModelDefinition]:
+        """Liste tous les modèles enregistrés (activés et désactivés)."""
+        return list(self._models.values())
+
+    def list_enabled(self) -> list[ModelDefinition]:
+        """Liste uniquement les modèles activés."""
+        return [m for m in self._models.values() if m.enabled]
+
+    def first_enabled_id(self) -> str | None:
+        """Retourne l'ID du premier modèle activé (pour le modèle par défaut)."""
+        for model in self._models.values():
+            if model.enabled:
+                return model.id
+        return None
+
+    # ── Écriture (API admin) ──────────────────────────────────────────────────
+
+    def add(self, entry: dict) -> ModelDefinition:
+        """
+        Ajoute un modèle au registre et persiste le YAML.
+        Lève ValueError si l'ID existe déjà ou si les données sont invalides.
+        """
+        model = self._parse_entry(entry)
+        if model.id in self._models:
+            raise ValueError(f"Un modèle avec l'ID '{model.id}' existe déjà dans le registre.")
+        self._models[model.id] = model
+        self._save()
+        log.info("Modèle enregistré : '%s' (vram=%.1f GB, enabled=%s)", model.id, model.vram_gb, model.enabled)
+        return model
+
+    def set_enabled(self, model_id: str, enabled: bool) -> ModelDefinition:
+        """Active ou désactive un modèle dans le registre."""
+        model = self._models.get(model_id)
+        if not model:
+            raise KeyError(f"Modèle inconnu : '{model_id}'")
+        # Recréer avec le nouveau flag enabled
+        updated = ModelDefinition(
+            id=model.id,
+            path=model.path,
+            description=model.description,
+            vram_gb=model.vram_gb,
+            enabled=enabled,
+            capabilities=model.capabilities,
+            llama_params=model.llama_params,
+        )
+        self._models[model_id] = updated
+        self._save()
+        log.info("Modèle '%s' : enabled → %s", model_id, enabled)
+        return updated
+
+    def update(self, model_id: str, **kwargs) -> ModelDefinition:
+        """
+        Met à jour les champs d'un modèle (vram_gb, description, enabled).
+        Ne modifie pas l'ID ni le path (pour ça, supprimer et re-créer).
+        """
+        model = self._models.get(model_id)
+        if not model:
+            raise KeyError(f"Modèle inconnu : '{model_id}'")
+
+        updated = ModelDefinition(
+            id=model.id,
+            path=model.path,
+            description=kwargs.get("description", model.description),
+            vram_gb=kwargs.get("vram_gb", model.vram_gb),
+            enabled=kwargs.get("enabled", model.enabled),
+            capabilities=model.capabilities,
+            llama_params=model.llama_params,
+        )
+        if updated.vram_gb <= 0:
+            raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")
+
+        self._models[model_id] = updated
+        self._save()
+        return updated
+
+    def remove(self, model_id: str) -> None:
+        """
+        Supprime un modèle du registre.
+        L'appelant doit s'assurer que le modèle est déchargé avant d'appeler cette méthode.
+        """
+        if model_id not in self._models:
+            raise KeyError(f"Modèle inconnu : '{model_id}'")
+        del self._models[model_id]
+        self._save()
+        log.info("Modèle '%s' supprimé du registre.", model_id)
+
+    def reload(self) -> None:
+        """Recharge le registre depuis le fichier YAML (utile après édition manuelle)."""
+        self._load()
+
+    # ── Persistance atomique ──────────────────────────────────────────────────
+
+    def _save(self) -> None:
+        """
+        Écrit le registre dans le fichier YAML de manière atomique :
+        écriture dans un fichier temporaire → rename.
+        Évite la corruption en cas de crash pendant l'écriture.
+        """
+        data = {"models": [m.to_dict() for m in self._models.values()]}
+        parent = self._path.parent
+
+        # Écriture atomique via fichier temporaire dans le même répertoire
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=parent,
+                suffix=".tmp",
+                delete=False,
+            ) as tmp:
+                yaml.dump(data, tmp, allow_unicode=True, default_flow_style=False, sort_keys=False)
+                tmp_path = Path(tmp.name)
+
+            tmp_path.replace(self._path)
+        except Exception as exc:
+            log.error("Échec de la sauvegarde du registre : %s", exc)
+            raise
