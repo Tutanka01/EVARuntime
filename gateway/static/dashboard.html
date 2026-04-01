@@ -421,6 +421,195 @@
     }
     .empty-state { text-align: center; padding: 32px 20px; color: var(--text3); font-size: 12.5px; }
     .hidden { display: none !important; }
+
+    /* ── Models management ──────────────────────────────────────────── */
+    .models-section {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden;
+      box-shadow: var(--shadow-sm); margin-bottom: 10px;
+    }
+    .models-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; border-bottom: 1px solid var(--border);
+    }
+    .models-title {
+      font-size: 12.5px; font-weight: 600;
+      display: flex; align-items: center; gap: 7px;
+    }
+    .models-title svg { color: var(--text3); }
+    .vram-budget {
+      padding: 10px 18px; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    }
+    .vram-label { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; color: var(--text3); white-space: nowrap; }
+    .vram-bar-wrap { flex: 1; min-width: 80px; height: 6px; background: var(--surface3); border-radius: 3px; overflow: hidden; }
+    .vram-bar-fill { height: 100%; border-radius: 3px; background: var(--accent); transition: width .4s; }
+    .vram-bar-fill.warn { background: var(--amber); }
+    .vram-bar-fill.crit { background: var(--red); }
+    .vram-stats  { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text2); white-space: nowrap; }
+    .vram-detail { font-size: 10.5px; color: var(--text3); white-space: nowrap; }
+    .models-table-wrap { overflow-x: auto; }
+    .models-table { width: 100%; border-collapse: collapse; }
+    .models-table thead th {
+      font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px;
+      color: var(--text3); padding: 8px 14px; text-align: left;
+      border-bottom: 1px solid var(--border); background: var(--surface2); white-space: nowrap;
+    }
+    .models-table tbody tr { border-bottom: 1px solid var(--border); }
+    .models-table tbody tr:last-child { border-bottom: none; }
+    .models-table tbody tr:hover { background: var(--surface2); }
+    .models-table tbody td { padding: 9px 14px; vertical-align: middle; }
+    .model-id   { font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 500; }
+    .model-path { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--text3); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+    .model-desc { font-size: 11px; color: var(--text2); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+    .state-badge {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 8px; border-radius: 20px;
+      font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .4px;
+      border: 1px solid transparent; white-space: nowrap;
+    }
+    .state-badge.ready     { background: var(--green-bg); border-color: var(--green-brd); color: var(--green); }
+    .state-badge.loading   { background: var(--amber-bg); border-color: var(--amber-brd); color: var(--amber); }
+    .state-badge.unloaded  { background: var(--surface2); border-color: var(--border);    color: var(--text3); }
+    .state-badge.unloading { background: var(--amber-bg); border-color: var(--amber-brd); color: var(--amber); }
+    .state-dot2 { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+    .state-dot2.pulse { animation: pulse 1.5s ease-in-out infinite; }
+    .toggle { position: relative; display: inline-block; width: 32px; height: 18px; cursor: pointer; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+    .toggle-slider {
+      position: absolute; inset: 0;
+      background: var(--surface3); border: 1px solid var(--border2);
+      border-radius: 18px; transition: background .2s, border-color .2s;
+    }
+    .toggle-slider:before {
+      content: ''; position: absolute; height: 12px; width: 12px;
+      left: 2px; top: 2px; background: var(--text3); border-radius: 50%;
+      transition: transform .2s, background .2s;
+    }
+    .toggle input:checked + .toggle-slider { background: var(--accent); border-color: var(--accent); }
+    .toggle input:checked + .toggle-slider:before { transform: translateX(14px); background: #fff; }
+    .toggle input:disabled + .toggle-slider { opacity: .5; cursor: not-allowed; }
+    .action-group { display: flex; gap: 5px; align-items: center; }
+    .btn-action {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text2); cursor: pointer;
+      font-family: 'Inter', sans-serif; font-size: 11px; font-weight: 500;
+      padding: 4px 8px; white-space: nowrap;
+      display: inline-flex; align-items: center; gap: 4px;
+      transition: background .12s, color .12s, border-color .12s;
+    }
+    .btn-action:hover:not(:disabled) { background: var(--surface3); border-color: var(--border2); color: var(--text); }
+    .btn-action:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-action.success:hover:not(:disabled) { background: var(--green-bg); border-color: var(--green-brd); color: var(--green); }
+    .btn-action.danger:hover:not(:disabled)  { background: var(--red-bg);   border-color: var(--red-brd);   color: var(--red);   }
+    .btn-add-model {
+      background: var(--accent); border: 1px solid var(--accent); border-radius: var(--radius-sm); color: #fff;
+      cursor: pointer; font-family: 'Inter', sans-serif; font-size: 12px; font-weight: 600;
+      padding: 6px 12px; display: inline-flex; align-items: center; gap: 5px; transition: opacity .15s;
+    }
+    .btn-add-model:hover { opacity: .85; }
+
+    /* ── Modal ──────────────────────────────────────────────────────── */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 500;
+      background: rgba(0,0,0,.45);
+      display: flex; align-items: center; justify-content: center; padding: 16px;
+    }
+    .modal-overlay.hidden { display: none; }
+    .modal-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      width: 100%; max-width: 580px; max-height: 90vh; overflow-y: auto;
+      box-shadow: 0 8px 40px rgba(0,0,0,.2);
+    }
+    .modal-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 18px 22px 14px; border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; background: var(--surface); z-index: 1;
+    }
+    .modal-head h3 { font-size: 14px; font-weight: 600; letter-spacing: -.2px; }
+    .modal-close {
+      background: none; border: none; cursor: pointer; color: var(--text3);
+      padding: 4px; border-radius: 4px; display: flex; align-items: center;
+      transition: color .12s, background .12s;
+    }
+    .modal-close:hover { color: var(--text); background: var(--surface2); }
+    .modal-body { padding: 18px 22px; }
+    .modal-foot {
+      display: flex; align-items: center; justify-content: flex-end; gap: 8px;
+      padding: 14px 22px; border-top: 1px solid var(--border);
+      position: sticky; bottom: 0; background: var(--surface);
+    }
+    .form-group { margin-bottom: 14px; }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 500px) { .form-row { grid-template-columns: 1fr; } }
+    .form-label {
+      display: block; font-size: 10.5px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: .6px; color: var(--text2); margin-bottom: 5px;
+    }
+    .form-label .req { color: var(--red); margin-left: 2px; }
+    .form-hint { font-size: 10.5px; color: var(--text3); margin-top: 4px; line-height: 1.4; }
+    .form-input, .form-select {
+      width: 100%; background: var(--surface2); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text); font-size: 12.5px;
+      padding: 8px 11px; outline: none; transition: border-color .15s, box-shadow .15s; -webkit-appearance: none;
+    }
+    .form-input { font-family: 'JetBrains Mono', monospace; }
+    .form-select { font-family: 'Inter', sans-serif; cursor: pointer; }
+    .form-input:focus, .form-select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+    .form-input.err-field { border-color: var(--red) !important; box-shadow: 0 0 0 3px var(--red-bg) !important; }
+    .form-err { font-size: 10.5px; color: var(--red); margin-top: 4px; display: none; }
+    .form-err.show { display: block; }
+    .form-section { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--text3); margin: 16px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+    .modal-err-banner { background: var(--red-bg); border: 1px solid var(--red-brd); border-radius: var(--radius-sm); color: var(--red); font-size: 12px; padding: 9px 12px; margin-bottom: 14px; display: none; line-height: 1.5; word-break: break-word; }
+    .modal-err-banner.show { display: block; }
+    .caps-wrap { display: flex; flex-wrap: wrap; gap: 7px; }
+    .cap-chip {
+      display: inline-flex; align-items: center; gap: 5px; padding: 5px 11px;
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 20px;
+      cursor: pointer; font-size: 11px; font-weight: 500; color: var(--text2);
+      user-select: none; transition: all .15s;
+    }
+    .cap-chip input[type=checkbox] { display: none; }
+    .cap-chip.selected { background: var(--accent-bg); border-color: var(--accent-brd); color: var(--accent); }
+    .adv-toggle {
+      display: flex; align-items: center; gap: 6px; cursor: pointer;
+      font-size: 12px; font-weight: 500; color: var(--text2);
+      background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 7px 12px; width: 100%; user-select: none; transition: background .12s, color .12s; font-family: 'Inter', sans-serif;
+    }
+    .adv-toggle:hover { background: var(--surface2); color: var(--text); }
+    .adv-chevron { margin-left: auto; transition: transform .2s; }
+    .adv-toggle.open .adv-chevron { transform: rotate(180deg); }
+    .adv-body { display: none; padding-top: 14px; }
+    .adv-body.open { display: block; }
+
+    /* ── Confirm dialog ─────────────────────────────────────────────── */
+    .confirm-overlay {
+      position: fixed; inset: 0; z-index: 600;
+      background: rgba(0,0,0,.5);
+      display: flex; align-items: center; justify-content: center; padding: 16px;
+    }
+    .confirm-overlay.hidden { display: none; }
+    .confirm-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+      padding: 24px; width: 100%; max-width: 360px; box-shadow: 0 8px 40px rgba(0,0,0,.2);
+    }
+    .confirm-card h4 { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+    .confirm-card p  { font-size: 12.5px; color: var(--text2); margin-bottom: 18px; line-height: 1.5; }
+    .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .btn-cancel-del {
+      background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      color: var(--text2); cursor: pointer; font-family: 'Inter', sans-serif;
+      font-size: 12.5px; font-weight: 500; padding: 7px 14px;
+    }
+    .btn-cancel-del:hover { background: var(--surface3); }
+    .btn-confirm-del {
+      background: var(--red); border: none; border-radius: var(--radius-sm);
+      color: #fff; cursor: pointer; font-family: 'Inter', sans-serif;
+      font-size: 12.5px; font-weight: 600; padding: 7px 14px; transition: opacity .15s;
+    }
+    .btn-confirm-del:hover { opacity: .85; }
+    @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
   </style>
 </head>
 <body>
@@ -442,6 +631,176 @@
     <input type="password" id="token-input" placeholder="llmgw-…" autocomplete="current-password" />
     <button class="login-btn" onclick="doLogin()">Continue</button>
     <div class="login-error" id="login-error"></div>
+  </div>
+</div>
+
+<!-- Add Model Modal -->
+<div id="add-model-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeAddModel()">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>Register New Model</h3>
+      <button class="modal-close" onclick="closeAddModel()" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <form id="add-model-form" onsubmit="return false;" autocomplete="off">
+      <div class="modal-body">
+        <div id="modal-err-banner" class="modal-err-banner"></div>
+
+        <div class="form-section" style="margin-top:0">Identification</div>
+
+        <div class="form-group">
+          <label class="form-label" for="field-id">Model ID <span class="req">*</span></label>
+          <input class="form-input" type="text" id="field-id" placeholder="llama-3.3-70b-instruct" autocomplete="off" spellcheck="false" />
+          <div class="form-hint">Lowercase letters, digits, hyphens, dots, underscores. Must start with letter or digit. Max 63 chars.</div>
+          <div class="form-err" id="field-id-err"></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="field-path">Model Path <span class="req">*</span></label>
+          <input class="form-input" type="text" id="field-path" placeholder="/models/Llama-3.3-70B-Q4_K_M.gguf" autocomplete="off" spellcheck="false" />
+          <div class="form-hint">Absolute path to the .gguf file on the server. The file must exist.</div>
+          <div class="form-err" id="field-path-err"></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="field-desc">Description</label>
+          <input class="form-input" type="text" id="field-desc" placeholder="Optional description…" maxlength="200" />
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="field-vram">VRAM (GB) <span class="req">*</span></label>
+            <input class="form-input" type="number" id="field-vram" placeholder="42.0" min="0.1" step="0.5" />
+            <div class="form-hint">Weights + KV cache at nominal load (parallel × ctx).</div>
+            <div class="form-err" id="field-vram-err"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Enabled after register</label>
+            <label class="toggle" style="margin-top:10px;display:inline-block">
+              <input type="checkbox" id="field-enabled" checked />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">Capabilities</label>
+          <div class="caps-wrap" id="caps-group">
+            <label class="cap-chip selected"><input type="checkbox" value="text_generation" checked onchange="syncCapChip(this)" />text_generation</label>
+            <label class="cap-chip"><input type="checkbox" value="tool_calls" onchange="syncCapChip(this)" />tool_calls</label>
+            <label class="cap-chip"><input type="checkbox" value="streaming" onchange="syncCapChip(this)" />streaming</label>
+            <label class="cap-chip"><input type="checkbox" value="vision" onchange="syncCapChip(this)" />vision</label>
+            <label class="cap-chip"><input type="checkbox" value="embedding" onchange="syncCapChip(this)" />embedding</label>
+          </div>
+        </div>
+
+        <!-- Advanced llama params -->
+        <button type="button" class="adv-toggle" id="adv-toggle-btn" onclick="toggleAdvanced()">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+          Advanced llama-server parameters
+          <svg class="adv-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+        </button>
+
+        <div class="adv-body" id="adv-body">
+          <div class="form-section">GPU &amp; Context</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="field-n-gpu-layers">GPU Layers</label>
+              <input class="form-input" type="number" id="field-n-gpu-layers" value="999" min="0" />
+              <div class="form-hint">999 = all layers on GPU (auto-capped)</div>
+              <div class="form-err" id="field-n-gpu-layers-err"></div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="field-ctx-size">Context Size (tokens)</label>
+              <input class="form-input" type="number" id="field-ctx-size" value="32768" min="512" step="512" />
+              <div class="form-err" id="field-ctx-size-err"></div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="field-parallel">Parallel Slots</label>
+              <input class="form-input" type="number" id="field-parallel" value="4" min="1" />
+              <div class="form-hint">Concurrent inference slots</div>
+              <div class="form-err" id="field-parallel-err"></div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="field-batch">Batch Size</label>
+              <input class="form-input" type="number" id="field-batch" value="4096" min="1" />
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="field-ubatch">μBatch Size</label>
+              <input class="form-input" type="number" id="field-ubatch" value="512" min="1" />
+              <div class="form-hint">Must be ≤ batch size</div>
+              <div class="form-err" id="field-ubatch-err"></div>
+            </div>
+            <div class="form-group" style="display:flex;flex-direction:column;justify-content:flex-end">
+              <label class="form-label">Flash Attention</label>
+              <label class="toggle" style="margin-top:8px;display:inline-block">
+                <input type="checkbox" id="field-flash-attn" checked />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-section">KV Cache</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="field-ctk">Cache Type K</label>
+              <select class="form-select" id="field-ctk">
+                <option value="q8_0" selected>q8_0 — recommended</option>
+                <option value="q5_0">q5_0</option>
+                <option value="q4_0">q4_0</option>
+                <option value="bf16">bf16</option>
+                <option value="f16">f16 — full precision</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="field-ctv">Cache Type V</label>
+              <select class="form-select" id="field-ctv">
+                <option value="q8_0" selected>q8_0 — recommended</option>
+                <option value="q5_0">q5_0</option>
+                <option value="q4_0">q4_0</option>
+                <option value="bf16">bf16</option>
+                <option value="f16">f16 — full precision</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-section">CPU Threads</div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label" for="field-threads">Compute Threads</label>
+              <input class="form-input" type="number" id="field-threads" value="8" min="1" />
+              <div class="form-err" id="field-threads-err"></div>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="field-threads-http">HTTP Threads</label>
+              <input class="form-input" type="number" id="field-threads-http" value="4" min="1" />
+              <div class="form-err" id="field-threads-http-err"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn" onclick="closeAddModel()">Cancel</button>
+        <button type="button" class="btn-add-model" id="btn-submit-model" onclick="submitAddModel()">Add Model</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Delete confirm -->
+<div id="confirm-overlay" class="confirm-overlay hidden" onclick="if(event.target===this)cancelDelete()">
+  <div class="confirm-card">
+    <h4>Delete model?</h4>
+    <p>Model <strong id="confirm-del-id" style="font-family:'JetBrains Mono',monospace;font-size:12px"></strong> will be permanently removed from the registry. If loaded, it will be unloaded first.</p>
+    <div class="confirm-actions">
+      <button class="btn-cancel-del" onclick="cancelDelete()">Cancel</button>
+      <button class="btn-confirm-del" id="btn-confirm-del" onclick="doConfirmDelete()">Delete</button>
+    </div>
   </div>
 </div>
 
@@ -497,6 +856,43 @@
     <div class="kpi-card"><div class="kpi-label">Avg latency (24h)</div><span class="skel"></span></div>
     <div class="kpi-card"><div class="kpi-label">Error rate (24h)</div><span class="skel"></span></div>
     <div class="kpi-card"><div class="kpi-label">Model state</div><span class="skel"></span></div>
+  </div>
+
+  <!-- Models -->
+  <div class="models-section">
+    <div class="models-header">
+      <div class="models-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        Models
+      </div>
+      <button class="btn-add-model" onclick="openAddModel()">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Add Model
+      </button>
+    </div>
+    <div class="vram-budget">
+      <span class="vram-label">VRAM Budget</span>
+      <div class="vram-bar-wrap"><div class="vram-bar-fill" id="vram-fill" style="width:0%"></div></div>
+      <span class="vram-stats" id="vram-stats">—</span>
+      <span class="vram-detail" id="vram-detail">—</span>
+    </div>
+    <div class="models-table-wrap">
+      <table class="models-table">
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th>Path</th>
+            <th>VRAM</th>
+            <th>State</th>
+            <th>Enabled</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="models-tbody">
+          <tr><td colspan="6" class="empty-state">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
   <!-- Charts -->
@@ -1122,6 +1518,7 @@ async function fetchAll() {
     fetchStatusCodes(periods.sc),
     fetchUsers(),
     fetchLlama(),
+    fetchModels(),
   ]);
   const now = new Date().toLocaleTimeString('en', { hour: '2-digit', minute: '2-digit', hour12: false });
   setText('last-updated', 'Updated ' + now);
@@ -1150,6 +1547,393 @@ if (_token) {
     .then(() => { document.getElementById('login-overlay').classList.add('hidden'); init(); })
     .catch(() => { sessionStorage.removeItem(TOKEN_KEY); _token = ''; });
 }
+
+// ── Extra API methods ──────────────────────────────────────────────
+async function apiPost(path, body) {
+  const res = await fetch('/admin/' + path, {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + _token, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 403) { doLogout(); throw new Error('Forbidden'); }
+  let data = {};
+  try { data = await res.json(); } catch(_) {}
+  if (!res.ok) {
+    const msg = Array.isArray(data.detail)
+      ? data.detail.map(e => e.msg || JSON.stringify(e)).join('; ')
+      : (data.detail || 'HTTP ' + res.status);
+    throw Object.assign(new Error(msg), { status: res.status, detail: msg });
+  }
+  return data;
+}
+
+async function apiPatch(path, body) {
+  const res = await fetch('/admin/' + path, {
+    method: 'PATCH',
+    headers: { 'Authorization': 'Bearer ' + _token, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 403) { doLogout(); throw new Error('Forbidden'); }
+  let data = {};
+  try { data = await res.json(); } catch(_) {}
+  if (!res.ok) {
+    const msg = Array.isArray(data.detail)
+      ? data.detail.map(e => e.msg || JSON.stringify(e)).join('; ')
+      : (data.detail || 'HTTP ' + res.status);
+    throw Object.assign(new Error(msg), { status: res.status, detail: msg });
+  }
+  return data;
+}
+
+async function apiDel(path) {
+  const res = await fetch('/admin/' + path, {
+    method: 'DELETE',
+    headers: { 'Authorization': 'Bearer ' + _token },
+  });
+  if (res.status === 403) { doLogout(); throw new Error('Forbidden'); }
+  let data = {};
+  try { data = await res.json(); } catch(_) {}
+  if (!res.ok) {
+    const msg = data.detail || 'HTTP ' + res.status;
+    throw Object.assign(new Error(msg), { status: res.status, detail: msg });
+  }
+  return data;
+}
+
+// ── Models management ──────────────────────────────────────────────
+async function fetchModels() {
+  try {
+    const res = await fetch('/admin/status', {
+      headers: { 'Authorization': 'Bearer ' + _token }
+    });
+    if (res.status === 403) { doLogout(); return; }
+    if (!res.ok) return;
+    const d = await res.json();
+    renderVramBudget(d.vram_budget);
+    renderModelsTable(d.models || []);
+  } catch(e) { console.error('fetchModels', e); }
+}
+
+function renderVramBudget(vram) {
+  if (!vram) return;
+  const pct = vram.budget_net_gb > 0 ? (vram.used_gb / vram.budget_net_gb * 100) : 0;
+  const cls = pct >= 90 ? 'crit' : pct >= 70 ? 'warn' : '';
+  const fill = document.getElementById('vram-fill');
+  if (fill) { fill.style.width = Math.min(pct, 100) + '%'; fill.className = 'vram-bar-fill ' + cls; }
+  setText('vram-stats',  vram.used_gb.toFixed(1) + ' / ' + vram.budget_net_gb.toFixed(1) + ' GB used (' + pct.toFixed(0) + '%)');
+  setText('vram-detail', 'Total ' + vram.total_gb + ' GB — overhead ' + vram.overhead_gb + ' GB — margin ' + (vram.safety_margin * 100).toFixed(0) + '%');
+}
+
+const LOAD_SVG   = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
+const UNLOAD_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>`;
+const DEL_SVG    = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
+
+function renderModelsTable(models) {
+  const tbody = document.getElementById('models-tbody');
+  if (!tbody) return;
+  if (!models.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No models registered. Click "Add Model" to get started.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = models.map(m => {
+    const state  = m.state || 'unloaded';
+    const isBusy = state === 'loading' || state === 'unloading';
+    const isReady = state === 'ready';
+    const dotCls = 'state-dot2' + (isBusy ? ' pulse' : '');
+    const sid = esc(m.id);
+
+    const loadBtn = isReady
+      ? `<button class="btn-action${isBusy?' danger':''}" onclick="doUnloadModel('${sid}')" ${isBusy?'disabled':''}>${UNLOAD_SVG} Unload</button>`
+      : `<button class="btn-action success" onclick="doLoadModel('${sid}')" ${(isBusy||!m.enabled)?'disabled':''} title="${!m.enabled?'Enable model first':'Load into VRAM'}">${LOAD_SVG} Load</button>`;
+
+    const caps = (m.capabilities || []).join(', ') || '—';
+
+    return `<tr>
+      <td>
+        <div class="model-id">${esc(m.id)}</div>
+        <div class="model-desc" title="${esc(m.description||'')}">${esc(m.description||'—')}</div>
+      </td>
+      <td><span class="model-path" title="${esc(m.path||'')}">${esc(m.path||'—')}</span></td>
+      <td class="mono" style="font-size:11.5px">${m.vram_gb != null ? m.vram_gb.toFixed(1) + ' GB' : '—'}</td>
+      <td>
+        <span class="state-badge ${state}">
+          <span class="${dotCls}"></span>${state}
+        </span>
+        ${isReady && m.uptime_seconds != null ? '<div style="font-size:10px;color:var(--text3);margin-top:2px">up ' + fmtDuration(m.uptime_seconds) + '</div>' : ''}
+      </td>
+      <td>
+        <label class="toggle" title="${m.enabled ? 'Click to disable' : 'Click to enable'}">
+          <input type="checkbox" ${m.enabled?'checked':''} ${isBusy?'disabled':''} onchange="doToggleEnabled('${sid}',this.checked)" />
+          <span class="toggle-slider"></span>
+        </label>
+      </td>
+      <td>
+        <div class="action-group">
+          ${loadBtn}
+          <button class="btn-action danger" onclick="confirmDelete('${sid}')" ${isBusy?'disabled':''} title="Remove from registry">${DEL_SVG} Delete</button>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+async function doLoadModel(id) {
+  setRowBusy(id, true);
+  try {
+    await apiPost('models/' + id + '/load', {});
+    showToast("Model '" + id + "' loaded successfully.", 'ok');
+  } catch(e) {
+    showToast('Load failed: ' + (e.detail || e.message), 'error');
+  } finally {
+    await fetchModels();
+  }
+}
+
+async function doUnloadModel(id) {
+  setRowBusy(id, true);
+  try {
+    await apiPost('models/' + id + '/unload', {});
+    showToast("Model '" + id + "' unloaded.", 'ok');
+  } catch(e) {
+    showToast('Unload failed: ' + (e.detail || e.message), 'error');
+  } finally {
+    await fetchModels();
+  }
+}
+
+async function doToggleEnabled(id, enabled) {
+  try {
+    await apiPatch('models/' + id, { enabled });
+    showToast("Model '" + id + "' " + (enabled ? 'enabled' : 'disabled') + '.', 'ok');
+  } catch(e) {
+    showToast('Update failed: ' + (e.detail || e.message), 'error');
+  } finally {
+    await fetchModels();
+  }
+}
+
+function setRowBusy(id, busy) {
+  // Disable buttons in the row while request is in flight
+  const tbody = document.getElementById('models-tbody');
+  if (!tbody) return;
+  const rows = tbody.querySelectorAll('tr');
+  rows.forEach(row => {
+    const idEl = row.querySelector('.model-id');
+    if (idEl && idEl.textContent === id) {
+      row.querySelectorAll('button,input').forEach(el => el.disabled = busy);
+    }
+  });
+}
+
+// ── Delete confirm ─────────────────────────────────────────────────
+let _pendingDelete = null;
+
+function confirmDelete(id) {
+  _pendingDelete = id;
+  document.getElementById('confirm-del-id').textContent = id;
+  document.getElementById('confirm-overlay').classList.remove('hidden');
+}
+
+function cancelDelete() {
+  _pendingDelete = null;
+  document.getElementById('confirm-overlay').classList.add('hidden');
+}
+
+async function doConfirmDelete() {
+  if (!_pendingDelete) return;
+  const id = _pendingDelete;
+  const btn = document.getElementById('btn-confirm-del');
+  btn.disabled = true;
+  btn.textContent = 'Deleting…';
+  cancelDelete();
+  try {
+    await apiDel('models/' + id);
+    showToast("Model '" + id + "' deleted.", 'ok');
+    await fetchModels();
+  } catch(e) {
+    showToast('Delete failed: ' + (e.detail || e.message), 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Delete';
+  }
+}
+
+// ── Add model modal ────────────────────────────────────────────────
+function openAddModel() {
+  document.getElementById('add-model-form').reset();
+  // Restore capability chip visual state after reset
+  document.querySelectorAll('#caps-group .cap-chip').forEach(chip => {
+    const cb = chip.querySelector('input[type=checkbox]');
+    chip.classList.toggle('selected', cb.checked);
+  });
+  document.getElementById('field-enabled').checked   = true;
+  document.getElementById('field-flash-attn').checked = true;
+  // Collapse advanced section
+  document.getElementById('adv-toggle-btn').classList.remove('open');
+  document.getElementById('adv-body').classList.remove('open');
+  // Clear all errors
+  clearAllFormErrors();
+  document.getElementById('add-model-modal').classList.remove('hidden');
+  setTimeout(() => document.getElementById('field-id').focus(), 50);
+}
+
+function closeAddModel() {
+  document.getElementById('add-model-modal').classList.add('hidden');
+}
+
+function toggleAdvanced() {
+  document.getElementById('adv-toggle-btn').classList.toggle('open');
+  document.getElementById('adv-body').classList.toggle('open');
+}
+
+function syncCapChip(cb) {
+  cb.closest('.cap-chip').classList.toggle('selected', cb.checked);
+}
+
+function clearAllFormErrors() {
+  document.querySelectorAll('.form-err').forEach(e => { e.classList.remove('show'); e.textContent = ''; });
+  document.querySelectorAll('.form-input.err-field').forEach(e => e.classList.remove('err-field'));
+  const banner = document.getElementById('modal-err-banner');
+  banner.classList.remove('show'); banner.textContent = '';
+}
+
+function setFieldError(fieldId, msg) {
+  const inp = document.getElementById(fieldId);
+  const err = document.getElementById(fieldId + '-err');
+  if (inp) inp.classList.add('err-field');
+  if (err) { err.textContent = msg; err.classList.add('show'); }
+}
+
+function clearFieldError(fieldId) {
+  const inp = document.getElementById(fieldId);
+  const err = document.getElementById(fieldId + '-err');
+  if (inp) inp.classList.remove('err-field');
+  if (err) { err.classList.remove('show'); err.textContent = ''; }
+}
+
+async function submitAddModel() {
+  clearAllFormErrors();
+
+  // Collect values
+  const id      = document.getElementById('field-id').value.trim();
+  const path    = document.getElementById('field-path').value.trim();
+  const desc    = document.getElementById('field-desc').value.trim();
+  const vramRaw = document.getElementById('field-vram').value.trim();
+  const enabled = document.getElementById('field-enabled').checked;
+  const caps    = Array.from(document.querySelectorAll('#caps-group input:checked')).map(cb => cb.value);
+
+  const ngl  = parseInt(document.getElementById('field-n-gpu-layers').value) || 999;
+  const ctx  = parseInt(document.getElementById('field-ctx-size').value)     || 32768;
+  const par  = parseInt(document.getElementById('field-parallel').value)     || 4;
+  const bs   = parseInt(document.getElementById('field-batch').value)        || 4096;
+  const ubs  = parseInt(document.getElementById('field-ubatch').value)       || 512;
+  const ctk  = document.getElementById('field-ctk').value;
+  const ctv  = document.getElementById('field-ctv').value;
+  const fa   = document.getElementById('field-flash-attn').checked;
+  const thr  = parseInt(document.getElementById('field-threads').value)      || 8;
+  const thrH = parseInt(document.getElementById('field-threads-http').value) || 4;
+
+  // Client-side validation (mirrors server rules)
+  const ID_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+  let valid = true;
+
+  if (!id) {
+    setFieldError('field-id', 'Required'); valid = false;
+  } else if (!ID_RE.test(id)) {
+    setFieldError('field-id', 'Lowercase letters, digits, hyphens, dots, underscores only'); valid = false;
+  }
+
+  if (!path) {
+    setFieldError('field-path', 'Required'); valid = false;
+  } else if (!/^(\/|[A-Za-z]:[\\\/])/.test(path)) {
+    setFieldError('field-path', 'Must be an absolute path (starts with / or C:\\)'); valid = false;
+  } else if (!path.toLowerCase().endsWith('.gguf')) {
+    setFieldError('field-path', 'Must point to a .gguf file'); valid = false;
+  }
+
+  const vram = parseFloat(vramRaw);
+  if (!vramRaw || isNaN(vram) || vram <= 0) {
+    setFieldError('field-vram', 'Must be a positive number (e.g. 42.0)'); valid = false;
+  }
+
+  if (ngl < 0)   { setFieldError('field-n-gpu-layers', 'Must be ≥ 0'); valid = false; }
+  if (ctx < 512) { setFieldError('field-ctx-size', 'Must be ≥ 512'); valid = false; }
+  if (par < 1)   { setFieldError('field-parallel', 'Must be ≥ 1'); valid = false; }
+  if (ubs > bs)  { setFieldError('field-ubatch', 'Must be ≤ batch size (' + bs + ')'); valid = false; }
+  if (thr < 1)   { setFieldError('field-threads', 'Must be ≥ 1'); valid = false; }
+  if (thrH < 1)  { setFieldError('field-threads-http', 'Must be ≥ 1'); valid = false; }
+
+  // Open advanced section if it has errors
+  if (!valid) {
+    const advFields = ['field-n-gpu-layers','field-ctx-size','field-parallel','field-ubatch','field-threads','field-threads-http'];
+    const hasAdvErr = advFields.some(f => document.getElementById(f + '-err')?.classList.contains('show'));
+    if (hasAdvErr) {
+      document.getElementById('adv-toggle-btn').classList.add('open');
+      document.getElementById('adv-body').classList.add('open');
+    }
+    return;
+  }
+
+  const btn = document.getElementById('btn-submit-model');
+  btn.disabled = true;
+  btn.textContent = 'Adding…';
+
+  try {
+    await apiPost('models', {
+      id, path, description: desc, vram_gb: vram, enabled, capabilities: caps,
+      llama_params: {
+        n_gpu_layers: ngl, ctx_size: ctx, parallel: par,
+        batch_size: bs, ubatch_size: ubs,
+        cache_type_k: ctk, cache_type_v: ctv,
+        flash_attn: fa, threads: thr, threads_http: thrH,
+      },
+    });
+    closeAddModel();
+    await fetchModels();
+    showToast("Model '" + id + "' registered successfully.", 'ok');
+  } catch(e) {
+    const detail = e.detail || e.message || 'Unknown error';
+    const banner = document.getElementById('modal-err-banner');
+    banner.textContent = detail;
+    banner.classList.add('show');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Add Model';
+  }
+}
+
+// ── Toast notifications ────────────────────────────────────────────
+function showToast(msg, type) {
+  let container = document.getElementById('toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.style.cssText = 'position:fixed;bottom:20px;right:20px;z-index:1000;display:flex;flex-direction:column-reverse;gap:8px;pointer-events:none;';
+    document.body.appendChild(container);
+  }
+  const ok = type === 'ok';
+  const color = ok ? 'var(--green)' : 'var(--red)';
+  const bg    = ok ? 'var(--green-bg)' : 'var(--red-bg)';
+  const brd   = ok ? 'var(--green-brd)' : 'var(--red-brd)';
+  const toast = document.createElement('div');
+  toast.style.cssText = [
+    'background:' + bg, 'border:1px solid ' + brd, 'color:' + color,
+    'border-radius:7px', 'padding:10px 16px', 'font-size:12.5px', 'font-weight:500',
+    'box-shadow:0 4px 16px rgba(0,0,0,.12)', 'max-width:340px', 'pointer-events:auto',
+    'animation:slideIn .2s ease', 'word-break:break-word',
+  ].join(';');
+  toast.textContent = msg;
+  container.appendChild(toast);
+  setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity .3s'; setTimeout(() => toast.remove(), 300); }, 4000);
+}
+
+// Close modals on Escape key
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    if (!document.getElementById('add-model-modal').classList.contains('hidden')) closeAddModel();
+    if (!document.getElementById('confirm-overlay').classList.contains('hidden')) cancelDelete();
+  }
+});
 </script>
 </body>
 </html>
