@@ -119,7 +119,7 @@ curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.3-70b-instruct",
+    "model": "qwen3.5-9b-q5_k_m",
     "messages": [
       {"role": "user", "content": "Explique le théorème de Bayes en 3 phrases."}
     ]
@@ -129,9 +129,9 @@ curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
 Réponse attendue :
 ```json
 {
-  "id": "chatcmpl-abc123",
-  "object": "chat.completion",
-  "model": "llama-3.3-70b-instruct",
+   "id": "chatcmpl-abc123",
+   "object": "chat.completion",
+   "model": "qwen3.5-9b-q5_k_m",
   "choices": [
     {
       "index": 0,
@@ -186,7 +186,7 @@ client = OpenAI(
 
 ```python
 response = client.chat.completions.create(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[
         {"role": "system", "content": "Tu es un assistant de recherche scientifique."},
         {"role": "user",   "content": "Quelles sont les principales limites des LLMs actuels ?"}
@@ -213,13 +213,13 @@ Le choix dépend du compromis qualité/latence souhaité :
 ```python
 # Modèle principal — qualité maximale, temps de chargement ~90s
 response = client.chat.completions.create(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[{"role": "user", "content": "Analyse en détail ce texte..."}],
 )
 
 # Modèle léger — latence réduite, chargement ~15s, suffisant pour de nombreuses tâches
 response = client.chat.completions.create(
-    model="llama-3.1-8b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[{"role": "user", "content": "Résume en 2 phrases."}],
 )
 ```
@@ -231,7 +231,7 @@ Pour maintenir un contexte conversationnel, il faut transmettre l'historique com
 à chaque appel.
 
 ```python
-def chat(messages: list[dict], model: str = "llama-3.3-70b-instruct") -> str:
+def chat(messages: list[dict], model: str = "qwen3.5-9b-q5_k_m") -> str:
     """Envoie une conversation et retourne la réponse du modèle."""
     response = client.chat.completions.create(
         model=model,
@@ -279,7 +279,7 @@ client = OpenAI(
 
 def query_with_retry(
     messages: list[dict],
-    model: str = "llama-3.3-70b-instruct",
+    model: str = "qwen3.5-9b-q5_k_m",
     max_attempts: int = 3,
 ) -> str:
     """
@@ -353,7 +353,7 @@ HEADERS = {
 
 def ask(
     prompt: str,
-    model: str = "llama-3.3-70b-instruct",
+    model: str = "qwen3.5-9b-q5_k_m",
     system: str = "Tu es un assistant utile.",
 ) -> str:
     payload = {
@@ -388,7 +388,7 @@ bloc de texte.
 ```python
 # Affiche chaque token dès sa génération
 stream = client.chat.completions.create(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[{"role": "user", "content": "Rédige une introduction sur les transformers."}],
     stream=True,
     max_tokens=1024,
@@ -407,7 +407,7 @@ print()  # retour à la ligne en fin de génération
 ```python
 def stream_and_collect(
     messages: list[dict],
-    model: str = "llama-3.3-70b-instruct",
+    model: str = "qwen3.5-9b-q5_k_m",
 ) -> str:
     """Affiche les tokens au fil de la génération et retourne le texte complet."""
     full_text = ""
@@ -445,7 +445,7 @@ async_client = AsyncOpenAI(
 )
 
 
-async def stream_response(prompt: str, model: str = "llama-3.3-70b-instruct"):
+async def stream_response(prompt: str, model: str = "qwen3.5-9b-q5_k_m"):
     async with async_client.beta.chat.completions.stream(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -465,7 +465,7 @@ curl -sN https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.3-70b-instruct",
+    "model": "qwen3.5-9b-q5_k_m",
     "messages": [{"role": "user", "content": "Compte jusqu'\''à 5 lentement."}],
     "stream": true
   }'
@@ -488,7 +488,7 @@ la référence officielle. Ils couvrent la grande majorité des besoins courants
 
 ```python
 response = client.chat.completions.create(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[{"role": "user", "content": "Ton message ici"}],
 
     # ── Longueur de la réponse ────────────────────────────────────────────────
@@ -607,7 +607,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[
         {
             "role": "system",
@@ -653,7 +653,7 @@ curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.3-70b-instruct",
+    "model": "qwen3.5-9b-q5_k_m",
     "messages": [{"role": "user", "content": "Rédige une introduction sur les LLMs."}],
     "max_tokens": 2048,
     "temperature": 0.8,
@@ -689,7 +689,7 @@ curl -s https://llm.eva.univ-pau.fr/completion \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.3-70b-instruct",
+    "model": "qwen3.5-9b-q5_k_m",
     "prompt": "<|im_start|>user\nQu'\''est-ce qu'\''un LLM ?<|im_end|>\n<|im_start|>assistant\n",
     "n_predict": 512,
     "temperature": 0.7,
@@ -723,7 +723,7 @@ response = httpx.post(
     "https://llm.eva.univ-pau.fr/completion",
     headers={"Authorization": f"Bearer {os.environ['UPPA_LLM_KEY']}"},
     json={
-        "model": "llama-3.3-70b-instruct",
+        "model": "qwen3.5-9b-q5_k_m",
         "prompt": "La photosynthèse est",
         "n_predict": 256,
         "temperature": 0.5,
@@ -762,7 +762,7 @@ curl -s https://llm.eva.univ-pau.fr/v1/tokenize \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.3-70b-instruct",
+    "model": "qwen3.5-9b-q5_k_m",
     "content": "Votre texte à tokeniser ici…"
   }'
 # Réponse : {"tokens": [123, 456, 789, ...]}
@@ -774,7 +774,7 @@ Python — vérifier qu'un prompt tient dans le contexte avant de l'envoyer :
 import httpx
 import os
 
-def count_tokens(text: str, model: str = "llama-3.3-70b-instruct") -> int:
+def count_tokens(text: str, model: str = "qwen3.5-9b-q5_k_m") -> int:
     """Compte les tokens d'un texte selon le tokenizer exact du modèle cible."""
     r = httpx.post(
         "https://llm.eva.univ-pau.fr/v1/tokenize",
@@ -805,7 +805,7 @@ curl -s https://llm.eva.univ-pau.fr/v1/detokenize \
   -H "Authorization: Bearer $UPPA_LLM_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "llama-3.3-70b-instruct",
+    "model": "qwen3.5-9b-q5_k_m",
     "tokens": [9468, 17403, 374, 264]
   }'
 # Réponse : {"content": "La France est un"}
@@ -844,7 +844,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 import os
 
 llm = ChatOpenAI(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     openai_api_base="https://llm.eva.univ-pau.fr/v1",
     openai_api_key=os.environ["UPPA_LLM_KEY"],
     temperature=0.7,
@@ -880,7 +880,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 
 # LLM — servi par le cluster EVA
 llm = ChatOpenAI(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     openai_api_base="https://llm.eva.univ-pau.fr/v1",
     openai_api_key=os.environ["UPPA_LLM_KEY"],
     temperature=0.0,
@@ -935,7 +935,7 @@ console.log(models.data.map(m => m.id));
 
 // Requête simple
 const response = await client.chat.completions.create({
-  model: 'llama-3.3-70b-instruct',
+    model: 'qwen3.5-9b-q5_k_m',
   messages: [
     { role: 'user', content: "Qu'est-ce que la perplexité en NLP ?" }
   ],
@@ -945,7 +945,7 @@ console.log(response.choices[0].message.content);
 
 // Streaming
 const stream = client.chat.completions.stream({
-  model: 'llama-3.3-70b-instruct',
+    model: 'qwen3.5-9b-q5_k_m',
   messages: [{ role: 'user', content: 'Explique BERT en détail.' }],
   stream: true,
 });
@@ -969,7 +969,7 @@ permet de réduire la consommation électrique d'environ 85 % pendant les pério
 Chaque modèle dispose de son propre cycle de chargement/déchargement indépendant.
 
 ```
-Votre requête arrive (model: "llama-3.3-70b-instruct")
+Votre requête arrive (model: "qwen3.5-9b-q5_k_m")
         │
         ▼
 Ce modèle est-il chargé en VRAM ?
@@ -1013,7 +1013,7 @@ client = OpenAI(
     timeout=150.0,
 )
 response = client.chat.completions.create(
-    model="llama-3.3-70b-instruct",
+    model="qwen3.5-9b-q5_k_m",
     messages=[{"role": "user", "content": "Bonjour"}],
 )
 
@@ -1083,7 +1083,7 @@ client = OpenAI(
 
 try:
     response = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model="qwen3.5-9b-q5_k_m",
         messages=[{"role": "user", "content": "Bonjour"}],
     )
     print(response.choices[0].message.content)
@@ -1151,7 +1151,7 @@ results = []
 for i, prompt in enumerate(prompts):
     try:
         r = client.chat.completions.create(
-            model="llama-3.3-70b-instruct",
+            model="qwen3.5-9b-q5_k_m",
             messages=[{"role": "user", "content": prompt}],
         )
         results.append(r.choices[0].message.content)
@@ -1159,7 +1159,7 @@ for i, prompt in enumerate(prompts):
         print(f"Rate limit sur la requête {i} — attente 60 s…")
         time.sleep(60)
         r = client.chat.completions.create(
-            model="llama-3.3-70b-instruct",
+            model="qwen3.5-9b-q5_k_m",
             messages=[{"role": "user", "content": prompt}],
         )
         results.append(r.choices[0].message.content)
@@ -1236,7 +1236,7 @@ réponds UNIQUEMENT avec un JSON valide : {"sentiment": "positif"|"négatif"|"ne
 
 def annotate_sentiment(text: str) -> dict:
     response = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model="qwen3.5-9b-q5_k_m",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": text},
@@ -1300,7 +1300,7 @@ Abstract :
 {abstract}"""
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model="qwen3.5-9b-q5_k_m",
         messages=[
             {"role": "system", "content": "Tu es un expert en vulgarisation scientifique."},
             {"role": "user",   "content": prompt},
@@ -1353,7 +1353,7 @@ Réponds UNIQUEMENT avec un JSON valide structuré ainsi :
 Texte : {text}"""
 
     response = client.chat.completions.create(
-        model="llama-3.3-70b-instruct",
+        model="qwen3.5-9b-q5_k_m",
         messages=[{"role": "user", "content": prompt}],
         max_tokens=512,
         temperature=0.0,  # extraction → réponse déterministe
@@ -1410,7 +1410,7 @@ client = OpenAI(
 def simple_rag(
     question: str,
     documents: list[str],
-    model: str = "llama-3.3-70b-instruct",
+    model: str = "qwen3.5-9b-q5_k_m",
 ) -> str:
     """Répond à une question en se basant exclusivement sur les documents fournis."""
     context = "\n\n---\n\n".join(documents)
