@@ -85,6 +85,9 @@ class ModelDefinition:
     enabled: bool
     capabilities: list[str]
     llama_params: LlamaParams
+    # Chemin vers le projector multimodal (requis pour la capability 'vision').
+    # Sans ce fichier, llama-server retourne 500 sur toute requête avec image.
+    mmproj_path: Path | None = None
 
     def build_llama_cmd(
         self,
@@ -118,12 +121,14 @@ class ModelDefinition:
         ]
         if p.flash_attn:
             cmd += ["-fa", "on"]
+        if self.mmproj_path is not None and "vision" in self.capabilities:
+            cmd += ["--mmproj", str(self.mmproj_path)]
         return cmd
 
     def to_dict(self) -> dict:
         """Sérialise vers le format YAML."""
         p = self.llama_params
-        return {
+        d: dict = {
             "id": self.id,
             "path": str(self.path),
             "description": self.description,
@@ -143,6 +148,9 @@ class ModelDefinition:
                 "threads_http": p.threads_http,
             },
         }
+        if self.mmproj_path is not None:
+            d["mmproj_path"] = str(self.mmproj_path)
+        return d
 
 
 class ModelRegistry:
@@ -204,14 +212,32 @@ class ModelRegistry:
         llama_raw = entry.get("llama_params", {})
         llama_params = LlamaParams(**llama_raw)
 
+        capabilities = list(entry.get("capabilities", ["text_generation"]))
+
+        # mmproj_path — optionnel, mais obligatoire en pratique si 'vision' est déclaré.
+        # Sans lui, llama-server retourne HTTP 500 sur toute requête avec image.
+        raw_mmproj = entry.get("mmproj_path")
+        mmproj_path: Path | None = None
+        if raw_mmproj:
+            mmproj_path = self._validate_model_path(str(raw_mmproj))
+
+        if "vision" in capabilities and mmproj_path is None:
+            log.warning(
+                "[%s] La capability 'vision' est déclarée mais 'mmproj_path' est absent "
+                "— les requêtes avec images retourneront HTTP 500. "
+                "Ajoutez mmproj_path dans models.yaml.",
+                model_id,
+            )
+
         return ModelDefinition(
             id=model_id,
             path=path,
             description=str(entry.get("description", "")),
             vram_gb=vram_gb,
             enabled=bool(entry.get("enabled", True)),
-            capabilities=list(entry.get("capabilities", ["text_generation"])),
+            capabilities=capabilities,
             llama_params=llama_params,
+            mmproj_path=mmproj_path,
         )
 
     def _validate_model_id(self, model_id: str) -> None:
@@ -307,6 +333,7 @@ class ModelRegistry:
             enabled=enabled,
             capabilities=model.capabilities,
             llama_params=model.llama_params,
+            mmproj_path=model.mmproj_path,
         )
         self._models[model_id] = updated
         self._save()
@@ -330,6 +357,7 @@ class ModelRegistry:
             enabled=kwargs.get("enabled", model.enabled),
             capabilities=model.capabilities,
             llama_params=model.llama_params,
+            mmproj_path=model.mmproj_path,
         )
         if updated.vram_gb <= 0:
             raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")

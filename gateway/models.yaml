@@ -13,6 +13,10 @@
 #   description : texte libre
 #   enabled     : true/false (défaut: true)
 #   capabilities: liste parmi [text_generation, tool_calls, streaming, vision, embedding]
+#   mmproj_path : chemin absolu vers le fichier .gguf du projector multimodal (clip).
+#                 OBLIGATOIRE si 'vision' est dans capabilities — sans lui, llama-server
+#                 retourne HTTP 500 sur toute requête contenant une image.
+#                 Exemple : /models/llava-v1.6-mistral-7b-mmproj-f16.gguf
 #   llama_params: paramètres llama-server (surcharge les défauts)
 #
 # IMPORTANT — estimation vram_gb :
