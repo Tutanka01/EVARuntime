@@ -138,12 +138,37 @@ huggingface-cli download bartowski/Meta-Llama-3.1-8B-Instruct-GGUF \
 # → Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf  ~5G
 ```
 
+### Modèles vision (multimodaux)
+
+Les modèles capables de traiter des images (LLaVA, Qwen2-VL, InternVL, etc.)
+nécessitent **deux fichiers GGUF** : le modèle principal et le **projecteur multimodal**
+(`mmproj`). Sans le fichier mmproj, llama-server retourne HTTP 500 sur toute
+requête contenant une image, même si la capability `vision` est déclarée.
+
+```bash
+# Exemple avec LLaVA 1.6 Mistral 7B
+huggingface-cli download bartowski/llava-v1.6-mistral-7b-GGUF \
+  --include "*Q4_K_M*" "*mmproj*" \
+  --local-dir /models/
+
+ls -lh /models/llava*
+# → llava-v1.6-mistral-7b-Q4_K_M.gguf          ~4.4G   ← modèle principal
+# → llava-v1.6-mistral-7b-mmproj-f16.gguf       ~0.6G   ← projecteur CLIP (requis)
+```
+
+Le `mmproj_path` est déclaré dans `models.yaml` — voir section 6 pour la structure complète.
+
+> **Note :** Avec llama.cpp ≥ mai 2025, le flag `-hf org/repo` télécharge le mmproj
+> automatiquement depuis HuggingFace. Pour les fichiers locaux (notre cas), le champ
+> `mmproj_path` est **toujours obligatoire**.
+
 ### Budget VRAM — planification
 
 | Modèle | Fichier | Poids VRAM | KV cache | Total estimé |
 |--------|---------|------------|----------|--------------|
 | Llama 3.3 70B Q4_K_M | `Llama-3.3-70B-Instruct-Q4_K_M.gguf` | ~38–40 GB | ~2.5 GB (4 slots × 8K, Q8) | ~42 GB |
 | Llama 3.1 8B Q4_K_M | `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` | ~4.5 GB | ~1 GB (8 slots × 8K, Q8) | ~5.5 GB |
+| LLaVA 1.6 Mistral 7B Q4_K_M | `llava-v1.6-mistral-7b-Q4_K_M.gguf` + mmproj | ~4.4 GB + 0.6 GB mmproj | ~1 GB | ~6 GB |
 
 **L40S 48 GB :**
 - Budget net disponible = 48 − 2 (overhead) − 2.4 (marge 5%) = **43.6 GB**
@@ -287,7 +312,36 @@ models:
       flash_attn: true
       threads: 4
       threads_http: 2
+
+  # Exemple de modèle vision — deux fichiers requis
+  - id: "llava-7b"
+    path: "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf"
+    mmproj_path: "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf"   # OBLIGATOIRE si vision
+    description: "LLaVA 1.6 Mistral 7B — vision + texte"
+    vram_gb: 6.0
+    enabled: false
+    capabilities:
+      - text_generation
+      - vision
+      - streaming
+    llama_params:
+      n_gpu_layers: 999
+      ctx_size: 8192
+      parallel: 4
+      batch_size: 2048
+      ubatch_size: 512
+      cache_type_k: "q8_0"
+      cache_type_v: "q8_0"
+      flash_attn: true
+      threads: 4
+      threads_http: 2
 ```
+
+> **Modèles vision — règle absolue :** si `vision` est dans `capabilities`, le champ
+> `mmproj_path` doit pointer vers le fichier projecteur CLIP (`.gguf`). Sans lui,
+> llama-server démarre correctement mais retourne **HTTP 500** sur toute requête avec
+> image. La gateway émet un avertissement dans les logs au démarrage si `mmproj_path`
+> est absent pour un modèle vision.
 
 ### Activer un modèle
 
@@ -329,7 +383,8 @@ sudo -u llmservice ./venv/bin/python cli.py status
 Le registre est validé au démarrage :
 - Les `id` doivent correspondre à `^[a-z0-9][a-z0-9._-]*$` (pas de `/`, `..`, etc.)
 - Les `path` doivent être absolus et se terminer par `.gguf`
-- Si `ALLOWED_MODEL_DIRS` est configuré, les chemins doivent être sous ces répertoires
+- Le `mmproj_path`, s'il est fourni, subit les mêmes validations que `path`
+- Si `ALLOWED_MODEL_DIRS` est configuré, les chemins (`path` et `mmproj_path`) doivent être sous ces répertoires
 
 ---
 
@@ -705,6 +760,8 @@ Causes fréquentes :
 | `llama-server: command not found` | llama.cpp non installé | Refaire l'étape 2 |
 | Timeout après 180s | Modèle trop lent à charger | Augmenter `MODEL_LOAD_TIMEOUT_SECONDS=300` dans `env` |
 | `Port already in use` | Deux modèles sur le même port | Vérifier `BASE_LLAMA_PORT` et `MAX_LOADED_MODELS` |
+| HTTP 500 sur requête avec image | `mmproj_path` absent dans `models.yaml` | Ajouter `mmproj_path` pointant vers le fichier projecteur CLIP (`.gguf`) |
+| Warning `mmproj_path absent` dans les logs | Modèle vision sans projecteur | Télécharger le fichier `mmproj` sur HuggingFace et configurer `mmproj_path` |
 
 ### Vérifier le budget VRAM
 

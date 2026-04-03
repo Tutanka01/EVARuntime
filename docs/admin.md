@@ -583,6 +583,40 @@ curl -s -X POST "$GW/admin/models" \
 - Le fichier `.gguf` doit exister sur disque
 - Si `ALLOWED_MODEL_DIRS` est configuré, le chemin doit être sous ces répertoires
 - `vram_gb` doit être entre 0.5 et le budget VRAM net
+- Si `mmproj_path` est fourni, il est validé de la même façon que `path` (absolu, `.gguf`)
+
+**Pour un modèle vision**, inclure `mmproj_path` dans le corps de la requête :
+
+```bash
+curl -s -X POST "$GW/admin/models" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "llava-7b",
+    "path": "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf",
+    "mmproj_path": "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf",
+    "description": "LLaVA 1.6 Mistral 7B — vision + texte",
+    "vram_gb": 6.0,
+    "enabled": true,
+    "capabilities": ["text_generation", "vision", "streaming"],
+    "llama_params": {
+      "n_gpu_layers": 999,
+      "ctx_size": 8192,
+      "parallel": 4,
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": true,
+      "threads": 4,
+      "threads_http": 2
+    }
+  }' | python3 -m json.tool
+```
+
+> **Important :** `mmproj_path` est **obligatoire** en pratique si `vision` est dans
+> `capabilities`. Sans lui, llama-server retourne HTTP 500 sur toute requête avec image.
+> La gateway émet un warning dans les logs au démarrage si ce champ est absent.
 
 ### Supprimer un modèle du registre
 
@@ -781,6 +815,9 @@ curl -s "$GW/admin/metrics/overview" \
   téléchargé, plutôt que de les supprimer
 - Surveiller `idle_seconds` dans `/admin/status` pour identifier les modèles rarement
   utilisés qui pourraient être désactivés pour libérer du budget VRAM
+- Pour tout modèle vision : s'assurer que `mmproj_path` est renseigné **avant**
+  d'activer le modèle — un modèle vision sans `mmproj_path` provoque des HTTP 500
+  silencieux (llama-server démarre, mais échoue à chaque requête avec image)
 
 ### Sécurité de l'`ADMIN_SECRET`
 
