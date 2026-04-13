@@ -139,15 +139,13 @@ class ServerManager:
                     f"réessayez dans quelques secondes."
                 )
 
+        effective_timeout = (self._model.load_timeout_seconds or settings.model_load_timeout_seconds) + 10
         try:
-            await asyncio.wait_for(
-                event.wait(),
-                timeout=settings.model_load_timeout_seconds + 10,
-            )
+            await asyncio.wait_for(event.wait(), timeout=effective_timeout)
         except asyncio.TimeoutError:
             raise TimeoutError(
                 f"Le modèle '{self._model.id}' n'a pas démarré dans les "
-                f"{settings.model_load_timeout_seconds + 10}s imparties."
+                f"{effective_timeout}s imparties."
             )
 
         if self._load_error:
@@ -231,7 +229,8 @@ class ServerManager:
         Lève RuntimeError si le processus meurt avant d'être prêt.
         """
         url = self.llama_url("/health")
-        deadline = time.monotonic() + settings.model_load_timeout_seconds
+        timeout = self._model.load_timeout_seconds or settings.model_load_timeout_seconds
+        deadline = time.monotonic() + timeout
 
         async with httpx.AsyncClient(timeout=3.0) as client:
             while time.monotonic() < deadline:
@@ -254,7 +253,7 @@ class ServerManager:
 
         raise TimeoutError(
             f"llama-server '{self._model.id}' n'a pas répondu sur {url} "
-            f"dans les {settings.model_load_timeout_seconds}s."
+            f"dans les {timeout}s."
         )
 
     # ── Déchargement ──────────────────────────────────────────────────────────
@@ -382,5 +381,6 @@ class ServerManager:
                 "flash_attn": self._model.llama_params.flash_attn,
                 "cache_type_k": self._model.llama_params.cache_type_k,
                 "cache_type_v": self._model.llama_params.cache_type_v,
+                "cpu_moe": self._model.llama_params.cpu_moe,
             },
         }

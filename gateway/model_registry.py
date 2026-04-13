@@ -54,6 +54,10 @@ class LlamaParams:
     flash_attn: bool = True
     threads: int = 8
     threads_http: int = 4
+    # Déporte les experts FFN des modèles MoE sur CPU (ex: MiniMax M2.7).
+    # Les couches attention restent sur GPU. Sans ce flag, un MoE massif
+    # ne tient pas en VRAM — llama-server échoue à charger.
+    cpu_moe: bool = False
 
     def __post_init__(self) -> None:
         if self.ubatch_size > self.batch_size:
@@ -88,6 +92,10 @@ class ModelDefinition:
     # Chemin vers le projector multimodal (requis pour la capability 'vision').
     # Sans ce fichier, llama-server retourne 500 sur toute requête avec image.
     mmproj_path: Path | None = None
+    # Timeout de chargement spécifique au modèle (secondes).
+    # Surcharge settings.model_load_timeout_seconds si défini.
+    # Utile pour les modèles massifs (ex: MiniMax M2.7 — 248 GB, ~10 min).
+    load_timeout_seconds: int | None = None
 
     def build_llama_cmd(
         self,
@@ -121,6 +129,8 @@ class ModelDefinition:
         ]
         if p.flash_attn:
             cmd += ["-fa", "on"]
+        if p.cpu_moe:
+            cmd += ["--cpu-moe"]
         if self.mmproj_path is not None and "vision" in self.capabilities:
             cmd += ["--mmproj", str(self.mmproj_path)]
         return cmd
@@ -128,6 +138,21 @@ class ModelDefinition:
     def to_dict(self) -> dict:
         """Sérialise vers le format YAML."""
         p = self.llama_params
+        llama_dict: dict = {
+            "n_gpu_layers": p.n_gpu_layers,
+            "ctx_size": p.ctx_size,
+            "parallel": p.parallel,
+            "batch_size": p.batch_size,
+            "ubatch_size": p.ubatch_size,
+            "cache_type_k": p.cache_type_k,
+            "cache_type_v": p.cache_type_v,
+            "flash_attn": p.flash_attn,
+            "threads": p.threads,
+            "threads_http": p.threads_http,
+        }
+        if p.cpu_moe:
+            llama_dict["cpu_moe"] = True
+
         d: dict = {
             "id": self.id,
             "path": str(self.path),
@@ -135,21 +160,12 @@ class ModelDefinition:
             "vram_gb": self.vram_gb,
             "enabled": self.enabled,
             "capabilities": list(self.capabilities),
-            "llama_params": {
-                "n_gpu_layers": p.n_gpu_layers,
-                "ctx_size": p.ctx_size,
-                "parallel": p.parallel,
-                "batch_size": p.batch_size,
-                "ubatch_size": p.ubatch_size,
-                "cache_type_k": p.cache_type_k,
-                "cache_type_v": p.cache_type_v,
-                "flash_attn": p.flash_attn,
-                "threads": p.threads,
-                "threads_http": p.threads_http,
-            },
+            "llama_params": llama_dict,
         }
         if self.mmproj_path is not None:
             d["mmproj_path"] = str(self.mmproj_path)
+        if self.load_timeout_seconds is not None:
+            d["load_timeout_seconds"] = self.load_timeout_seconds
         return d
 
 
@@ -229,6 +245,15 @@ class ModelRegistry:
                 model_id,
             )
 
+        raw_timeout = entry.get("load_timeout_seconds")
+        load_timeout_seconds: int | None = None
+        if raw_timeout is not None:
+            load_timeout_seconds = int(raw_timeout)
+            if load_timeout_seconds < 30:
+                raise ValueError(
+                    f"[{model_id}] load_timeout_seconds doit être ≥ 30, reçu : {load_timeout_seconds}"
+                )
+
         return ModelDefinition(
             id=model_id,
             path=path,
@@ -238,6 +263,7 @@ class ModelRegistry:
             capabilities=capabilities,
             llama_params=llama_params,
             mmproj_path=mmproj_path,
+            load_timeout_seconds=load_timeout_seconds,
         )
 
     def _validate_model_id(self, model_id: str) -> None:
