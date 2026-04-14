@@ -129,14 +129,17 @@ async def metrics_users(
     period_days = _period_to_days(period)
     rows = await db.get_user_period_stats(period_days=period_days)
 
-    # Calculer le % quota utilisé si une limite est définie
+    # Calculer le % quota utilisé si une limite est définie.
+    # On utilise tokens_30d (toujours sur 30 jours glissants) pour que la
+    # comparaison avec monthly_token_limit reste correcte quelle que soit
+    # la période d'affichage sélectionnée dans le dashboard.
     result = []
     for row in rows:
         entry = dict(row)
         limit = entry.get("monthly_token_limit", 0)
         if limit and limit > 0:
             entry["quota_used_pct"] = round(
-                min(entry["total_tokens"] / limit * 100, 100), 1
+                min(entry["tokens_30d"] / limit * 100, 100), 1
             )
         else:
             entry["quota_used_pct"] = None  # Illimité

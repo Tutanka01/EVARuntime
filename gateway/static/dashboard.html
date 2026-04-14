@@ -1249,8 +1249,8 @@
       <table>
          <thead>
            <tr>
-             <th>User</th><th>Requests</th><th>Tokens</th>
-             <th>Quota</th><th>RPM</th><th title="Estimated cost if this usage had gone through Claude Sonnet 3.7 ($3/M input · $15/M output)">≈ Claude Sonnet cost</th><th>Last active</th><th>Status</th>
+             <th>User</th><th>Requests</th><th id="th-tokens">Tokens</th>
+             <th title="Monthly quota used — always based on the last 30 days regardless of the period filter">Quota (30d)</th><th>RPM</th><th title="Estimated cost if this usage had gone through Claude Sonnet 3.7 ($3/M input · $15/M output)">≈ Claude Sonnet cost</th><th>Last active</th><th>Status</th>
            </tr>
          </thead>
         <tbody id="users-tbody">
@@ -1664,7 +1664,11 @@ async function fetchStatusCodes(period) {
 }
 
 async function fetchUsers() {
-  try { renderUsers(await apiGet('users', { period: periods.users })); }
+  try {
+    const th = document.getElementById('th-tokens');
+    if (th) th.textContent = 'Tokens (' + periods.users + ')';
+    renderUsers(await apiGet('users', { period: periods.users }));
+  }
   catch(e) { console.error('users', e); }
 }
 
@@ -1769,7 +1773,7 @@ function renderUsers(rows) {
      return;
    }
    tbody.innerHTML = rows.map(u => {
-     const q = buildQuotaBar(u.total_tokens, u.monthly_token_limit, u.quota_used_pct);
+     const q = buildQuotaBar(u.tokens_30d, u.monthly_token_limit, u.quota_used_pct);
      const costCell = renderClaudeCostCell(u.prompt_tokens, u.completion_tokens);
      return `<tr>
        <td class="td-user ${u.is_active ? '' : 'user-inactive'}">${esc(u.username)}</td>

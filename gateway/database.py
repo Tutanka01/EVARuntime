@@ -508,6 +508,12 @@ async def get_user_period_stats(period_days: int = 30) -> list[dict]:
     """
     Statistiques par utilisateur sur une période donnée.
     Inclut les limites quota pour afficher les barres de progression.
+
+    - total_tokens / prompt_tokens / completion_tokens / request_count :
+      agrégés sur la fenêtre glissante `period_days`.
+    - tokens_30d : toujours calculé sur les 30 derniers jours, utilisé
+      pour comparer correctement au monthly_token_limit quelle que soit
+      la période d'affichage sélectionnée.
     """
     async with get_db() as db:
         rows = await (await db.execute(
@@ -524,7 +530,14 @@ async def get_user_period_stats(period_days: int = 30) -> list[dict]:
                 COUNT(CASE WHEN l.status_code IS NOT NULL
                            AND l.status_code != 200 THEN 1 END) AS error_count,
                 AVG(l.duration_ms)                   AS avg_latency_ms,
-                MAX(l.timestamp)                     AS last_request
+                MAX(l.timestamp)                     AS last_request,
+                -- Toujours sur 30 jours fixes pour le calcul de quota mensuel
+                COALESCE((
+                    SELECT SUM(l2.total_tokens)
+                    FROM usage_log l2
+                    WHERE l2.user_id = u.id
+                      AND l2.timestamp >= datetime('now', '-30 days')
+                ), 0)                                AS tokens_30d
             FROM users u
             LEFT JOIN usage_log l
                 ON l.user_id = u.id
