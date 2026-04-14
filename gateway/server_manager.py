@@ -75,6 +75,11 @@ class ServerManager:
         self._load_error: Exception | None = None
         self._idle_task: asyncio.Task | None = None
 
+        # Compteur de requêtes actuellement en cours sur ce modèle.
+        # Incrémenté par pin() avant de proxifier, décrémenté par unpin() après.
+        # En asyncio single-thread, les opérations entières sont atomiques — pas de lock.
+        self._active_requests: int = 0
+
     # ── Propriétés publiques ──────────────────────────────────────────────────
 
     @property
@@ -100,6 +105,30 @@ class ServerManager:
         if self._last_request_time == 0:
             return 0.0
         return time.monotonic() - self._last_request_time
+
+    @property
+    def is_pinned(self) -> bool:
+        """True si au moins une requête est en cours sur ce modèle — interdit l'éviction."""
+        return self._active_requests > 0
+
+    @property
+    def active_requests(self) -> int:
+        return self._active_requests
+
+    def pin(self) -> None:
+        """
+        Signale le début d'une requête active.
+        Appelé juste avant de proxifier vers llama-server.
+        Atomique en asyncio single-thread (pas de lock nécessaire).
+        """
+        self._active_requests += 1
+
+    def unpin(self) -> None:
+        """
+        Signale la fin d'une requête active (terminée, exception ou client déconnecté).
+        Toujours appelé depuis un bloc finally — ne peut pas être oublié.
+        """
+        self._active_requests = max(0, self._active_requests - 1)
 
     def llama_url(self, path: str) -> str:
         """URL complète vers llama-server pour ce modèle."""
@@ -374,6 +403,7 @@ class ServerManager:
             "port": self._port,
             "uptime_seconds": self.uptime_seconds,
             "idle_seconds": round(self.idle_seconds, 1) if self._last_request_time else None,
+            "active_requests": self._active_requests,
             "llama_params": {
                 "n_gpu_layers": self._model.llama_params.n_gpu_layers,
                 "ctx_size": self._model.llama_params.ctx_size,

@@ -148,6 +148,21 @@ class ModelManager:
             )
             evicted = await self._evict_lru_idle(exclude=model.id)
             if not evicted:
+                # Distinguer : manque de VRAM brut vs modèles actifs non évictables
+                busy_models = [
+                    mid for mid, mgr in self._managers.items()
+                    if mid != model.id
+                    and mgr.state == ModelState.READY
+                    and mgr.is_pinned
+                ]
+                if busy_models:
+                    busy_list = ", ".join(f"'{m}'" for m in busy_models)
+                    raise RuntimeError(
+                        f"VRAM insuffisante pour charger '{model.id}' "
+                        f"({model.vram_gb:.1f} GB requis, {self._available_vram_gb():.1f} GB disponibles). "
+                        f"Les modèles {busy_list} ont des requêtes en cours et ne peuvent pas être évincés. "
+                        f"Réessayez dans quelques secondes."
+                    )
                 raise RuntimeError(
                     f"VRAM insuffisante pour charger '{model.id}' "
                     f"({model.vram_gb:.1f} GB requis, {self._available_vram_gb():.1f} GB disponibles). "
@@ -161,10 +176,14 @@ class ModelManager:
         Retourne True si un modèle a été évincé, False si aucun candidat.
         Doit être appelé sous _pool_lock (relâche brièvement pour await).
         """
-        # Candidats : modèles READY non exclus
+        # Candidats : modèles READY, non exclus, et sans requête active en cours.
+        # Un modèle pinned (is_pinned=True) est en train de servir une requête —
+        # le tuer casserait la connexion de l'utilisateur en cours.
         candidates = [
             (mid, mgr) for mid, mgr in self._managers.items()
-            if mid != exclude and mgr.state == ModelState.READY
+            if mid != exclude
+            and mgr.state == ModelState.READY
+            and not mgr.is_pinned
         ]
         if not candidates:
             return False

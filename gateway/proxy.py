@@ -128,6 +128,9 @@ async def proxy_request(
     start_time = time.monotonic()
 
     if is_streaming:
+        # Le pin est géré DANS le générateur (_stream_proxy appelle manager.pin() en premier
+        # et manager.unpin() dans son finally). Ainsi le modèle reste protégé pendant toute
+        # la durée du stream, y compris en cas de déconnexion client (GeneratorExit → finally).
         return StreamingResponse(
             _stream_proxy(path, body, user, request_id, start_time, manager),
             media_type="text/event-stream",
@@ -138,7 +141,11 @@ async def proxy_request(
             },
         )
     else:
-        return await _non_stream_proxy(path, body, user, request_id, start_time, manager)
+        manager.pin()
+        try:
+            return await _non_stream_proxy(path, body, user, request_id, start_time, manager)
+        finally:
+            manager.unpin()
 
 
 # ── Proxy non-streaming ───────────────────────────────────────────────────────
@@ -216,7 +223,13 @@ async def _stream_proxy(
     détecter si le modèle fait un tool_call. Si oui, on supprime le texte
     "thinking aloud" (content) avant les tool_calls — le SDK Vercel AI
     n'accepte pas un stream avec content + tool_calls mélangés.
+
+    Pin/unpin : manager.pin() est appelé en premier (avant tout yield) et
+    manager.unpin() est garanti dans le finally, même en cas de déconnexion
+    client (GeneratorExit) ou d'exception réseau. Cela protège le modèle
+    contre une éviction LRU pendant toute la durée du stream.
     """
+    manager.pin()
     prompt_tokens = 0
     completion_tokens = 0
     status_code = 200
@@ -311,6 +324,10 @@ async def _stream_proxy(
         err = _sse_error("Erreur de connexion au backend d'inférence.")
         yield err.encode()
         status_code = 502
+    finally:
+        # Garantie absolue : unpin même si le client se déconnecte (GeneratorExit),
+        # si une exception réseau survient, ou si le stream se termine normalement.
+        manager.unpin()
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
