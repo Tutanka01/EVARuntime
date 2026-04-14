@@ -542,6 +542,87 @@ curl -s -X PATCH "$GW/admin/models/llama-3.1-8b-instruct" \
   -d '{"enabled": true}'
 ```
 
+### Modifier les paramètres llama-server (hot-reload)
+
+Il est possible de modifier **à chaud** les paramètres de lancement d'un modèle
+(`ctx_size`, `parallel`, `cpu_moe`, etc.) sans redémarrer le gateway.
+
+Le PATCH déclenche un **hot-reload** : le modèle est déchargé immédiatement
+(sa VRAM est libérée), le registre est mis à jour, et le prochain appel relancera
+llama-server avec les nouveaux paramètres.
+
+> **`llama_params` utilise une sémantique de remplacement complet.** Tous les champs
+> doivent être fournis — il n'y a pas de merge partiel. Récupérez les valeurs actuelles
+> via `GET /admin/models/{id}` avant de faire le PATCH.
+
+```bash
+# Récupérer la config actuelle d'un modèle
+curl -s "$GW/admin/models/qwen3.5-9b-q5_k_m" \
+  -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# Corriger un modèle MoE qui saturait la VRAM (ajout de cpu_moe)
+curl -s -X PATCH "$GW/admin/models/qwen3.5-9b-q5_k_m" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "llama_params": {
+      "n_gpu_layers": 999,
+      "ctx_size": 32768,
+      "parallel": 4,
+      "batch_size": 2048,
+      "ubatch_size": 512,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": true,
+      "threads": 8,
+      "threads_http": 4,
+      "cpu_moe": true
+    }
+  }'
+
+# Réduire la fenêtre de contexte pour libérer de la VRAM KV
+curl -s -X PATCH "$GW/admin/models/llama-3.3-70b-instruct" \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "llama_params": {
+      "n_gpu_layers": 999,
+      "ctx_size": 16384,
+      "parallel": 4,
+      "batch_size": 4096,
+      "ubatch_size": 512,
+      "cache_type_k": "q8_0",
+      "cache_type_v": "q8_0",
+      "flash_attn": true,
+      "threads": 8,
+      "threads_http": 4,
+      "cpu_moe": false
+    }
+  }'
+```
+
+**Champs disponibles dans `llama_params` :**
+
+| Champ | Type | Défaut | Description |
+|-------|------|--------|-------------|
+| `n_gpu_layers` | int | 999 | Couches GPU (999 = tout en GPU) |
+| `ctx_size` | int | 32768 | Contexte total (somme de tous les slots) |
+| `parallel` | int | 4 | Slots d'inférence concurrents |
+| `batch_size` | int | 4096 | Taille de batch logique |
+| `ubatch_size` | int | 512 | Taille de micro-batch physique |
+| `cache_type_k` | str | `q8_0` | Quantisation du KV cache (K) |
+| `cache_type_v` | str | `q8_0` | Quantisation du KV cache (V) |
+| `flash_attn` | bool | true | Flash Attention 2 (Ada Lovelace) |
+| `threads` | int | 8 | Threads CPU pour le calcul |
+| `threads_http` | int | 4 | Threads HTTP de llama-server |
+| `cpu_moe` | bool | false | **MoE uniquement** — déporte les experts FFN sur RAM CPU |
+
+> **`cpu_moe: true`** est indispensable pour les modèles MoE (Mixtral, Qwen-MoE, MiniMax…)
+> quand les experts ne tiennent pas en VRAM. Sans ce flag, llama-server alloue tous les
+> experts en GPU → CUDA OOM → exit code 1 immédiat. Le `vram_gb` déclaré dans le registre
+> doit correspondre à l'utilisation **avec** `cpu_moe` (uniquement les couches attention +
+> embeddings restent en GPU).
+
 ### Enregistrer un nouveau modèle (sans redémarrage)
 
 ```bash
@@ -678,7 +759,7 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 | `GET` | `/admin/models` | Lister tous les modèles (registre + état live) |
 | `POST` | `/admin/models` | Enregistrer un nouveau modèle (persiste dans models.yaml) |
 | `GET` | `/admin/models/{model_id}` | Détail d'un modèle (registre + état live) |
-| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle (enabled, vram_gb, description) |
+| `PATCH` | `/admin/models/{model_id}` | Modifier un modèle — `enabled`, `vram_gb`, `description`, `llama_params` (hot-reload) |
 | `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (seulement si non chargé) |
 | `POST` | `/admin/models/{model_id}/load` | Pré-charger un modèle en VRAM |
 | `POST` | `/admin/models/{model_id}/unload` | Décharger un modèle spécifique |
@@ -810,7 +891,7 @@ curl -s "$GW/admin/metrics/overview" \
 ### Politique de gestion des modèles
 
 - Maintenir `vram_gb` à jour dans `models.yaml` si vous modifiez `ctx_size` ou `parallel`
-  (la VRAM réelle change avec le KV cache)
+  (la VRAM réelle change avec le KV cache — voir formule dans `docs/architecture.md`)
 - Désactiver (`enabled: false`) les modèles dont le fichier `.gguf` n'est pas encore
   téléchargé, plutôt que de les supprimer
 - Surveiller `idle_seconds` dans `/admin/status` pour identifier les modèles rarement
@@ -818,6 +899,14 @@ curl -s "$GW/admin/metrics/overview" \
 - Pour tout modèle vision : s'assurer que `mmproj_path` est renseigné **avant**
   d'activer le modèle — un modèle vision sans `mmproj_path` provoque des HTTP 500
   silencieux (llama-server démarre, mais échoue à chaque requête avec image)
+- Pour les **modèles MoE** (Mixtral, Qwen-MoE, MiniMax, Gemma-MoE…) : toujours activer
+  `cpu_moe: true` dans `llama_params` si les experts FFN ne tiennent pas en VRAM. Le
+  `vram_gb` doit refléter la consommation **avec** `cpu_moe` (attention + embeddings
+  seulement). Sans ce flag, llama-server crashe avec exit code 1 dès qu'un autre modèle
+  est chargé simultanément. Corriger à chaud via `PATCH /admin/models/{id}`.
+- Si un modèle crashe au chargement (exit code 1), les **dernières lignes de stderr**
+  sont désormais incluses dans le message d'erreur retourné au client et dans les logs
+  gateway — chercher `Stderr (dernières N lignes)` dans `journalctl -u llm-gateway`.
 
 ### Sécurité de l'`ADMIN_SECRET`
 

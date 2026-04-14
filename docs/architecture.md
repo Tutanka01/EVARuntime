@@ -142,7 +142,7 @@ UNLOADED ──► LOADING ──► READY ──► UNLOADING ──► UNLOADE
                └──── UNLOADED ──────────┘
 ```
 
-### Flux de décision avant chargement
+### Flux de décision avant chargement (`_ensure_capacity`)
 
 ```
 ensure_model_loaded("llama-3.1-8b")
@@ -161,23 +161,33 @@ Déjà READY ? ──oui──► retourner le manager (fast path, sans lock)
        non
         ▼
 [LOCK acquis]
-available_vram ≥ model.vram_gb ?
+┌─ available_vram ≥ model.vram_gb ? ─┐
+│  ET                                 │
+└─ pool de ports non vide ?          ─┘
     ──oui──► allouer port, créer ServerManager, lancer
-    ──non──► éviction LRU (modèle READY le plus ancien)
+    ──non──► éviction LRU (modèle READY le plus ancien, non pinné)
                     │
-                    ├─ modèle idle trouvé → unload → recommencer
-                    └─ aucun idle disponible → RuntimeError → 503
+                    ├─ modèle idle trouvé → unload → recommencer la vérification
+                    ├─ aucun idle mais modèles LOADING → RuntimeError 503
+                    │  "Réessayez dans quelques secondes"
+                    └─ aucun idle, tous pinnés → RuntimeError 503
+                       liste des modèles avec requêtes actives
 ```
+
+**Point critique** : les deux contraintes (VRAM **et** pool de ports) déclenchent
+l'éviction LRU. Avant ce comportement, un pool de ports plein retournait un 503 immédiat
+même si la VRAM aurait permis le chargement — le modèle le plus récemment utilisé
+n'était pas évincé pour libérer un slot.
 
 ### Éviction LRU
 
-L'algorithme évinçe uniquement les modèles en état `READY` (pas ceux avec des
-inférences en cours — le `last_request_time` reflète la fin de la dernière
-requête). Le modèle avec le `_last_request_time` le plus ancien est choisi.
+L'algorithme évinçe uniquement les modèles en état `READY` et non pinnés
+(aucune requête active en cours). Le modèle avec le `_last_request_time` le plus
+ancien est choisi.
 
 **Propriété de sécurité :** une inférence en cours ne peut jamais être
-interrompue par l'éviction. Seuls les modèles idle (aucune requête active)
-sont candidats.
+interrompue par l'éviction. `is_pinned` (compteur `_active_requests > 0`) protège
+le modèle entre `manager.pin()` (avant proxy) et `manager.unpin()` (dans le finally).
 
 ---
 
@@ -263,6 +273,72 @@ def _on_model_unloaded(self, model_id):
 Le callback `on_unload` est appelé par `ServerManager.unload()` après
 déchargement complet — quelle que soit la cause (idle timeout, admin, LRU
 eviction, shutdown). Cette conception garantit qu'aucun port ne fuit.
+
+**Interaction avec l'éviction VRAM :** le pool de ports est une contrainte
+indépendante de la VRAM. `_ensure_capacity` les vérifie ensemble : si tous les
+slots sont occupés mais que la VRAM permettrait un modèle supplémentaire, une
+éviction LRU est quand même déclenchée pour libérer un port.
+
+---
+
+## Modèles MoE et `--cpu-moe`
+
+Les architectures MoE (Mixture of Experts) ont un volume de poids total bien
+supérieur au nombre de paramètres actifs par token. Sans `--cpu-moe`, llama-server
+alloue **l'intégralité des experts FFN** en VRAM au démarrage.
+
+```
+Modèle MoE 27B — sans --cpu-moe
+  Poids GPU = 27B paramètres × 5.5 bits ÷ 8 ≈ 18.6 GB
+  → trop pour coexister avec un autre modèle de 26.9 GB (total ≈ 45.5 GB > 43.6 budget)
+  → exit code 1 (CUDA OOM) au chargement
+
+Modèle MoE 27B — avec --cpu-moe
+  GPU = couches attention + embeddings ≈ 5–8 GB
+  CPU = experts FFN (RAM système)
+  → coexistence possible sur L40S 48GB
+```
+
+**Règle de dimensionnement** : le `vram_gb` déclaré dans `models.yaml` doit
+correspondre à la consommation **avec** `cpu_moe` si le flag est activé :
+
+```yaml
+- id: "qwen3.5-9b-q5_k_m"    # 9b = 9B paramètres actifs, 27B total
+  vram_gb: 7.0                # CORRECT avec cpu_moe: true (attention + KV cache seulement)
+  llama_params:
+    cpu_moe: true             # experts FFN → RAM CPU
+```
+
+Sans `cpu_moe`, `vram_gb: 7.0` serait faux (réalité ≈ 18-28 GB selon le modèle),
+le budget VRAM sous-estimerait la consommation, et le processus planterait en cours
+de chargement plutôt que d'être refusé par l'éviction LRU.
+
+Le flag `cpu_moe` peut être activé à chaud via
+`PATCH /admin/models/{id}` → `{"llama_params": {..., "cpu_moe": true}}`.
+Le hot-reload décharge le modèle et le relance avec `--cpu-moe` à la prochaine requête.
+
+---
+
+## Diagnostic de crash — buffer stderr
+
+Quand llama-server s'arrête prématurément (exit code ≠ 0), la raison est dans
+son stderr : CUDA OOM, mauvais chemin de modèle, driver incompatible, etc.
+
+`ServerManager` maintient un buffer circulaire des 30 dernières lignes de stderr
+(`deque(maxlen=30)` alimenté par `_drain_logs`). Quand `_wait_for_health` détecte
+un returncode non nul, il attend 150ms pour laisser le drain vider le pipe, puis
+construit le message d'erreur avec le tail :
+
+```python
+raise RuntimeError(
+    f"llama-server '{model.id}' s'est terminé prématurément (code {returncode}).\n"
+    f"Stderr (dernières {n} lignes) :\n  {tail_text}"
+)
+```
+
+Ce message est propagé dans les logs gateway au niveau ERROR et dans la réponse
+HTTP 503 retournée au client, ce qui rend le diagnostic immédiat sans avoir à
+ouvrir le fichier de log du sous-processus.
 
 ---
 
