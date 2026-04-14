@@ -10,7 +10,8 @@ Responsabilités :
 
 Logique budget VRAM :
     budget_net = total_vram_gb - vram_overhead_gb - (total_vram_gb × vram_safety_margin)
-    avant chargement : si used_vram + model.vram_gb > budget_net → éviction LRU
+    avant chargement : si used_vram + model.vram_gb > budget_net OU pool de ports vide → éviction LRU
+    Les deux contraintes (VRAM et port) déclenchent l'éviction — pas seulement la VRAM.
 
 Concurrence :
     asyncio.Lock sur toutes les transitions de pool (chargement, éviction, déchargement).
@@ -83,19 +84,13 @@ class ModelManager:
         async with self._pool_lock:
             # Re-vérifier après acquisition du lock
             manager = self._managers.get(model_id)
-            if manager and manager.state in (ModelState.READY, ModelState.LOADING):
-                # Déjà en cours — on attend hors du lock ci-dessous
+            if manager and manager.state in (ModelState.READY, ModelState.LOADING, ModelState.UNLOADED):
+                # Déjà en cours (ou créé mais pas encore démarré) — on attend hors du lock ci-dessous
                 pass
             else:
-                # Nouveau chargement : vérifier le budget VRAM
-                await self._ensure_vram_budget(model)
+                # Nouveau chargement : vérifier VRAM + disponibilité d'un port
+                await self._ensure_capacity(model)
 
-                # Allouer un port
-                if not self._port_pool:
-                    raise RuntimeError(
-                        f"Pool de ports épuisé ({settings.max_loaded_models} modèles max). "
-                        f"Déchargez un modèle via POST /admin/models/{{id}}/unload."
-                    )
                 port = self._port_pool.pop(0)
                 self._allocated_ports[model_id] = port
 
@@ -133,22 +128,33 @@ class ModelManager:
         """Budget VRAM disponible pour un nouveau modèle."""
         return settings.effective_vram_budget_gb() - self._used_vram_gb()
 
-    async def _ensure_vram_budget(self, model: ModelDefinition) -> None:
+    async def _ensure_capacity(self, model: ModelDefinition) -> None:
         """
-        Vérifie que le budget VRAM permet de charger le modèle.
-        Évinçe des modèles LRU idle jusqu'à avoir suffisamment d'espace.
+        Vérifie que VRAM et port sont disponibles pour charger le modèle.
+        Évinçe des modèles LRU idle (READY, non pinnés) jusqu'à avoir :
+          - assez de VRAM  (available_vram >= model.vram_gb)
+          - au moins un port libre dans le pool
+        Les deux contraintes déclenchent l'éviction — pas seulement la VRAM.
         Lève RuntimeError si impossible (aucun modèle idle à évincer).
         Doit être appelé sous _pool_lock.
         """
-        while self._available_vram_gb() < model.vram_gb:
+        while self._available_vram_gb() < model.vram_gb or not self._port_pool:
+            reasons: list[str] = []
+            if self._available_vram_gb() < model.vram_gb:
+                reasons.append(
+                    f"VRAM insuffisante (besoin {model.vram_gb:.1f} GB, "
+                    f"disponible {self._available_vram_gb():.1f} GB)"
+                )
+            if not self._port_pool:
+                reasons.append(
+                    f"pool de ports épuisé ({settings.max_loaded_models} modèles simultanés max)"
+                )
             log.warning(
-                "Budget VRAM insuffisant pour '%s' (besoin %.1f GB, disponible %.1f GB) "
-                "— tentative d'éviction LRU…",
-                model.id, model.vram_gb, self._available_vram_gb(),
+                "Capacité insuffisante pour '%s' — %s — tentative d'éviction LRU…",
+                model.id, " | ".join(reasons),
             )
             evicted = await self._evict_lru_idle(exclude=model.id)
             if not evicted:
-                # Distinguer : manque de VRAM brut vs modèles actifs non évictables
                 busy_models = [
                     mid for mid, mgr in self._managers.items()
                     if mid != model.id
@@ -158,14 +164,25 @@ class ModelManager:
                 if busy_models:
                     busy_list = ", ".join(f"'{m}'" for m in busy_models)
                     raise RuntimeError(
-                        f"VRAM insuffisante pour charger '{model.id}' "
-                        f"({model.vram_gb:.1f} GB requis, {self._available_vram_gb():.1f} GB disponibles). "
+                        f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
                         f"Les modèles {busy_list} ont des requêtes en cours et ne peuvent pas être évincés. "
                         f"Réessayez dans quelques secondes."
                     )
+                # Aucun candidat READY non pinné — tous les slots sont soit en cours de chargement
+                # soit occupés par des requêtes actives.
+                loading_models = [
+                    mid for mid, mgr in self._managers.items()
+                    if mid != model.id and mgr.state == ModelState.LOADING
+                ]
+                if loading_models:
+                    loading_list = ", ".join(f"'{m}'" for m in loading_models)
+                    raise RuntimeError(
+                        f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
+                        f"Les modèles {loading_list} sont en cours de chargement et ne peuvent pas être évincés. "
+                        f"Réessayez dans quelques secondes une fois leur chargement terminé."
+                    )
                 raise RuntimeError(
-                    f"VRAM insuffisante pour charger '{model.id}' "
-                    f"({model.vram_gb:.1f} GB requis, {self._available_vram_gb():.1f} GB disponibles). "
+                    f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
                     f"Aucun modèle idle à évincer. Attendez la fin des requêtes en cours "
                     f"ou déchargez un modèle manuellement via POST /admin/models/{{id}}/unload."
                 )

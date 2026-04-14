@@ -73,6 +73,47 @@ models:
       threads_http: 4
       cpu_moe: true            # --cpu-moe : déporte les experts FFN sur CPU pour tenir en VRAM
 
+  - id: "gemma-4-26b-a4b"
+    path: "/models/gemma-4-26b-it-a4b-Q4_K_M.gguf"    # À ajuster selon le chemin réel
+    description: "Gemma4 with MoE architecture"
+    vram_gb: 26.9
+    enabled: true
+    load_timeout_seconds: 300    # MoE — chargement plus lent, surtout en parallèle
+    capabilities:
+      - text_generation
+      - streaming
+    llama_params:
+      n_gpu_layers: 999
+      ctx_size: 16384             # Réduit pour coexister avec qwen3.5-9b (~7 GB) sur 48 GB
+      parallel: 2
+      batch_size: 2048
+      ubatch_size: 512
+      cache_type_k: "q8_0"
+      cache_type_v: "q8_0"
+      flash_attn: true
+      threads: 8
+      threads_http: 4
+
+  - id: "qwen3.5-9b-q5_k_m"
+    path: "/models/Qwen2.5-9B-Instruct-Q5_K_M.gguf"   # À ajuster selon le chemin réel
+    description: "Qwen2.5 27B de parametres"
+    vram_gb: 7.0
+    enabled: true
+    capabilities:
+      - text_generation
+      - streaming
+    llama_params:
+      n_gpu_layers: 999
+      ctx_size: 32768
+      parallel: 4
+      batch_size: 2048
+      ubatch_size: 512
+      cache_type_k: "q8_0"
+      cache_type_v: "q8_0"
+      flash_attn: true
+      threads: 4
+      threads_http: 2
+
   - id: "llama-3.1-8b-instruct"
     path: "/models/Llama-3.1-8B-Instruct-Q4_K_M.gguf"
     description: "Llama 3.1 8B Instruct, quantisé Q4_K_M — modèle léger / test"
