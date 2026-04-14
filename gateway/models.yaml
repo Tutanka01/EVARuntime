@@ -95,9 +95,9 @@ models:
       threads_http: 4
 
   - id: "qwen3.5-9b-q5_k_m"
-    path: "/models/Qwen2.5-9B-Instruct-Q5_K_M.gguf"   # À ajuster selon le chemin réel
-    description: "Qwen2.5 27B de parametres"
-    vram_gb: 7.0
+    path: "/data/models/qwen3.5-27B-Claude/Qwen3.5-27B.Q5_K_M.gguf"
+    description: "Qwen3.5 27B MoE (9B active params), Q5_K_M — experts FFN sur CPU, attention sur GPU"
+    vram_gb: 7.0                 # Correct AVEC --cpu-moe : seules les couches attention + embeddings sont en GPU
     enabled: true
     capabilities:
       - text_generation
@@ -111,8 +111,9 @@ models:
       cache_type_k: "q8_0"
       cache_type_v: "q8_0"
       flash_attn: true
-      threads: 4
-      threads_http: 2
+      threads: 8               # Plus de threads pour les experts CPU
+      threads_http: 4
+      cpu_moe: true            # OBLIGATOIRE — sans ce flag les experts FFN saturent la VRAM
 
   - id: "llama-3.1-8b-instruct"
     path: "/models/Llama-3.1-8B-Instruct-Q4_K_M.gguf"

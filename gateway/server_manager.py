@@ -25,6 +25,7 @@ import logging
 import os
 import signal
 import time
+from collections import deque
 from collections.abc import Callable
 from enum import Enum
 
@@ -79,6 +80,9 @@ class ServerManager:
         # Incrémenté par pin() avant de proxifier, décrémenté par unpin() après.
         # En asyncio single-thread, les opérations entières sont atomiques — pas de lock.
         self._active_requests: int = 0
+
+        # Buffer des dernières lignes stderr — alimenté par _drain_logs, lu au crash.
+        self._stderr_tail: deque[str] = deque(maxlen=30)
 
     # ── Propriétés publiques ──────────────────────────────────────────────────
 
@@ -237,7 +241,10 @@ class ServerManager:
         asyncio.create_task(self._drain_logs())
 
     async def _drain_logs(self) -> None:
-        """Lit les sorties de llama-server pour éviter le blocage du pipe."""
+        """
+        Lit le stderr de llama-server en continu pour éviter le blocage du pipe.
+        Alimente _stderr_tail (30 lignes max) pour diagnostic en cas de crash.
+        """
         if not self._process:
             return
         llama_log = logging.getLogger(f"llama-server.{self._model.id}")
@@ -247,7 +254,9 @@ class ServerManager:
                     line = await self._process.stderr.readline()
                     if not line:
                         break
-                    llama_log.debug(line.decode(errors="replace").rstrip())
+                    decoded = line.decode(errors="replace").rstrip()
+                    self._stderr_tail.append(decoded)
+                    llama_log.debug(decoded)
         except Exception:
             pass
 
@@ -255,7 +264,8 @@ class ServerManager:
         """
         Poll /health toutes les 2s jusqu'à {"status": "ok"}.
         Lève TimeoutError si le serveur ne répond pas dans le délai configuré.
-        Lève RuntimeError si le processus meurt avant d'être prêt.
+        Lève RuntimeError si le processus meurt avant d'être prêt — inclut les
+        dernières lignes stderr pour diagnostic (CUDA OOM, mauvais chemin, etc.).
         """
         url = self.llama_url("/health")
         timeout = self._model.load_timeout_seconds or settings.model_load_timeout_seconds
@@ -264,9 +274,14 @@ class ServerManager:
         async with httpx.AsyncClient(timeout=3.0) as client:
             while time.monotonic() < deadline:
                 if self._process and self._process.returncode is not None:
+                    # Laisser _drain_logs vider le pipe avant de lire le tail
+                    await asyncio.sleep(0.15)
+                    tail = list(self._stderr_tail)
+                    tail_text = "\n  ".join(tail) if tail else "(aucune sortie capturée)"
                     raise RuntimeError(
                         f"llama-server '{self._model.id}' s'est terminé prématurément "
-                        f"(code {self._process.returncode})"
+                        f"(code {self._process.returncode}).\n"
+                        f"Stderr (dernières {len(tail)} lignes) :\n  {tail_text}"
                     )
 
                 try:

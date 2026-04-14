@@ -368,12 +368,27 @@ class ModelRegistry:
 
     def update(self, model_id: str, **kwargs) -> ModelDefinition:
         """
-        Met à jour les champs d'un modèle (vram_gb, description, enabled).
+        Met à jour les champs d'un modèle (vram_gb, description, enabled, llama_params).
         Ne modifie pas l'ID ni le path (pour ça, supprimer et re-créer).
+
+        llama_params — remplacement complet si fourni (dict ou objet avec .model_dump()).
+        L'appelant est responsable de décharger le modèle si llama_params change,
+        car le processus llama-server en cours utilise encore les anciens paramètres.
         """
         model = self._models.get(model_id)
         if not model:
             raise KeyError(f"Modèle inconnu : '{model_id}'")
+
+        # Résoudre les nouveaux llama_params si fournis
+        new_llama_params = model.llama_params
+        if "llama_params" in kwargs and kwargs["llama_params"] is not None:
+            lp_raw = kwargs["llama_params"]
+            if hasattr(lp_raw, "model_dump"):
+                lp_raw = lp_raw.model_dump()
+            try:
+                new_llama_params = LlamaParams(**lp_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"llama_params invalide : {exc}") from exc
 
         updated = ModelDefinition(
             id=model.id,
@@ -382,8 +397,9 @@ class ModelRegistry:
             vram_gb=kwargs.get("vram_gb", model.vram_gb),
             enabled=kwargs.get("enabled", model.enabled),
             capabilities=model.capabilities,
-            llama_params=model.llama_params,
+            llama_params=new_llama_params,
             mmproj_path=model.mmproj_path,
+            load_timeout_seconds=model.load_timeout_seconds,
         )
         if updated.vram_gb <= 0:
             raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")

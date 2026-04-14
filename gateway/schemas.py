@@ -119,6 +119,7 @@ class LlamaParamsSchema(BaseModel):
     flash_attn: bool = True
     threads: int = Field(8, ge=1)
     threads_http: int = Field(4, ge=1)
+    cpu_moe: bool = False  # Déporte les experts FFN des modèles MoE sur CPU
 
     @field_validator("ubatch_size")
     @classmethod
@@ -145,10 +146,17 @@ class ModelEntryCreate(BaseModel):
 
 
 class ModelEntryUpdate(BaseModel):
-    """Corps de requête pour PATCH /admin/models/{model_id}."""
+    """
+    Corps de requête pour PATCH /admin/models/{model_id}.
+
+    llama_params — remplacement complet du bloc (pas de merge partiel).
+    Si fourni, le modèle est déchargé et rechargé à la prochaine requête
+    pour prendre en compte les nouveaux paramètres de lancement.
+    """
     enabled: Optional[bool] = None
     vram_gb: Optional[float] = Field(None, gt=0.0)
     description: Optional[str] = Field(None, max_length=200)
+    llama_params: Optional[LlamaParamsSchema] = None
 
 
 # ── Statut système multi-modèles ──────────────────────────────────────────────

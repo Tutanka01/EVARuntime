@@ -24,6 +24,7 @@ from schemas import (
     KeyCreate,
     KeyCreateResponse,
     KeyResponse,
+    LlamaParamsSchema,
     ModelEntryCreate,
     ModelEntryUpdate,
     ModelStatusResponse,
@@ -37,6 +38,34 @@ from schemas import (
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_BYTES_PER_KV_TOKEN: dict[str, float] = {
+    "f16": 2.0,
+    "bf16": 2.0,
+    "q8_0": 1.0,
+    "q5_0": 0.625,
+    "q4_0": 0.5,
+}
+
+
+def _warn_kv_cache(model_id: str, vram_gb: float, lp: LlamaParamsSchema) -> None:
+    """
+    Avertit si le KV cache estimé représente plus de 50 % du vram_gb déclaré.
+    Le calcul est un minorant : il suppose une architecture 7B (128 B/token de KV par couche).
+    Pour les modèles plus grands le vrai cache sera encore plus gros.
+    """
+    bytes_k = _BYTES_PER_KV_TOKEN.get(lp.cache_type_k, 2.0)
+    bytes_v = _BYTES_PER_KV_TOKEN.get(lp.cache_type_v, 2.0)
+    kv_gb = lp.ctx_size * lp.parallel * (bytes_k + bytes_v) * 128 / 1e9
+    if kv_gb > vram_gb * 0.5:
+        log.warning(
+            "[%s] KV cache estimé à %.2f GB (ctx_size=%d × parallel=%d × cache quant) "
+            "dépasse 50%% du vram_gb déclaré (%.1f GB). "
+            "Vérifiez que vram_gb inclut bien les poids ET le KV cache.",
+            model_id, kv_gb, lp.ctx_size, lp.parallel, vram_gb,
+        )
 
 
 # ── Statut système multi-modèles ──────────────────────────────────────────────
@@ -93,6 +122,8 @@ async def register_model(
             ),
         )
 
+    _warn_kv_cache(body.id, body.vram_gb, body.llama_params)
+
     try:
         entry_dict = {
             "id": body.id,
@@ -131,9 +162,13 @@ async def update_model(
     _: None = Depends(require_admin),
 ) -> dict:
     """
-    Met à jour les métadonnées d'un modèle (enabled, vram_gb, description).
-    Si le modèle est actuellement chargé et qu'on le désactive (enabled=false),
-    il est déchargé immédiatement.
+    Met à jour les métadonnées d'un modèle (enabled, vram_gb, description, llama_params).
+
+    llama_params — remplacement complet. Si fourni, le modèle chargé est déchargé
+    immédiatement pour que la prochaine requête le relance avec les nouveaux paramètres.
+    Cela permet de corriger cpu_moe, ctx_size, parallel, etc. sans redémarrer la gateway.
+
+    enabled=false — décharge le modèle immédiatement.
     """
     if not model_manager.registry.get(model_id):
         raise HTTPException(status_code=404, detail=f"Modèle '{model_id}' introuvable dans le registre.")
@@ -147,8 +182,20 @@ async def update_model(
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    # Si désactivé, décharger immédiatement s'il est en mémoire
-    if updates.get("enabled") is False:
+    # Avertissement KV cache si vram_gb ou llama_params ont changé
+    if "vram_gb" in updates or "llama_params" in updates:
+        lp_schema = LlamaParamsSchema(**model.llama_params.__dict__)
+        _warn_kv_cache(model_id, model.vram_gb, lp_schema)
+
+    # Hot-reload : si llama_params changent, le processus doit être relancé
+    if "llama_params" in updates:
+        await model_manager.unload_model(model_id)
+        log.info(
+            "Admin : llama_params modifiés pour '%s' — modèle déchargé, "
+            "rechargement automatique à la prochaine requête.",
+            model_id,
+        )
+    elif updates.get("enabled") is False:
         await model_manager.unload_model(model_id)
         log.info("Admin : modèle '%s' désactivé et déchargé", model_id)
 
