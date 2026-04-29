@@ -1,0 +1,52 @@
+[Unit]
+Description=LLM Gateway Student EVA (FastAPI edge proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmstudent
+Group=llmstudent
+WorkingDirectory=/opt/llm-gateway-student
+EnvironmentFile=/etc/llm-gateway-student/env
+ExecStart=/opt/llm-gateway-student/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8001 --workers 1 --loop uvloop --access-log
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/llm-gateway-student /var/log/llm-gateway-student
+
+IPAddressDeny=any
+IPAddressAllow=127.0.0.0/8
+IPAddressAllow=10.10.0.10
+
+LimitNOFILE=8192
+LimitNPROC=512
+TasksMax=256
+MemoryHigh=512M
+MemoryMax=1G
+
+Restart=on-failure
+RestartSec=5s
+SyslogIdentifier=llm-gateway-student
+
+[Install]
+WantedBy=multi-user.target
+
