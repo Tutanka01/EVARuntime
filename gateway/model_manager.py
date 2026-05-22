@@ -1,21 +1,21 @@
 """
-Gestionnaire du pool de modèles — Budget VRAM + Éviction LRU + Pool de ports.
+Gestionnaire du pool de modèles — façade locale/cluster.
 
-Responsabilités :
-  - Maintenir un pool de ServerManager (un par modèle chargé)
-  - Enforcer le budget VRAM avant chaque chargement
-  - Évincer le modèle le moins récemment utilisé (LRU) si le budget est dépassé
-  - Gérer un pool de ports pour les sous-processus llama-server
-  - Recevoir les callbacks de déchargement (idle + admin) pour nettoyer l'état
+Ce module expose UN SEUL singleton `model_manager` qui est soit :
+  - Un `LocalModelManager`  (CLUSTER_MODE=local, défaut) : comportement historique
+    exact — la gateway lance des sous-processus llama-server en local.
+  - Un `ClusterManager`     (CLUSTER_MODE=cluster) : délègue aux agents distants.
 
-Logique budget VRAM :
-    budget_net = total_vram_gb - vram_overhead_gb - (total_vram_gb × vram_safety_margin)
-    avant chargement : si used_vram + model.vram_gb > budget_net OU pool de ports vide → éviction LRU
-    Les deux contraintes (VRAM et port) déclenchent l'éviction — pas seulement la VRAM.
+Tous les imports existants (`from model_manager import model_manager`) fonctionnent
+sans modification — la sélection est transparente.
 
-Concurrence :
-    asyncio.Lock sur toutes les transitions de pool (chargement, éviction, déchargement).
-    La phase d'attente du chargement (ensure_loaded) se passe hors du lock.
+Interface commune exposée par les deux implémentations :
+    await model_manager.ensure_model_loaded(model_id) → ServerManager | ClusterModelHandle
+    await model_manager.unload_model(model_id)
+    await model_manager.shutdown()
+    await model_manager.start_health_monitor()   # no-op en mode local
+          model_manager.status()
+          model_manager.registry                 → ModelRegistry
 """
 from __future__ import annotations
 
@@ -29,26 +29,33 @@ from server_manager import ModelState, ServerManager
 log = logging.getLogger(__name__)
 
 
-class ModelManager:
+# ── LocalModelManager (mode local — comportement historique) ──────────────────
+
+class LocalModelManager:
     """
-    Singleton gérant le pool de ServerManager actifs.
-    Instancié une fois dans model_manager.py et importé partout.
+    Gestionnaire du pool de ServerManager actifs.
+
+    Responsabilités :
+      - Maintenir un pool de ServerManager (un par modèle chargé)
+      - Enforcer le budget VRAM avant chaque chargement
+      - Évincer le modèle le moins récemment utilisé (LRU) si le budget est dépassé
+      - Gérer un pool de ports pour les sous-processus llama-server
+
+    Concurrence :
+        asyncio.Lock sur toutes les transitions de pool (chargement, éviction, libération).
+        La phase d'attente du chargement se passe hors du lock.
     """
 
     def __init__(self, registry: ModelRegistry) -> None:
         self._registry = registry
 
-        # model_id → ServerManager (uniquement les modèles en cours de chargement ou chargés)
         self._managers: dict[str, ServerManager] = {}
-        # model_id → port alloué
         self._allocated_ports: dict[str, int] = {}
-        # Ports disponibles
         self._port_pool: list[int] = list(range(
             settings.base_llama_port,
             settings.base_llama_port + settings.max_loaded_models,
         ))
 
-        # Lock sur les opérations de pool (chargement / éviction / libération)
         self._pool_lock = asyncio.Lock()
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
@@ -57,11 +64,11 @@ class ModelManager:
         """
         Garantit qu'un modèle est chargé et retourne son ServerManager.
 
-        1. Valide que le modèle est dans le registre et activé
-        2. Fast path si déjà READY
+        1. Valide que le modèle est dans le registre et activé.
+        2. Fast path si déjà READY.
         3. Sous lock : vérifie le budget VRAM, évinçe LRU si nécessaire,
-           alloue un port et crée le ServerManager
-        4. Attend le chargement hors du lock (pour ne pas bloquer les autres requêtes)
+           alloue un port et crée le ServerManager.
+        4. Attend le chargement hors du lock.
         """
         model = self._registry.get(model_id)
         if model is None:
@@ -72,29 +79,21 @@ class ModelManager:
                 f"Activez-le via PATCH /admin/models/{model_id}."
             )
 
-        # Fast path : déjà READY (pas de lock nécessaire)
-        # On passe quand même par ensure_loaded() pour mettre à jour _last_request_time
-        # (fenêtre glissante d'inactivité). Le fast path interne d'ensure_loaded est sans overhead.
         manager = self._managers.get(model_id)
         if manager and manager.state == ModelState.READY:
             await manager.ensure_loaded()
             return manager
 
-        # Slow path : sous lock
         async with self._pool_lock:
-            # Re-vérifier après acquisition du lock
             manager = self._managers.get(model_id)
             if manager and manager.state in (ModelState.READY, ModelState.LOADING, ModelState.UNLOADED):
-                # Déjà en cours (ou créé mais pas encore démarré) — on attend hors du lock ci-dessous
                 pass
             else:
-                # Nouveau chargement : vérifier VRAM + disponibilité d'un port
                 await self._ensure_capacity(model)
 
                 port = self._port_pool.pop(0)
                 self._allocated_ports[model_id] = port
 
-                # Créer le ServerManager avec callback de déchargement
                 manager = ServerManager(
                     model=model,
                     port=port,
@@ -108,14 +107,12 @@ class ModelManager:
                     self._available_vram_gb() - model.vram_gb,
                 )
 
-        # Attendre le chargement hors du lock
         await manager.ensure_loaded()
         return manager
 
     # ── Budget VRAM ───────────────────────────────────────────────────────────
 
     def _used_vram_gb(self) -> float:
-        """VRAM consommée par tous les modèles actuellement READY ou LOADING."""
         total = 0.0
         for model_id, manager in self._managers.items():
             if manager.state in (ModelState.READY, ModelState.LOADING):
@@ -125,17 +122,11 @@ class ModelManager:
         return total
 
     def _available_vram_gb(self) -> float:
-        """Budget VRAM disponible pour un nouveau modèle."""
         return settings.effective_vram_budget_gb() - self._used_vram_gb()
 
     async def _ensure_capacity(self, model: ModelDefinition) -> None:
         """
-        Vérifie que VRAM et port sont disponibles pour charger le modèle.
-        Évinçe des modèles LRU idle (READY, non pinnés) jusqu'à avoir :
-          - assez de VRAM  (available_vram >= model.vram_gb)
-          - au moins un port libre dans le pool
-        Les deux contraintes déclenchent l'éviction — pas seulement la VRAM.
-        Lève RuntimeError si impossible (aucun modèle idle à évincer).
+        Vérifie que VRAM et port sont disponibles. Évinçe LRU si nécessaire.
         Doit être appelé sous _pool_lock.
         """
         while self._available_vram_gb() < model.vram_gb or not self._port_pool:
@@ -168,8 +159,6 @@ class ModelManager:
                         f"Les modèles {busy_list} ont des requêtes en cours et ne peuvent pas être évincés. "
                         f"Réessayez dans quelques secondes."
                     )
-                # Aucun candidat READY non pinné — tous les slots sont soit en cours de chargement
-                # soit occupés par des requêtes actives.
                 loading_models = [
                     mid for mid, mgr in self._managers.items()
                     if mid != model.id and mgr.state == ModelState.LOADING
@@ -184,18 +173,10 @@ class ModelManager:
                 raise RuntimeError(
                     f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
                     f"Aucun modèle idle à évincer. Attendez la fin des requêtes en cours "
-                    f"ou déchargez un modèle manuellement via POST /admin/models/{{id}}/unload."
+                    f"ou déchargez un modèle manuellement via POST /admin/models/{model.id}/unload."
                 )
 
     async def _evict_lru_idle(self, exclude: str) -> bool:
-        """
-        Évinçe le modèle READY le moins récemment utilisé (hors `exclude`).
-        Retourne True si un modèle a été évincé, False si aucun candidat.
-        Doit être appelé sous _pool_lock (relâche brièvement pour await).
-        """
-        # Candidats : modèles READY, non exclus, et sans requête active en cours.
-        # Un modèle pinned (is_pinned=True) est en train de servir une requête —
-        # le tuer casserait la connexion de l'utilisateur en cours.
         candidates = [
             (mid, mgr) for mid, mgr in self._managers.items()
             if mid != exclude
@@ -205,7 +186,6 @@ class ModelManager:
         if not candidates:
             return False
 
-        # LRU : celui avec le _last_request_time le plus ancien
         lru_id, lru_mgr = min(candidates, key=lambda x: x[1]._last_request_time)
 
         log.info(
@@ -214,39 +194,28 @@ class ModelManager:
             self._registry.get(lru_id).vram_gb if self._registry.get(lru_id) else 0.0,
         )
 
-        # Décharger hors du lock serait idéal, mais en asyncio single-thread
-        # c'est sans danger : unload() est cooperative (await interne)
         await lru_mgr.unload(reason=f"LRU eviction pour '{exclude}'")
-        # Note : _on_model_unloaded est appelé par le callback, nettoyant _managers et _allocated_ports
         return True
 
     # ── Callback de déchargement ──────────────────────────────────────────────
 
     def _on_model_unloaded(self, model_id: str) -> None:
-        """
-        Appelé par ServerManager.unload() après déchargement complet.
-        Libère le port et retire le manager du pool.
-        Opérations dict pures — safe en asyncio single-thread sans lock.
-        """
         if model_id in self._allocated_ports:
             port = self._allocated_ports.pop(model_id)
             self._port_pool.append(port)
             log.debug("Port %d libéré et retourné au pool (modèle '%s')", port, model_id)
-
         self._managers.pop(model_id, None)
 
     # ── Actions admin ─────────────────────────────────────────────────────────
 
     async def unload_model(self, model_id: str) -> None:
-        """Force le déchargement d'un modèle spécifique."""
         async with self._pool_lock:
             manager = self._managers.get(model_id)
         if manager is None:
-            return  # Déjà déchargé
+            return
         await manager.unload(reason="admin request")
 
     async def shutdown(self) -> None:
-        """Décharge tous les modèles — appelé au shutdown de la gateway."""
         model_ids = list(self._managers.keys())
         log.info("Shutdown : déchargement de %d modèle(s)…", len(model_ids))
         for model_id in model_ids:
@@ -254,13 +223,13 @@ class ModelManager:
             if manager:
                 await manager.unload(reason="shutdown")
 
+    async def start_health_monitor(self) -> None:
+        """No-op en mode local — pas de heartbeat réseau nécessaire."""
+        pass
+
     # ── Statut ────────────────────────────────────────────────────────────────
 
     def status(self) -> dict:
-        """
-        Retourne l'état complet du pool pour /admin/status.
-        Inclut tous les modèles du registre (chargés ou non) + le budget VRAM.
-        """
         models_status = []
         for model in self._registry.list_all():
             manager = self._managers.get(model.id)
@@ -300,13 +269,65 @@ class ModelManager:
         return self._registry
 
 
+# Alias de rétro-compat : le code ancien importe `from model_manager import ModelManager`
+ModelManager = LocalModelManager
+
+
+# ── Sélection du backend selon CLUSTER_MODE ───────────────────────────────────
+
+def _build_manager():
+    """
+    Construit le manager approprié au mode de déploiement.
+    Appelé une seule fois au chargement du module.
+    """
+    registry = ModelRegistry(
+        config_path=settings.models_config_path,
+        allowed_model_dirs=settings.allowed_model_dirs if settings.allowed_model_dirs else None,
+    )
+
+    if settings.cluster_mode == "local":
+        log.info("Mode CLUSTER_MODE=local — gateway mono-nœud (comportement historique).")
+        return LocalModelManager(registry=registry)
+
+    # ── Mode cluster ──────────────────────────────────────────────────────────
+    log.info("Mode CLUSTER_MODE=cluster — gateway multi-nœuds.")
+
+    from cluster.nodes_config import load_nodes_config
+    from cluster.node_client import RemoteNodeClient
+    from cluster.cluster_manager import ClusterManager
+
+    cluster_cfg = load_nodes_config(settings.cluster_nodes_path)
+    if not cluster_cfg.nodes:
+        raise RuntimeError(
+            "CLUSTER_MODE=cluster mais aucun nœud défini dans "
+            f"{settings.cluster_nodes_path}"
+        )
+
+    clients = [
+        RemoteNodeClient(
+            node_id=node.id,
+            base_url=node.base_url,
+            agent_secret=settings.agent_secret,
+            timeout_seconds=settings.cluster_request_timeout,
+            verify=cluster_cfg.tls_verify,
+        )
+        for node in cluster_cfg.nodes
+    ]
+
+    log.info(
+        "Nœuds cluster configurés : %s",
+        ", ".join(f"{n.node_id}({n.base_url})" for n in cluster_cfg.nodes),
+    )
+
+    return ClusterManager(
+        registry=registry,
+        nodes=clients,
+        health_interval=settings.cluster_health_interval,
+        health_failures_to_offline=settings.cluster_health_failures_to_offline,
+    )
+
+
 # ── Singleton global ──────────────────────────────────────────────────────────
-# Instancié ici, importé dans proxy.py, admin.py et main.py.
-# Le registre se charge depuis models_config_path défini dans settings.
+# Importé partout dans l'application : proxy.py, admin.py, main.py.
 
-registry = ModelRegistry(
-    config_path=settings.models_config_path,
-    allowed_model_dirs=settings.allowed_model_dirs if settings.allowed_model_dirs else None,
-)
-
-model_manager = ModelManager(registry=registry)
+model_manager = _build_manager()

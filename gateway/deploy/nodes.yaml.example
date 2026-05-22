@@ -1,0 +1,54 @@
+# nodes.yaml — Topologie du cluster EVARuntime (CLUSTER_MODE=cluster)
+#
+# Chargé uniquement quand CLUSTER_MODE=cluster dans l'env de l'orchestrateur.
+# En mode local (CLUSTER_MODE=local, défaut), ce fichier n'est pas lu.
+#
+# Déployement minimal :
+#   1. Copier vers /etc/llm-gateway/nodes.yaml sur l'orchestrateur.
+#   2. Adapter les champs id, base_url et tls_verify.
+#   3. Générer AGENT_SECRET une fois et le mettre IDENTIQUE sur :
+#      - l'orchestrateur : .env → AGENT_SECRET=<valeur>
+#      - chaque agent    : /etc/llm-gateway-agent/env → AGENT_SECRET=<valeur>
+#
+# Générer un secret :
+#   python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+#
+# Voir docs/deployment.md § Multi-nœud pour la procédure complète.
+
+cluster:
+  # Vérification TLS des certificats agents.
+  # Options :
+  #   true                      → vérification système (certificat signé par CA reconnue)
+  #   false                     → désactivée (LAN strict, dev uniquement — DÉCONSEILLÉ en prod)
+  #   /chemin/vers/ca-bundle.pem → bundle CA personnalisé (certificats auto-signés ou PKI locale)
+  #
+  # Pour les DGX Spark en réseau campus UPPA, deux options :
+  #   a) Certificat PKI UPPA → tls_verify: true (si la PKI est dans le bundle système)
+  #   b) Certificat auto-signé (généré par install-agent.sh) → tls_verify: /etc/ssl/certs/nodes-ca.pem
+  #      Concaténer les .crt des deux agents dans ce fichier :
+  #        cat /etc/ssl/certs/dgx-spark-a.crt /etc/ssl/certs/dgx-spark-b.crt > /etc/ssl/certs/nodes-ca.pem
+  tls_verify: /etc/ssl/certs/llm-gateway-nodes-ca.pem
+
+nodes:
+  # ── DGX Spark A ──────────────────────────────────────────────────────────────
+  - id: dgx-spark-a
+    base_url: https://dgx-a.internal.uppa.fr:9443
+    description: "DGX Spark A — GB10 128 GB unified, salle serveurs bat. B"
+
+  # ── DGX Spark B ──────────────────────────────────────────────────────────────
+  - id: dgx-spark-b
+    base_url: https://dgx-b.internal.uppa.fr:9443
+    description: "DGX Spark B — GB10 128 GB unified, salle serveurs bat. B"
+
+# ── Notes de configuration ────────────────────────────────────────────────────
+#
+# Les timeouts et intervalles heartbeat sont configurés dans .env de l'orchestrateur,
+# pas ici (ils sont env-tunables et n'appartiennent pas à la topologie) :
+#
+#   CLUSTER_REQUEST_TIMEOUT=10.0         # timeout requêtes de contrôle (s)
+#   CLUSTER_HEALTH_INTERVAL=10           # interval heartbeat (s)
+#   CLUSTER_HEALTH_FAILURES_TO_OFFLINE=3 # échecs → nœud offline
+#
+# La VRAM de chaque nœud est lue dynamiquement depuis l'agent au heartbeat.
+# Ne pas la configurer ici. Sur GB10 (128 GB physiques) l'agent rapporte
+# ~120 GB net après overhead (configurable via TOTAL_VRAM_GB dans son .env).

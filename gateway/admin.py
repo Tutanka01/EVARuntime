@@ -276,6 +276,27 @@ async def unload_all(_: None = Depends(require_admin)) -> dict:
     return {"message": "Tous les modèles déchargés. GPU entièrement libéré."}
 
 
+# ── Cluster multi-nœuds ───────────────────────────────────────────────────────
+
+@router.get("/cluster")
+async def cluster_status(_: None = Depends(require_admin)) -> dict:
+    """
+    État de chaque nœud du cluster (uniquement en CLUSTER_MODE=cluster).
+    Retourne 200 avec cluster_mode=local et une liste vide en mode mono-nœud.
+    """
+    from config import settings as cfg
+    if cfg.cluster_mode != "cluster" or not hasattr(model_manager, "cluster_status"):
+        return {
+            "cluster_mode": cfg.cluster_mode,
+            "nodes": [],
+            "info": "Mode local — aucun nœud distant à afficher.",
+        }
+    return {
+        "cluster_mode": "cluster",
+        "nodes": model_manager.cluster_status(),
+    }
+
+
 # ── Gestion utilisateurs ──────────────────────────────────────────────────────
 
 @router.post("/users", response_model=UserResponse, status_code=201)

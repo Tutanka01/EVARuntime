@@ -3,12 +3,22 @@
 # Testé sur : Ubuntu 22.04 / 24.04
 #
 # Usage :
-#   sudo bash install.sh
+#   sudo bash install.sh             # mode local (défaut, mono-nœud)
+#   sudo bash install.sh --cluster   # mode cluster multi-nœuds (avancé)
 #
 # Ce script est idempotent : le relancer ne casse pas une installation existante.
 
 set -euo pipefail
 IFS=$'\n\t'
+
+# ── Arguments ─────────────────────────────────────────────────────────────────
+CLUSTER_MODE=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster) CLUSTER_MODE=true; shift ;;
+        *) echo "Usage: $0 [--cluster]"; exit 1 ;;
+    esac
+done
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -156,6 +166,14 @@ CUDA_VISIBLE_DEVICES=0
 # ── Rate limiting par défaut ───────────────────────────────────────────────────
 DEFAULT_RPM_LIMIT=20
 DEFAULT_MONTHLY_TOKEN_LIMIT=0
+
+# ── Cluster multi-nœuds (désactivé par défaut — activer avec --cluster) ───────
+CLUSTER_MODE=local
+# CLUSTER_NODES_PATH=${CONFIG_DIR}/nodes.yaml
+# AGENT_SECRET=CHANGE_ME_GENERATE_WITH_python3_-c_import_secrets;_print(secrets.token_urlsafe(32))
+# CLUSTER_REQUEST_TIMEOUT=10.0
+# CLUSTER_HEALTH_INTERVAL=10
+# CLUSTER_HEALTH_FAILURES_TO_OFFLINE=3
 EOF
 
     chmod 640 "$CONFIG_FILE"
@@ -165,6 +183,32 @@ EOF
     warn "ADMIN_SECRET = $ADMIN_SECRET — notez-le maintenant."
 else
     info "Configuration existante conservée : $CONFIG_FILE"
+fi
+
+# ── 6c. Configuration cluster (optionnel, --cluster seulement) ────────────────
+
+if [[ "$CLUSTER_MODE" == "true" ]]; then
+    AGENT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+    NODES_FILE="$CONFIG_DIR/nodes.yaml"
+
+    # Activer cluster_mode dans env
+    sed -i 's/^CLUSTER_MODE=local/CLUSTER_MODE=cluster/' "$CONFIG_FILE"
+    echo "CLUSTER_NODES_PATH=${CONFIG_DIR}/nodes.yaml" >> "$CONFIG_FILE"
+    echo "AGENT_SECRET=${AGENT_SECRET}" >> "$CONFIG_FILE"
+    chmod 640 "$CONFIG_FILE"
+
+    # Générer nodes.yaml exemple s'il n'existe pas
+    if [[ ! -f "$NODES_FILE" ]]; then
+        cp "$SCRIPT_DIR/deploy/nodes.yaml.example" "$NODES_FILE"
+        chmod 640 "$NODES_FILE"
+        chown root:"$SERVICE_USER" "$NODES_FILE"
+    fi
+
+    warn "Mode cluster activé."
+    warn "AGENT_SECRET = $AGENT_SECRET"
+    warn "→ Définissez AGENT_SECRET=<valeur> dans /etc/llm-gateway-agent/env sur CHAQUE agent."
+    warn "→ Éditez $NODES_FILE pour déclarer vos nœuds."
+    warn "→ Sur chaque DGX Spark : sudo bash node_agent/deploy/install-agent.sh --node-id <id>"
 fi
 
 # ── 6b. Registre des modèles (models.yaml) ────────────────────────────────────

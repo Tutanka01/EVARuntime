@@ -100,6 +100,9 @@ async def lifespan(app: FastAPI):
     await db.init_db()
     log.info("Base de données initialisée : %s", settings.db_path)
 
+    log.info("Mode déploiement : CLUSTER_MODE=%s", settings.cluster_mode)
+    await model_manager.start_health_monitor()
+
     yield
 
     log.info("Arrêt de la gateway — déchargement de tous les modèles…")

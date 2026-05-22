@@ -801,3 +801,137 @@ sudo rm /var/lib/llm-gateway/gateway.db
 sudo systemctl start llm-gateway
 # La DB est recréée automatiquement au démarrage
 ```
+
+---
+
+## 13. Déploiement multi-nœuds (Optionnel — avancé)
+
+> Le multi-nœud est une **feature opt-in**. Le déploiement UPPA actuel (mono L40S)
+> n'est pas impacté — `CLUSTER_MODE=local` reste le défaut.
+> Cette section s'adresse aux opérateurs souhaitant piloter plusieurs GPU (ex : 2 DGX Spark).
+
+### Architecture
+
+```
+Client OpenAI-compatible
+        │ HTTPS public (nginx)
+        ▼
+┌────────────────────────────────┐
+│   Orchestrateur (cette gateway) │
+│   ClusterManager               │
+└─────────────┬──────────────────┘
+              │ HTTPS :9443 (Bearer agent_secret)
+    ┌─────────┴─────────┐
+    ▼                   ▼
+┌──────────┐     ┌──────────┐
+│ Agent A  │     │ Agent B  │
+│ DGX Spark│     │ DGX Spark│
+└────┬─────┘     └────┬─────┘
+     ▼                ▼
+ llama-server    llama-server
+ (GB10 128GB)    (GB10 128GB)
+```
+
+Deux flux séparés :
+- **Plan de contrôle** : orchestrateur ↔ agent (load/unload/health) — HTTPS
+- **Plan de données** : orchestrateur ↔ llama-server (inférence SSE) — HTTP interne LAN
+
+### Pré-requis réseau
+
+- Ports ouverts sur chaque nœud :
+  - `9443` (TCP) — agent, accessible uniquement depuis l'orchestrateur
+  - `8081-8085` (TCP) — llama-server, accessible uniquement depuis l'orchestrateur
+- Recommandé : règle firewall `ufw allow from <IP_orchestrateur> to any port 9443`
+
+### Installation — orchestrateur
+
+```bash
+# Sur la machine orchestrateur :
+sudo bash gateway/deploy/install.sh --cluster
+# → génère AGENT_SECRET, crée /etc/llm-gateway/nodes.yaml depuis l'exemple
+# → active CLUSTER_MODE=cluster dans /etc/llm-gateway/env
+
+# Éditer la topologie des nœuds
+sudo nano /etc/llm-gateway/nodes.yaml
+```
+
+### Installation — chaque nœud DGX Spark
+
+Voir [build-llama-cpp-dgx-spark.md](build-llama-cpp-dgx-spark.md) pour compiler llama-server.
+
+```bash
+# Sur chaque DGX Spark (répéter pour dgx-spark-a et dgx-spark-b) :
+git clone <repo> /opt/llm-gateway-src
+cd /opt/llm-gateway-src
+
+sudo bash node_agent/deploy/install-agent.sh --node-id dgx-spark-a --port 9443
+# → crée /etc/llm-gateway-agent/env, génère le certificat TLS, installe le service
+
+# Définir AGENT_SECRET (MÊME valeur que l'orchestrateur)
+sudo nano /etc/llm-gateway-agent/env
+# → AGENT_SECRET=<valeur générée par install.sh --cluster sur l'orchestrateur>
+
+sudo systemctl start llm-gateway-agent
+sudo journalctl -fu llm-gateway-agent
+```
+
+### Configuration TLS (certificats auto-signés)
+
+Si vous utilisez des certificats auto-signés générés par `install-agent.sh` :
+
+```bash
+# Sur l'orchestrateur — récupérer les certificats des deux nœuds
+scp dgx-spark-a:/etc/llm-gateway-agent/tls/agent.crt /etc/ssl/certs/dgx-spark-a.crt
+scp dgx-spark-b:/etc/llm-gateway-agent/tls/agent.crt /etc/ssl/certs/dgx-spark-b.crt
+
+# Créer le bundle CA
+cat /etc/ssl/certs/dgx-spark-a.crt \
+    /etc/ssl/certs/dgx-spark-b.crt \
+  > /etc/ssl/certs/llm-gateway-nodes-ca.pem
+
+# Pointer nodes.yaml vers ce bundle :
+#   cluster:
+#     tls_verify: /etc/ssl/certs/llm-gateway-nodes-ca.pem
+sudo nano /etc/llm-gateway/nodes.yaml
+```
+
+### Démarrage et vérification
+
+```bash
+# Démarrer l'orchestrateur
+sudo systemctl start llm-gateway
+
+# Vérifier les nœuds (les deux doivent être online)
+curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
+  http://localhost:8000/admin/cluster | python3 -m json.tool
+
+# Charger un modèle (le scheduler choisit le meilleur nœud automatiquement)
+curl -s -X POST -H "Authorization: Bearer $ADMIN_SECRET" \
+  http://localhost:8000/admin/models/llama-3.3-70b-instruct/load
+
+# Vérifier le placement
+curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
+  http://localhost:8000/admin/cluster | python3 -m json.tool
+```
+
+### Comportement en cas de panne
+
+- **Nœud injoignable** : après 3 heartbeats échoués (~30 s), le nœud passe
+  `offline`. Les modèles qui y étaient deviennent `unavailable`.
+- **Requêtes en cours** : reçoivent une erreur 502 si le nœud s'arrête pendant
+  le stream. Les requêtes futures sont routées vers les nœuds disponibles.
+- **Retour du nœud** : dès que le heartbeat répond, le nœud repasse `online`.
+  L'orchestrateur **ne recharge pas automatiquement** les modèles — rechargement
+  manuel via `POST /admin/models/{id}/load` ou à la prochaine requête utilisateur.
+- **Tous les nœuds offline** : les requêtes d'inférence reçoivent une 503 explicite.
+
+### Vérification de la rétrocompatibilité (déploiement UPPA existant)
+
+```bash
+# Sur l'installation UPPA actuelle (L40S mono-nœud) :
+git pull
+bash gateway/deploy/update.sh    # même script qu'avant
+systemctl restart llm-gateway
+# Aucune modification de configuration nécessaire.
+# CLUSTER_MODE=local reste le défaut — comportement inchangé.
+```

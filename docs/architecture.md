@@ -621,3 +621,102 @@ FROM usage_log l JOIN users u ON u.id = l.user_id
 WHERE l.timestamp >= date('now', 'start of month')
 GROUP BY u.id, l.model ORDER BY tokens DESC LIMIT 10;"
 ```
+
+---
+
+## Architecture cluster multi-nœuds (opt-in avancé)
+
+> Activé par `CLUSTER_MODE=cluster`. Le mode `local` (défaut) est inchangé.
+
+### Vue d'ensemble
+
+```
+                  Client OpenAI-compatible
+                          │ HTTPS public (TLS 1.3, nginx)
+                          ▼
+              ┌───────────────────────────────────┐
+              │   Orchestrateur (FastAPI)          │
+              │   auth, rate limit, DB SQLite      │
+              │   ClusterManager                   │
+              │   Routes /v1/*, /admin/*           │
+              └─────────────────┬─────────────────┘
+                                │ HTTPS :9443 (Bearer agent_secret)
+              ┌─────────────────┴─────────────────┐
+              ▼                                   ▼
+     ┌──────────────────┐                ┌──────────────────┐
+     │  Node Agent A    │                │  Node Agent B    │
+     │  FastAPI :9443   │                │  FastAPI :9443   │
+     │  load / unload   │                │  load / unload   │
+     │  health (VRAM)   │                │  health (VRAM)   │
+     └────────┬─────────┘                └────────┬─────────┘
+              │                                   │
+              ▼  subprocess local                 ▼  subprocess local
+     ┌──────────────────┐                ┌──────────────────┐
+     │ llama-server     │                │ llama-server     │
+     │ :8081  :8082 …   │                │ :8081  :8082 …   │
+     │ GB10 — 128 GB    │                │ GB10 — 128 GB    │
+     │ unifiée CPU/GPU  │                │ unifiée CPU/GPU  │
+     └──────────────────┘                └──────────────────┘
+                        ▲
+         Trafic d'inférence SSE direct (orchestrateur → llama-server)
+         L'agent retourne llama_url + internal_api_key dans LoadResponse.
+         L'orchestrateur ouvre une connexion HTTP directe vers llama-server
+         pour éviter un double-hop sur les flux SSE longs.
+```
+
+### Deux plans séparés
+
+| Plan | Participants | Protocole | Volume |
+|------|-------------|-----------|--------|
+| Contrôle | orchestrateur ↔ agent | HTTPS + Bearer | Faible (load/unload/health) |
+| Données | orchestrateur ↔ llama-server | HTTP LAN | Élevé (tokens SSE) |
+
+### Scheduler (placement automatique)
+
+`gateway/cluster/scheduler.py` contient la logique **pure** de placement (pas d'I/O) :
+
+1. **Best-fit immédiat** : nœuds avec VRAM libre suffisante + port libre →
+   on choisit celui avec le moins de résidu (optimise le packing).
+2. **Éviction LRU simulée** : si aucun nœud n'a assez de VRAM libre, on simule
+   l'éviction des modèles les moins récemment utilisés et on choisit le nœud
+   qui doit évincer le moins de VRAM (moins de churn).
+3. **Contrainte de pin** : `pin_to_node` force le placement sur un nœud précis.
+
+### Heartbeat & dégradation gracieuse
+
+- Toutes les `CLUSTER_HEALTH_INTERVAL` secondes (défaut 10 s) :
+  `GET /agent/health` vers chaque nœud (timeout 3 s).
+- ≥ `CLUSTER_HEALTH_FAILURES_TO_OFFLINE` (défaut 3) échecs consécutifs →
+  nœud marqué `offline`. Plus aucune requête routée vers lui.
+- Retour à `online` dès qu'un health répond OK.
+- L'orchestrateur **ne recharge pas automatiquement** les modèles (dégradation
+  gracieuse, pas de failover automatique).
+
+### Budget VRAM sur GB10 (mémoire unifiée)
+
+Sur les DGX Spark GB10, le concept "VRAM" est en réalité de la **mémoire unifiée**
+partagée CPU+GPU via NVLink-C2C (600 GB/s). Conséquences :
+
+- `total_vram_gb` à configurer à ~120 sur les 128 GB physiques (OS+CUDA réserve ~8 GB).
+- `--cpu-moe` de llama.cpp est **inutile** : déporter les experts FFN sur CPU ne libère
+  rien car c'est la même mémoire physique. Laisser `cpu_moe: false`.
+- Un GB10 peut tenir un 70B en Q8_0 (~72 GB) ou un 120B en Q4_K_M (~70 GB) seul.
+
+Voir [build-llama-cpp-dgx-spark.md](build-llama-cpp-dgx-spark.md) pour la compilation
+et la configuration complète.
+
+### Nouveaux fichiers du package cluster
+
+| Fichier | Rôle |
+|---------|------|
+| `gateway/cluster/__init__.py` | Package cluster |
+| `gateway/cluster/node_protocol.py` | DTOs Pydantic partagés (LoadRequest/Response, NodeHealth, NodeStatus…) |
+| `gateway/cluster/scheduler.py` | Logique pure de placement (best-fit + éviction LRU simulée) |
+| `gateway/cluster/nodes_config.py` | Chargement/validation de `nodes.yaml` |
+| `gateway/cluster/node_client.py` | `RemoteNodeClient` (HTTPS) + `LocalNodeAdapter` (in-process, tests) |
+| `gateway/cluster/cluster_manager.py` | Orchestrateur — heartbeat, placement, état par nœud |
+| `node_agent/main.py` | App FastAPI agent (~250 lignes, réutilise ServerManager) |
+| `node_agent/config.py` | Settings agent (port, secret, VRAM, bin…) |
+| `gateway/deploy/nodes.yaml.example` | Template de topologie cluster |
+| `node_agent/deploy/install-agent.sh` | Script d'install agent sur DGX Spark |
+| `docs/build-llama-cpp-dgx-spark.md` | Guide de compilation llama.cpp pour GB10/sm_121 |

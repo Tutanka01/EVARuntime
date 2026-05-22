@@ -6,6 +6,8 @@ jamais dans le code source.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
+
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -75,6 +77,26 @@ class Settings(BaseSettings):
     # ── GPU ────────────────────────────────────────────────────────────────────
     cuda_visible_devices: str = "0"
 
+    # ── Cluster multi-nœuds (opt-in avancé) ───────────────────────────────────
+    # local   : comportement historique — la gateway lance llama-server localement
+    #           (mode par défaut, rétro-compatible avec tous les déploiements existants)
+    # cluster : la gateway pilote N agents distants via HTTPS, lit cluster_nodes_path
+    cluster_mode: Literal["local", "cluster"] = "local"
+
+    # Fichier YAML décrivant les nœuds GPU pilotés en mode cluster
+    cluster_nodes_path: Path = Path("/etc/llm-gateway/nodes.yaml")
+
+    # Secret bearer partagé orchestrateur ↔ agents (même valeur sur tous les agents)
+    # Utilisé uniquement quand cluster_mode=cluster
+    agent_secret: str = "CHANGE_ME_AGENT_SECRET"
+
+    # Plan de contrôle (load/unload/health) — timeout court
+    cluster_request_timeout: float = 10.0
+    # Heartbeat — intervalle entre deux GET /agent/health par nœud
+    cluster_health_interval: int = 10
+    # Échecs consécutifs avant de marquer un nœud offline
+    cluster_health_failures_to_offline: int = 3
+
     @field_validator("models_config_path", "llama_server_bin", mode="before")
     @classmethod
     def coerce_path(cls, v: object) -> Path:
@@ -92,6 +114,18 @@ class Settings(BaseSettings):
     def validate_max_models(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"max_loaded_models doit être ≥ 1, reçu : {v}")
+        return v
+
+    @field_validator("cluster_nodes_path", mode="before")
+    @classmethod
+    def coerce_cluster_path(cls, v: object) -> Path:
+        return Path(str(v))
+
+    @field_validator("cluster_health_interval", "cluster_health_failures_to_offline")
+    @classmethod
+    def validate_cluster_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"Valeur cluster doit être ≥ 1, reçu : {v}")
         return v
 
     def effective_vram_budget_gb(self) -> float:
