@@ -112,6 +112,35 @@ curl -s https://llm.eva.univ-pau.fr/v1/models \
   -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
 ```
 
+### Voir l'état de la queue VRAM
+
+Cet endpoint est authentifié avec une clé API utilisateur normale. Il expose
+uniquement l'état minimal de la queue d'admission, sans révéler les modèles
+chargés, les chemins fichiers ou le détail VRAM.
+
+```bash
+curl -s https://llm.eva.univ-pau.fr/v1/capacity \
+  -H "Authorization: Bearer $UPPA_LLM_KEY" | python3 -m json.tool
+```
+
+Réponse exemple :
+
+```json
+{
+  "object": "capacity_queue",
+  "mode": "local",
+  "available": true,
+  "enabled": true,
+  "status": "idle",
+  "waiters": 0,
+  "max_waiters": 100,
+  "timeout_seconds": 120,
+  "retry_after_seconds": 10
+}
+```
+
+`status` vaut `idle`, `waiting`, `full`, `disabled` ou `unavailable`.
+
 ### Première requête de génération
 
 ```bash

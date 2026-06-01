@@ -812,6 +812,7 @@ Elles sont toutes soumises au rate limiting et à la gestion VRAM automatique.
 | Méthode | Route | Description |
 |---------|-------|-------------|
 | `GET` | `/v1/models` | Liste les modèles activés |
+| `GET` | `/v1/capacity` | État minimal de la queue VRAM (auth utilisateur, sans détail infra sensible) |
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible, streaming supporté) |
 | `POST` | `/v1/completions` | Legacy text completion (OpenAI-compatible) |
 | `POST` | `/completion` | Completion native llama.cpp — prend un champ `prompt` string |

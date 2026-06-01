@@ -1841,6 +1841,7 @@ Authorization: Bearer llmgw-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
   \midrule
   \texttt{GET}  & \texttt{/health}                & État du service (sans authentification) \\
   \texttt{GET}  & \texttt{/v1/models}             & Liste des modèles activés \\
+  \texttt{GET}  & \texttt{/v1/capacity}           & État minimal de la queue VRAM \\
   \texttt{POST} & \texttt{/v1/chat/completions}   & Génération (format OpenAI, streaming supporté) \\
   \texttt{POST} & \texttt{/v1/completions}        & Completion legacy (format OpenAI) \\
   \texttt{POST} & \texttt{/completion}            & Completion native llama.cpp \\

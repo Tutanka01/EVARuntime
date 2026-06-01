@@ -186,6 +186,56 @@ async def list_models(user: dict = Depends(get_current_user)):
     return models_response(model_manager)
 
 
+@app.get("/v1/capacity")
+async def capacity_status(user: dict = Depends(get_current_user)):
+    """
+    État minimal de la queue d'admission VRAM.
+
+    Route authentifiée par clé API utilisateur. Ne révèle ni VRAM détaillée,
+    ni modèles chargés, ni chemins fichiers : seulement l'état exploitable par
+    une application cliente pour afficher attente/saturation et gérer Retry-After.
+    """
+    status = model_manager.status()
+    queue = status.get("capacity_queue")
+    if not queue:
+        return {
+            "object": "capacity_queue",
+            "mode": settings.cluster_mode,
+            "available": False,
+            "enabled": False,
+            "status": "unavailable",
+            "waiters": 0,
+            "max_waiters": None,
+            "timeout_seconds": None,
+            "retry_after_seconds": settings.capacity_queue_retry_after_seconds,
+        }
+
+    waiters = int(queue.get("waiters", 0))
+    max_waiters = int(queue.get("max_waiters", 0))
+    enabled = bool(queue.get("enabled", False))
+
+    queue_status = "disabled"
+    if enabled:
+        if max_waiters > 0 and waiters >= max_waiters:
+            queue_status = "full"
+        elif waiters > 0:
+            queue_status = "waiting"
+        else:
+            queue_status = "idle"
+
+    return {
+        "object": "capacity_queue",
+        "mode": settings.cluster_mode,
+        "available": True,
+        "enabled": enabled,
+        "status": queue_status,
+        "waiters": waiters,
+        "max_waiters": max_waiters,
+        "timeout_seconds": queue.get("timeout_seconds"),
+        "retry_after_seconds": settings.capacity_queue_retry_after_seconds,
+    }
+
+
 # ── Routes d'inférence (protégées + rate limitées) ────────────────────────────
 
 @app.post("/v1/chat/completions")
