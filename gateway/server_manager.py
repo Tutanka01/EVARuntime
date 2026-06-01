@@ -61,10 +61,12 @@ class ServerManager:
         model: ModelDefinition,
         port: int,
         on_unload: Callable[[str], None] | None = None,
+        on_capacity_change: Callable[[], None] | None = None,
     ) -> None:
         self._model = model
         self._port = port
         self._on_unload = on_unload
+        self._on_capacity_change = on_capacity_change
 
         self._process: asyncio.subprocess.Process | None = None
         self._state: ModelState = ModelState.UNLOADED
@@ -132,7 +134,10 @@ class ServerManager:
         Signale la fin d'une requête active (terminée, exception ou client déconnecté).
         Toujours appelé depuis un bloc finally — ne peut pas être oublié.
         """
+        was_pinned = self._active_requests > 0
         self._active_requests = max(0, self._active_requests - 1)
+        if was_pinned and self._active_requests == 0 and self._on_capacity_change:
+            self._on_capacity_change()
 
     def llama_url(self, path: str) -> str:
         """URL complète vers llama-server pour ce modèle."""
@@ -216,6 +221,8 @@ class ServerManager:
                 self._state = ModelState.UNLOADED
         finally:
             event.set()
+            if self._on_capacity_change:
+                self._on_capacity_change()
 
     async def _start_process(self) -> None:
         cmd = self._model.build_llama_cmd(

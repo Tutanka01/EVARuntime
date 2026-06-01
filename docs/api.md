@@ -262,8 +262,10 @@ print("Assistant :", reply)
 ### Gestion robuste des erreurs
 
 Dans un pipeline de traitement automatique, les erreurs passagères sont inévitables :
-modèle en cours de chargement (503), limite de débit dépassée (429), perte réseau
-transitoire. Le patron suivant gère ces cas avec relance automatique.
+queue VRAM saturée ou expirée (503), limite de débit dépassée (429), perte réseau
+transitoire. En fonctionnement normal, la gateway attend déjà le chargement ou la
+libération VRAM avant de répondre ; un 503 signifie que l'attente bornée a expiré
+ou que la queue est pleine.
 
 ```python
 import time
@@ -286,7 +288,7 @@ def query_with_retry(
     Envoie une requête avec relances automatiques.
 
     Gère spécifiquement :
-    - 503 : le modèle est en cours de chargement — attendre et réessayer
+    - 503 : queue VRAM pleine/expirée ou backend temporairement indisponible
     - 429 : la limite de débit est atteinte — attendre 60s
     - timeout réseau — attendre et réessayer
     """
@@ -301,8 +303,8 @@ def query_with_retry(
 
         except APIStatusError as e:
             if e.status_code == 503:
-                wait = 30 * attempt
-                print(f"Modèle en chargement, attente {wait}s (tentative {attempt}/{max_attempts})…")
+                wait = int(e.response.headers.get("Retry-After", 30 * attempt))
+                print(f"Service temporairement indisponible, attente {wait}s (tentative {attempt}/{max_attempts})…")
                 time.sleep(wait)
             elif e.status_code == 429:
                 print("Limite de débit atteinte, attente 60s…")
@@ -1041,7 +1043,7 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
 | `403` | `permission_error` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible via `GET /v1/models` |
 | `404` | `not_found_error` | Identifiant de modèle inconnu | Vérifier l'ID du modèle via `GET /v1/models` |
 | `429` | `rate_limit_error` | Limite de débit dépassée | Attendre 60 s ; consulter l'en-tête `Retry-After` |
-| `503` | `server_error` | Modèle en cours de chargement | Attendre 30 à 90 s et réessayer |
+| `503` | `server_error` | Queue VRAM pleine/expirée, modèle impossible à charger ou backend temporairement indisponible | Respecter `Retry-After` si présent, sinon attendre 30 à 90 s |
 | `504` | `server_error` | Timeout de génération | Réduire `max_tokens` ou simplifier le prompt |
 | `502` | `server_error` | Moteur d'inférence injoignable | Transitoire — réessayer dans 30 s |
 | `500` | `server_error` | Erreur interne inattendue | Contacter l'admin avec l'heure et le contexte |

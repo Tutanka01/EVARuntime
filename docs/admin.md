@@ -305,6 +305,12 @@ curl -s "$GW/admin/status" \
 #     "used_gb": 42.0,
 #     "available_gb": 1.6
 #   },
+#   "capacity_queue": {
+#     "enabled": true,
+#     "waiters": 0,
+#     "max_waiters": 100,
+#     "timeout_seconds": 120
+#   },
 #   "models": [
 #     {
 #       "id": "llama-3.3-70b-instruct",
@@ -832,6 +838,7 @@ curl -s "$GW/admin/status" \
 #     "used_gb": 42.0,
 #     "available_gb": 1.6
 #   },
+#   "capacity_queue": { "enabled": true, "waiters": 0, "max_waiters": 100, "timeout_seconds": 120 },
 #   "models": [
 #     { "id": "llama-3.3-70b-instruct", "state": "ready", "vram_gb": 42.0, ... },
 #     { "id": "llama-3.1-8b-instruct", "state": "unloaded", ... }
@@ -896,6 +903,9 @@ curl -s "$GW/admin/metrics/overview" \
   téléchargé, plutôt que de les supprimer
 - Surveiller `idle_seconds` dans `/admin/status` pour identifier les modèles rarement
   utilisés qui pourraient être désactivés pour libérer du budget VRAM
+- Surveiller `capacity_queue.waiters` dans `/admin/status` : une valeur non nulle
+  récurrente indique une saturation VRAM ou des générations trop longues. Ajuster
+  `CAPACITY_QUEUE_TIMEOUT_SECONDS` et `CAPACITY_QUEUE_MAX_WAITERS` avec prudence.
 - Pour tout modèle vision : s'assurer que `mmproj_path` est renseigné **avant**
   d'activer le modèle — un modèle vision sans `mmproj_path` provoque des HTTP 500
   silencieux (llama-server démarre, mais échoue à chaque requête avec image)

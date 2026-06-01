@@ -21,12 +21,28 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
 
 from config import settings
 from model_registry import ModelDefinition, ModelRegistry
 from server_manager import ModelState, ServerManager
 
 log = logging.getLogger(__name__)
+
+
+# ── Erreurs d'admission VRAM ──────────────────────────────────────────────────
+
+class CapacityQueueError(RuntimeError):
+    """Erreur temporaire liée à la queue d'admission VRAM."""
+
+
+class CapacityQueueFull(CapacityQueueError):
+    """La queue d'admission est pleine."""
+
+
+class CapacityQueueTimeout(CapacityQueueError):
+    """La requête a trop attendu une libération de capacité."""
 
 
 # ── LocalModelManager (mode local — comportement historique) ──────────────────
@@ -42,8 +58,9 @@ class LocalModelManager:
       - Gérer un pool de ports pour les sous-processus llama-server
 
     Concurrence :
-        asyncio.Lock sur toutes les transitions de pool (chargement, éviction, libération).
-        La phase d'attente du chargement se passe hors du lock.
+        asyncio.Condition sur les transitions de pool et la queue d'admission VRAM.
+        L'attente de capacité relâche le verrou ; le chargement llama-server se
+        fait hors condition après réservation du port.
     """
 
     def __init__(self, registry: ModelRegistry) -> None:
@@ -56,7 +73,8 @@ class LocalModelManager:
             settings.base_llama_port + settings.max_loaded_models,
         ))
 
-        self._pool_lock = asyncio.Lock()
+        self._capacity_cond = asyncio.Condition()
+        self._capacity_waiters: deque[object] = deque()
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
@@ -84,7 +102,7 @@ class LocalModelManager:
             await manager.ensure_loaded()
             return manager
 
-        async with self._pool_lock:
+        async with self._capacity_cond:
             manager = self._managers.get(model_id)
             if manager and manager.state in (ModelState.READY, ModelState.LOADING, ModelState.UNLOADED):
                 pass
@@ -98,6 +116,7 @@ class LocalModelManager:
                     model=model,
                     port=port,
                     on_unload=self._on_model_unloaded,
+                    on_capacity_change=self._notify_capacity_changed,
                 )
                 self._managers[model_id] = manager
                 log.info(
@@ -127,54 +146,133 @@ class LocalModelManager:
     async def _ensure_capacity(self, model: ModelDefinition) -> None:
         """
         Vérifie que VRAM et port sont disponibles. Évinçe LRU si nécessaire.
-        Doit être appelé sous _pool_lock.
+        Doit être appelé sous _capacity_cond.
         """
-        while self._available_vram_gb() < model.vram_gb or not self._port_pool:
-            reasons: list[str] = []
-            if self._available_vram_gb() < model.vram_gb:
-                reasons.append(
-                    f"VRAM insuffisante (besoin {model.vram_gb:.1f} GB, "
-                    f"disponible {self._available_vram_gb():.1f} GB)"
-                )
-            if not self._port_pool:
-                reasons.append(
-                    f"pool de ports épuisé ({settings.max_loaded_models} modèles simultanés max)"
-                )
-            log.warning(
-                "Capacité insuffisante pour '%s' — %s — tentative d'éviction LRU…",
-                model.id, " | ".join(reasons),
+        budget = settings.effective_vram_budget_gb()
+        if model.vram_gb > budget:
+            raise RuntimeError(
+                f"Impossible de charger '{model.id}' : besoin {model.vram_gb:.1f} GB, "
+                f"budget VRAM net {budget:.1f} GB. Ce modèle ne peut pas tenir seul."
             )
-            evicted = await self._evict_lru_idle(exclude=model.id)
-            if not evicted:
-                busy_models = [
-                    mid for mid, mgr in self._managers.items()
-                    if mid != model.id
-                    and mgr.state == ModelState.READY
-                    and mgr.is_pinned
-                ]
-                if busy_models:
-                    busy_list = ", ".join(f"'{m}'" for m in busy_models)
-                    raise RuntimeError(
-                        f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
-                        f"Les modèles {busy_list} ont des requêtes en cours et ne peuvent pas être évincés. "
+
+        ticket: object | None = None
+        deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
+        try:
+            while True:
+                is_turn = ticket is None and not self._capacity_waiters
+                is_turn = is_turn or (
+                    ticket is not None
+                    and self._capacity_waiters
+                    and self._capacity_waiters[0] is ticket
+                )
+
+                if is_turn:
+                    while not self._has_capacity_for(model):
+                        reasons = self._capacity_reasons(model)
+                        log.warning(
+                            "Capacité insuffisante pour '%s' — %s — tentative d'éviction LRU…",
+                            model.id, " | ".join(reasons),
+                        )
+                        evicted = await self._evict_lru_idle(exclude=model.id)
+                        if not evicted:
+                            break
+
+                    if self._has_capacity_for(model):
+                        return
+
+                if not settings.capacity_queue_enabled:
+                    raise self._capacity_unavailable_error(model)
+
+                if ticket is None:
+                    if len(self._capacity_waiters) >= settings.capacity_queue_max_waiters:
+                        raise CapacityQueueFull(
+                            f"Impossible de charger '{model.id}' : queue VRAM pleine "
+                            f"({settings.capacity_queue_max_waiters} requêtes en attente). "
+                            f"Réessayez dans quelques secondes."
+                        )
+                    ticket = object()
+                    self._capacity_waiters.append(ticket)
+                    log.info(
+                        "Requête pour '%s' mise en attente de capacité VRAM "
+                        "(position=%d/%d, timeout=%ds)",
+                        model.id,
+                        len(self._capacity_waiters),
+                        settings.capacity_queue_max_waiters,
+                        settings.capacity_queue_timeout_seconds,
+                    )
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CapacityQueueTimeout(
+                        f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
+                        f"après {settings.capacity_queue_timeout_seconds}s d'attente. "
                         f"Réessayez dans quelques secondes."
                     )
-                loading_models = [
-                    mid for mid, mgr in self._managers.items()
-                    if mid != model.id and mgr.state == ModelState.LOADING
-                ]
-                if loading_models:
-                    loading_list = ", ".join(f"'{m}'" for m in loading_models)
-                    raise RuntimeError(
-                        f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
-                        f"Les modèles {loading_list} sont en cours de chargement et ne peuvent pas être évincés. "
-                        f"Réessayez dans quelques secondes une fois leur chargement terminé."
-                    )
-                raise RuntimeError(
-                    f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
-                    f"Aucun modèle idle à évincer. Attendez la fin des requêtes en cours "
-                    f"ou déchargez un modèle manuellement via POST /admin/models/{model.id}/unload."
-                )
+
+                try:
+                    await asyncio.wait_for(self._capacity_cond.wait(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise CapacityQueueTimeout(
+                        f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
+                        f"après {settings.capacity_queue_timeout_seconds}s d'attente. "
+                        f"Réessayez dans quelques secondes."
+                    ) from exc
+        finally:
+            if ticket is not None:
+                try:
+                    self._capacity_waiters.remove(ticket)
+                except ValueError:
+                    pass
+                self._capacity_cond.notify_all()
+
+    def _has_capacity_for(self, model: ModelDefinition) -> bool:
+        return self._available_vram_gb() >= model.vram_gb and bool(self._port_pool)
+
+    def _capacity_reasons(self, model: ModelDefinition) -> list[str]:
+        reasons: list[str] = []
+        available = self._available_vram_gb()
+        if available < model.vram_gb:
+            reasons.append(
+                f"VRAM insuffisante (besoin {model.vram_gb:.1f} GB, "
+                f"disponible {available:.1f} GB)"
+            )
+        if not self._port_pool:
+            reasons.append(
+                f"pool de ports épuisé ({settings.max_loaded_models} modèles simultanés max)"
+            )
+        return reasons or ["capacité temporairement indisponible"]
+
+    def _capacity_unavailable_error(self, model: ModelDefinition) -> RuntimeError:
+        reasons = self._capacity_reasons(model)
+        busy_models = [
+            mid for mid, mgr in self._managers.items()
+            if mid != model.id
+            and mgr.state == ModelState.READY
+            and mgr.is_pinned
+        ]
+        if busy_models:
+            busy_list = ", ".join(f"'{m}'" for m in busy_models)
+            return RuntimeError(
+                f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
+                f"Les modèles {busy_list} ont des requêtes en cours et ne peuvent pas être évincés. "
+                f"Réessayez dans quelques secondes."
+            )
+        loading_models = [
+            mid for mid, mgr in self._managers.items()
+            if mid != model.id and mgr.state == ModelState.LOADING
+        ]
+        if loading_models:
+            loading_list = ", ".join(f"'{m}'" for m in loading_models)
+            return RuntimeError(
+                f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
+                f"Les modèles {loading_list} sont en cours de chargement et ne peuvent pas être évincés. "
+                f"Réessayez dans quelques secondes une fois leur chargement terminé."
+            )
+        return RuntimeError(
+            f"Impossible de charger '{model.id}' : {' | '.join(reasons)}. "
+            f"Aucun modèle idle à évincer. Attendez la fin des requêtes en cours "
+            f"ou déchargez un modèle manuellement via POST /admin/models/{model.id}/unload."
+        )
 
     async def _evict_lru_idle(self, exclude: str) -> bool:
         candidates = [
@@ -205,11 +303,23 @@ class LocalModelManager:
             self._port_pool.append(port)
             log.debug("Port %d libéré et retourné au pool (modèle '%s')", port, model_id)
         self._managers.pop(model_id, None)
+        self._notify_capacity_changed()
+
+    def _notify_capacity_changed(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._notify_capacity_waiters())
+
+    async def _notify_capacity_waiters(self) -> None:
+        async with self._capacity_cond:
+            self._capacity_cond.notify_all()
 
     # ── Actions admin ─────────────────────────────────────────────────────────
 
     async def unload_model(self, model_id: str) -> None:
-        async with self._pool_lock:
+        async with self._capacity_cond:
             manager = self._managers.get(model_id)
         if manager is None:
             return
@@ -262,6 +372,12 @@ class LocalModelManager:
                 "budget_net_gb": round(settings.effective_vram_budget_gb(), 2),
             },
             "models": models_status,
+            "capacity_queue": {
+                "enabled": settings.capacity_queue_enabled,
+                "waiters": len(self._capacity_waiters),
+                "max_waiters": settings.capacity_queue_max_waiters,
+                "timeout_seconds": settings.capacity_queue_timeout_seconds,
+            },
         }
 
     @property

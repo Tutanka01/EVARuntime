@@ -187,8 +187,17 @@ class VramBudgetResponse(BaseModel):
     budget_net_gb: float
 
 
+class CapacityQueueStatusResponse(BaseModel):
+    """État de la queue d'admission VRAM locale."""
+    enabled: bool
+    waiters: int
+    max_waiters: int
+    timeout_seconds: int
+
+
 class GatewayStatus(BaseModel):
     """Statut complet de la gateway — retourné par GET /admin/status."""
     status: str
     vram_budget: VramBudgetResponse
     models: list[ModelStatusResponse]
+    capacity_queue: Optional[CapacityQueueStatusResponse] = None

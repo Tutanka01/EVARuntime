@@ -589,8 +589,10 @@ print("Assistant :", reply)
 
 \subsection{Gestion robuste des erreurs}
 
-Dans un pipeline de traitement, les erreurs passagères (modèle en cours de chargement,
-limite de débit dépassée) sont inévitables. Voici un patron de code avec relance automatique :
+Dans un pipeline de traitement, les erreurs passagères (queue VRAM saturée ou expirée,
+limite de débit dépassée) sont inévitables. La gateway attend déjà le chargement ou
+la libération VRAM avant de répondre ; un 503 signifie que cette attente bornée a
+échoué. Voici un patron de code avec relance automatique :
 
 \begin{lstlisting}[style=pythonstyle, caption={Requête avec retry automatique et gestion des erreurs}]
 import time
@@ -609,7 +611,7 @@ def query_with_retry(messages: list[dict],
                      max_attempts: int = 3) -> str:
     """
     Envoie une requete avec retry automatique.
-    Attend le chargement du modele si necessaire (503).
+    Gere les 503 temporaires de queue VRAM/backend.
     """
     for attempt in range(1, max_attempts + 1):
         try:
@@ -622,9 +624,8 @@ def query_with_retry(messages: list[dict],
 
         except APIStatusError as e:
             if e.status_code == 503:
-                # Modele en cours de chargement — attendre et reessayer
-                wait = 30 * attempt
-                print(f"Modele en chargement, attente {wait}s "
+                wait = int(e.response.headers.get("Retry-After", 30 * attempt))
+                print(f"Service temporairement indisponible, attente {wait}s "
                       f"(tentative {attempt}/{max_attempts})...")
                 time.sleep(wait)
             elif e.status_code == 429:
@@ -1360,7 +1361,7 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
   \addlinespace
   429 & rate\_limit\_error & Limite RPM dépassée & Attendre 60~s ; voir l'en-tête \texttt{Retry-After} \\
   \addlinespace
-  503 & server\_error & Modèle en cours de chargement & Attendre 30 à 90~s et réessayer \\
+  503 & server\_error & Queue VRAM pleine/expirée ou backend temporaire & Respecter \texttt{Retry-After} si présent \\
   \addlinespace
   504 & server\_error & Timeout de génération & Réduire \texttt{max\_tokens} ou simplifier le prompt \\
   \addlinespace

@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     model_load_timeout_seconds: int = 180
     idle_check_interval_seconds: int = 30
 
+    # ── Queue d'admission VRAM ────────────────────────────────────────────────
+    # Quand un modèle ne peut pas être chargé car la VRAM/les ports sont
+    # temporairement occupés par des requêtes actives, attendre au lieu de
+    # retourner immédiatement 503. La queue reste bornée pour éviter l'abus.
+    capacity_queue_enabled: bool = True
+    capacity_queue_timeout_seconds: int = 120
+    capacity_queue_max_waiters: int = 100
+    capacity_queue_retry_after_seconds: int = 10
+
     # ── Sécurité ───────────────────────────────────────────────────────────────
     # Clé interne entre la gateway et llama-server (jamais exposée aux users)
     internal_api_key: str = "CHANGE_ME_INTERNAL_KEY"
@@ -114,6 +123,17 @@ class Settings(BaseSettings):
     def validate_max_models(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"max_loaded_models doit être ≥ 1, reçu : {v}")
+        return v
+
+    @field_validator(
+        "capacity_queue_timeout_seconds",
+        "capacity_queue_max_waiters",
+        "capacity_queue_retry_after_seconds",
+    )
+    @classmethod
+    def validate_capacity_queue_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"Valeur capacity_queue doit être ≥ 1, reçu : {v}")
         return v
 
     @field_validator("cluster_nodes_path", mode="before")

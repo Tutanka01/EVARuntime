@@ -252,6 +252,13 @@ IDLE_TIMEOUT_SECONDS=300        # décharger après 5 min sans requête
 # ↑ Augmenter si les utilisateurs reviennent souvent (ex: 600 pour 10 min)
 # ↓ Diminuer pour économiser l'électricité (ex: 120 pour 2 min)
 
+# ── Queue d'admission VRAM ────────────────────────────────────────────────────
+# Attend une libération VRAM/port au lieu de retourner 503 immédiatement.
+CAPACITY_QUEUE_ENABLED=true
+CAPACITY_QUEUE_TIMEOUT_SECONDS=120
+CAPACITY_QUEUE_MAX_WAITERS=100
+CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
+
 # ── Secrets (générés par install.sh — ne pas modifier manuellement) ───────────
 INTERNAL_API_KEY=<généré>
 ADMIN_SECRET=<généré>

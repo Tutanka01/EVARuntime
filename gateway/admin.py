@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 import database as db
 from auth import require_admin
 from config import settings
-from model_manager import model_manager
+from model_manager import CapacityQueueFull, CapacityQueueTimeout, model_manager
 from schemas import (
     GatewayStatus,
     KeyCreate,
@@ -245,6 +245,12 @@ async def load_model(
         raise HTTPException(status_code=404, detail=str(exc))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    except (CapacityQueueFull, CapacityQueueTimeout) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=str(exc),
+            headers={"Retry-After": str(settings.capacity_queue_retry_after_seconds)},
+        )
     except (RuntimeError, TimeoutError) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 

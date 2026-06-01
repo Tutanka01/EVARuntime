@@ -168,16 +168,26 @@ Déjà READY ? ──oui──► retourner le manager (fast path, sans lock)
     ──non──► éviction LRU (modèle READY le plus ancien, non pinné)
                     │
                     ├─ modèle idle trouvé → unload → recommencer la vérification
-                    ├─ aucun idle mais modèles LOADING → RuntimeError 503
-                    │  "Réessayez dans quelques secondes"
-                    └─ aucun idle, tous pinnés → RuntimeError 503
-                       liste des modèles avec requêtes actives
+                    ├─ aucun idle mais capacité temporaire possible
+                    │  → queue FIFO bornée (défaut : 120s, 100 waiters)
+                    ├─ queue expirée ou pleine → 503 + Retry-After
+                    └─ modèle > budget VRAM net → RuntimeError 503 immédiat
 ```
 
 **Point critique** : les deux contraintes (VRAM **et** pool de ports) déclenchent
-l'éviction LRU. Avant ce comportement, un pool de ports plein retournait un 503 immédiat
-même si la VRAM aurait permis le chargement — le modèle le plus récemment utilisé
-n'était pas évincé pour libérer un slot.
+l'éviction LRU. Si aucune éviction sûre n'est possible parce que les modèles sont
+actifs ou en chargement, la requête attend dans la queue d'admission VRAM au lieu
+de recevoir immédiatement un 503. La queue est volontairement bornée pour éviter
+l'épuisement de connexions en cas d'abus ou de saturation prolongée.
+
+Variables d'environnement :
+
+| Variable | Défaut | Rôle |
+|---|---:|---|
+| `CAPACITY_QUEUE_ENABLED` | `true` | Active l'attente bornée avant chargement |
+| `CAPACITY_QUEUE_TIMEOUT_SECONDS` | `120` | Temps maximal d'attente d'une requête |
+| `CAPACITY_QUEUE_MAX_WAITERS` | `100` | Nombre maximal de requêtes en attente |
+| `CAPACITY_QUEUE_RETRY_AFTER_SECONDS` | `10` | Valeur de l'en-tête `Retry-After` en cas de 503 queue |
 
 ### Éviction LRU
 
@@ -188,6 +198,8 @@ ancien est choisi.
 **Propriété de sécurité :** une inférence en cours ne peut jamais être
 interrompue par l'éviction. `is_pinned` (compteur `_active_requests > 0`) protège
 le modèle entre `manager.pin()` (avant proxy) et `manager.unpin()` (dans le finally).
+Quand `unpin()` fait retomber ce compteur à zéro, les requêtes en attente sont
+réveillées et peuvent retenter l'éviction LRU.
 
 ---
 

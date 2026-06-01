@@ -44,7 +44,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import database as db
 from config import settings
-from model_manager import ModelManager
+from model_manager import CapacityQueueFull, CapacityQueueTimeout, ModelManager
 from server_manager import ServerManager
 
 log = logging.getLogger(__name__)
@@ -115,6 +115,13 @@ async def proxy_request(
         return _openai_error(404, str(exc), "model_not_found")
     except PermissionError as exc:
         return _openai_error(403, str(exc), "model_disabled")
+    except (CapacityQueueFull, CapacityQueueTimeout) as exc:
+        return _openai_error(
+            503,
+            str(exc),
+            "server_error",
+            headers={"Retry-After": str(settings.capacity_queue_retry_after_seconds)},
+        )
     except TimeoutError as exc:
         return _openai_error(503, str(exc), "server_error")
     except RuntimeError as exc:
@@ -368,9 +375,15 @@ def models_response(model_manager: ModelManager) -> JSONResponse:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _openai_error(status_code: int, message: str, error_type: str) -> JSONResponse:
+def _openai_error(
+    status_code: int,
+    message: str,
+    error_type: str,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "error": {
                 "message": message,
