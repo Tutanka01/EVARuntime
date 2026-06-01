@@ -288,7 +288,7 @@ echo "     sudo nano $CONFIG_FILE"
 echo "     sudo nano $MODELS_FILE"
 echo ""
 echo "  3. Configurer le certificat TLS :"
-echo "     sudo certbot certonly --nginx -d llm.univ-pau.fr"
+echo "     sudo certbot certonly --nginx -d llm.eva.univ-pau.fr"
 echo "     sudo nano /etc/nginx/sites-available/llm-gateway  # adapter le domaine"
 echo ""
 echo "  4. Démarrer le service :"
@@ -302,7 +302,7 @@ echo "     sudo -u $SERVICE_USER ./venv/bin/python cli.py add-user alice --email
 echo "     sudo -u $SERVICE_USER ./venv/bin/python cli.py create-key alice --name 'these-2025'"
 echo ""
 echo "  6. Tester :"
-echo '     curl -s https://llm.univ-pau.fr/v1/chat/completions \'
+echo '     curl -s https://llm.eva.univ-pau.fr/v1/chat/completions \'
 echo '       -H "Authorization: Bearer <VOTRE_CLE>" \'
 echo '       -H "Content-Type: application/json" \'
 echo '       -d '"'"'{"model":"llama-3.3-70b-instruct","messages":[{"role":"user","content":"Bonjour !"}]}'"'"

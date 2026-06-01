@@ -35,7 +35,7 @@ ReadWritePaths=/var/lib/llm-gateway-student /var/log/llm-gateway-student
 
 IPAddressDeny=any
 IPAddressAllow=127.0.0.0/8
-IPAddressAllow=10.10.0.10
+IPAddressAllow=192.0.2.10
 
 LimitNOFILE=8192
 LimitNPROC=512
