@@ -18,10 +18,11 @@ from server_manager import ModelState
 
 
 class FakeModelDef:
-    def __init__(self, mid: str, vram: float, enabled: bool = True):
+    def __init__(self, mid: str, vram: float, enabled: bool = True, fail_load_once: bool = False):
         self.id = mid
         self.vram_gb = vram
         self.enabled = enabled
+        self.fail_load_once = fail_load_once
         self.description = ""
         self.path = Path(f"/models/{mid}.gguf")
         self.capabilities = ["text_generation"]
@@ -91,6 +92,10 @@ class FakeServerManager:
         return self._active_requests
 
     async def ensure_loaded(self):
+        if getattr(self._model, "fail_load_once", False):
+            self._model.fail_load_once = False
+            self._state = ModelState.UNLOADED
+            raise RuntimeError("cudaMalloc failed: out of memory")
         self._state = ModelState.READY
         self._last_request_time = time.monotonic()
         if self._on_capacity_change:
@@ -210,6 +215,23 @@ async def test_evicts_idle_model_without_queue(capacity_settings, monkeypatch):
     new_server = await manager.ensure_model_loaded("new")
 
     assert new_server.model.id == "new"
+    assert "old" not in manager._managers
+    assert manager.status()["capacity_queue"]["waiters"] == 0
+
+
+@pytest.mark.anyio
+async def test_load_oom_retries_after_extra_eviction(capacity_settings, monkeypatch):
+    monkeypatch.setattr(settings, "total_vram_gb", 20.0)
+    monkeypatch.setattr(settings, "max_loaded_models", 2)
+    old = FakeModelDef("old", 10.0)
+    new = FakeModelDef("new", 5.0, fail_load_once=True)
+    manager = make_manager(monkeypatch, [old, new])
+    add_loaded(manager, old, active_requests=0, last_request_time=time.monotonic() - 100)
+
+    new_server = await manager.ensure_model_loaded("new")
+
+    assert new_server.model.id == "new"
+    assert new_server.state == ModelState.READY
     assert "old" not in manager._managers
     assert manager.status()["capacity_queue"]["waiters"] == 0
 

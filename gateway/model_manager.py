@@ -97,37 +97,57 @@ class LocalModelManager:
                 f"Activez-le via PATCH /admin/models/{model_id}."
             )
 
-        manager = self._managers.get(model_id)
-        if manager and manager.state == ModelState.READY:
-            await manager.ensure_loaded()
-            return manager
-
-        async with self._capacity_cond:
+        force_extra_eviction = False
+        last_error: Exception | None = None
+        for attempt in range(2):
             manager = self._managers.get(model_id)
-            if manager and manager.state in (ModelState.READY, ModelState.LOADING, ModelState.UNLOADED):
-                pass
-            else:
-                await self._ensure_capacity(model)
+            if manager and manager.state == ModelState.READY:
+                await manager.ensure_loaded()
+                return manager
 
-                port = self._port_pool.pop(0)
-                self._allocated_ports[model_id] = port
+            async with self._capacity_cond:
+                manager = self._managers.get(model_id)
+                if manager and manager.state in (ModelState.READY, ModelState.LOADING, ModelState.UNLOADED):
+                    pass
+                else:
+                    await self._ensure_capacity(model, force_extra_eviction=force_extra_eviction)
 
-                manager = ServerManager(
-                    model=model,
-                    port=port,
-                    on_unload=self._on_model_unloaded,
-                    on_capacity_change=self._notify_capacity_changed,
-                )
-                self._managers[model_id] = manager
-                log.info(
-                    "Nouveau ServerManager créé pour '%s' sur port %d "
-                    "(%.1f GB VRAM estimée, budget restant après : %.1f GB)",
-                    model_id, port, model.vram_gb,
-                    self._available_vram_gb() - model.vram_gb,
-                )
+                    port = self._port_pool.pop(0)
+                    self._allocated_ports[model_id] = port
 
-        await manager.ensure_loaded()
-        return manager
+                    manager = ServerManager(
+                        model=model,
+                        port=port,
+                        on_unload=self._on_model_unloaded,
+                        on_capacity_change=self._notify_capacity_changed,
+                    )
+                    self._managers[model_id] = manager
+                    log.info(
+                        "Nouveau ServerManager créé pour '%s' sur port %d "
+                        "(%.1f GB VRAM estimée, budget restant après : %.1f GB)",
+                        model_id, port, model.vram_gb,
+                        self._available_vram_gb() - model.vram_gb,
+                    )
+
+            try:
+                await manager.ensure_loaded()
+                return manager
+            except Exception as exc:
+                last_error = exc
+                await self._forget_failed_manager(model_id, manager)
+                if attempt == 0 and self._is_load_capacity_error(exc):
+                    force_extra_eviction = True
+                    log.warning(
+                        "Chargement de '%s' refusé par CUDA malgré le budget estimé. "
+                        "Nettoyage puis nouvelle tentative après libération VRAM réelle.",
+                        model_id,
+                    )
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Impossible de charger '{model_id}'.")
 
     # ── Budget VRAM ───────────────────────────────────────────────────────────
 
@@ -143,7 +163,12 @@ class LocalModelManager:
     def _available_vram_gb(self) -> float:
         return settings.effective_vram_budget_gb() - self._used_vram_gb()
 
-    async def _ensure_capacity(self, model: ModelDefinition) -> None:
+    async def _ensure_capacity(
+        self,
+        model: ModelDefinition,
+        *,
+        force_extra_eviction: bool = False,
+    ) -> None:
         """
         Vérifie que VRAM et port sont disponibles. Évinçe LRU si nécessaire.
         Doit être appelé sous _capacity_cond.
@@ -156,6 +181,7 @@ class LocalModelManager:
             )
 
         ticket: object | None = None
+        extra_eviction_done = not force_extra_eviction
         deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
         try:
             while True:
@@ -167,6 +193,13 @@ class LocalModelManager:
                 )
 
                 if is_turn:
+                    if not extra_eviction_done:
+                        evicted = await self._evict_lru_idle(exclude=model.id)
+                        if evicted:
+                            extra_eviction_done = True
+                        elif not self._has_temporary_capacity_blocker(model):
+                            extra_eviction_done = True
+
                     while not self._has_capacity_for(model):
                         reasons = self._capacity_reasons(model)
                         log.warning(
@@ -177,7 +210,7 @@ class LocalModelManager:
                         if not evicted:
                             break
 
-                    if self._has_capacity_for(model):
+                    if extra_eviction_done and self._has_capacity_for(model):
                         return
 
                 if not settings.capacity_queue_enabled:
@@ -273,6 +306,41 @@ class LocalModelManager:
             f"Aucun modèle idle à évincer. Attendez la fin des requêtes en cours "
             f"ou déchargez un modèle manuellement via POST /admin/models/{model.id}/unload."
         )
+
+    def _has_temporary_capacity_blocker(self, model: ModelDefinition) -> bool:
+        for mid, mgr in self._managers.items():
+            if mid == model.id:
+                continue
+            if mgr.state == ModelState.LOADING:
+                return True
+            if mgr.state == ModelState.READY and mgr.is_pinned:
+                return True
+        return False
+
+    @staticmethod
+    def _is_load_capacity_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(
+            marker in text
+            for marker in (
+                "cuda",
+                "out of memory",
+                "unable to allocate",
+                "failed to allocate",
+                "failed to fit params to free device memory",
+                "cudamalloc failed",
+            )
+        )
+
+    async def _forget_failed_manager(self, model_id: str, manager: ServerManager) -> None:
+        async with self._capacity_cond:
+            if self._managers.get(model_id) is manager:
+                self._managers.pop(model_id, None)
+            port = self._allocated_ports.pop(model_id, None)
+            if port is not None and port not in self._port_pool:
+                self._port_pool.append(port)
+                log.debug("Port %d libéré après échec de chargement (modèle '%s')", port, model_id)
+            self._capacity_cond.notify_all()
 
     async def _evict_lru_idle(self, exclude: str) -> bool:
         candidates = [
