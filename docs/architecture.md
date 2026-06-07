@@ -102,6 +102,35 @@ Le champ `mmproj_path` est transmis à llama-server via le flag `--mmproj` uniqu
 quand `vision` est présent dans `capabilities`. Sans ce fichier, llama-server démarre
 normalement mais retourne HTTP 500 sur toute requête contenant une image.
 
+### Speculative decoding MTP
+
+Un bloc optionnel `speculative:` active le **Multi-Token Prediction** (MTP) sur les
+modèles dont la tête MTP est intégrée au GGUF (DeepSeek-V3, GLM, etc.) :
+
+```yaml
+  - id: "deepseek-v3-mtp"
+    path: "/models/DeepSeek-V3-Q4_K_M.gguf"
+    vram_gb: 42.0
+    capabilities: [text_generation, streaming]
+    speculative:
+      type: mtp        # seul type supporté actuellement
+      draft_max: 16    # --spec-draft-n-max : nb de tokens draftés
+      draft_min: 0     # --spec-draft-n-min (optionnel)
+      draft_p_min: 0.0 # --spec-draft-p-min, proba min greedy (optionnel)
+```
+
+`build_llama_cmd` traduit ce bloc en flags `--spec-type draft-mtp --spec-draft-n-max …`.
+**Invariant VRAM :** la tête MTP est dans le même GGUF, donc MTP **n'ajoute pas de
+VRAM** — `vram_gb` reste l'empreinte du modèle seul, et la logique de capacité/éviction
+est inchangée. Absent, le bloc ne produit aucun flag : comportement strictement
+identique à avant (rétrocompatible).
+
+**Local et cluster :** la définition transite vers les `node_agent` sous forme de dict
+(`to_dict()` → `LoadRequest.model` → `_parse_entry`), donc le bloc `speculative` est
+re-validé et appliqué à l'identique sur les nodes — aucun changement de protocole. Le
+binaire `llama-server` de chaque node doit supporter `--spec-type` (vérifier avec
+`llama-server --help | grep spec`).
+
 ### Validation à la charge
 
 `ModelRegistry._load()` applique plusieurs couches de validation avant d'accepter une entrée :

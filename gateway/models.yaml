@@ -18,6 +18,16 @@
 #                 retourne HTTP 500 sur toute requête contenant une image.
 #                 Exemple : /models/llava-v1.6-mistral-7b-mmproj-f16.gguf
 #   llama_params: paramètres llama-server (surcharge les défauts)
+#   speculative : speculative decoding MTP (Multi-Token Prediction). Bloc optionnel.
+#                 La tête MTP est INTÉGRÉE au GGUF (DeepSeek-V3, GLM, etc.) — pas de
+#                 modèle draft séparé, pas de VRAM additionnelle (vram_gb inchangé).
+#                 Champs : type (mtp), draft_max (nb tokens draftés, défaut 16),
+#                 draft_min (défaut 0), draft_p_min (proba min greedy, défaut 0.0).
+#                 Le binaire llama-server doit supporter --spec-type (vérifier avec
+#                 « llama-server --help | grep spec »). Exemple :
+#                   speculative:
+#                     type: mtp
+#                     draft_max: 16
 #
 # IMPORTANT — estimation vram_gb :
 #   Inclure : poids du modèle + KV cache à concurrence nominale (parallel × ctx_size)

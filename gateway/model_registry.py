@@ -40,6 +40,11 @@ _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 # Types valides pour la quantisation du KV cache
 _CACHE_TYPES = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
 
+# Types de speculative decoding supportés. Pour l'instant uniquement MTP
+# (Multi-Token Prediction) — tête intégrée au GGUF, pas de modèle draft séparé.
+# Extensible plus tard (draft-simple, draft-eagle3, ngram-*…).
+_SPEC_TYPES = {"mtp"}
+
 
 @dataclass
 class LlamaParams:
@@ -77,6 +82,38 @@ class LlamaParams:
 
 
 @dataclass
+class SpeculativeParams:
+    """
+    Paramètres de speculative decoding MTP (Multi-Token Prediction).
+
+    MTP utilise une tête de prédiction multi-tokens intégrée AU MÊME GGUF
+    (DeepSeek-V3, GLM, etc.) : aucun modèle draft séparé, aucune VRAM
+    additionnelle. La tête propose plusieurs tokens d'avance, vérifiés en un
+    seul forward pass. Mappé sur les flags llama-server --spec-* .
+    """
+    type: str = "mtp"
+    draft_max: int = 16       # --spec-draft-n-max : nb de tokens draftés par étape
+    draft_min: int = 0        # --spec-draft-n-min : minimum de draft tokens
+    draft_p_min: float = 0.0  # --spec-draft-p-min : proba min d'acceptation (greedy)
+
+    def __post_init__(self) -> None:
+        if self.type not in _SPEC_TYPES:
+            raise ValueError(
+                f"type de speculative invalide : {self.type!r}. Valeurs : {_SPEC_TYPES}"
+            )
+        if self.draft_max < 1:
+            raise ValueError(f"draft_max doit être ≥ 1, reçu : {self.draft_max}")
+        if self.draft_min < 0:
+            raise ValueError(f"draft_min doit être ≥ 0, reçu : {self.draft_min}")
+        if self.draft_min > self.draft_max:
+            raise ValueError(
+                f"draft_min ({self.draft_min}) doit être ≤ draft_max ({self.draft_max})"
+            )
+        if not (0.0 <= self.draft_p_min <= 1.0):
+            raise ValueError(f"draft_p_min doit être dans [0, 1], reçu : {self.draft_p_min}")
+
+
+@dataclass
 class ModelDefinition:
     """
     Définition complète d'un modèle enregistré dans le registre.
@@ -96,6 +133,9 @@ class ModelDefinition:
     # Surcharge settings.model_load_timeout_seconds si défini.
     # Utile pour les modèles massifs (ex: MiniMax M2.7 — 248 GB, ~10 min).
     load_timeout_seconds: int | None = None
+    # Speculative decoding MTP (tête intégrée au GGUF). None = désactivé.
+    # N'ajoute pas de VRAM (pas de modèle draft séparé) — vram_gb inchangé.
+    speculative: SpeculativeParams | None = None
 
     def build_llama_cmd(
         self,
@@ -133,6 +173,14 @@ class ModelDefinition:
             cmd += ["--cpu-moe"]
         if self.mmproj_path is not None and "vision" in self.capabilities:
             cmd += ["--mmproj", str(self.mmproj_path)]
+        if self.speculative is not None:
+            s = self.speculative
+            # MTP : --spec-type draft-mtp active la tête intégrée au GGUF.
+            cmd += ["--spec-type", f"draft-{s.type}", "--spec-draft-n-max", str(s.draft_max)]
+            if s.draft_min:
+                cmd += ["--spec-draft-n-min", str(s.draft_min)]
+            if s.draft_p_min:
+                cmd += ["--spec-draft-p-min", str(s.draft_p_min)]
         return cmd
 
     def to_dict(self) -> dict:
@@ -166,6 +214,14 @@ class ModelDefinition:
             d["mmproj_path"] = str(self.mmproj_path)
         if self.load_timeout_seconds is not None:
             d["load_timeout_seconds"] = self.load_timeout_seconds
+        if self.speculative is not None:
+            s = self.speculative
+            d["speculative"] = {
+                "type": s.type,
+                "draft_max": s.draft_max,
+                "draft_min": s.draft_min,
+                "draft_p_min": s.draft_p_min,
+            }
         return d
 
 
@@ -254,6 +310,15 @@ class ModelRegistry:
                     f"[{model_id}] load_timeout_seconds doit être ≥ 30, reçu : {load_timeout_seconds}"
                 )
 
+        # speculative — bloc optionnel MTP. Absent = comportement inchangé.
+        spec_raw = entry.get("speculative")
+        speculative: SpeculativeParams | None = None
+        if spec_raw:
+            try:
+                speculative = SpeculativeParams(**spec_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"[{model_id}] speculative invalide : {exc}") from exc
+
         return ModelDefinition(
             id=model_id,
             path=path,
@@ -264,6 +329,7 @@ class ModelRegistry:
             llama_params=llama_params,
             mmproj_path=mmproj_path,
             load_timeout_seconds=load_timeout_seconds,
+            speculative=speculative,
         )
 
     def _validate_model_id(self, model_id: str) -> None:
@@ -350,7 +416,7 @@ class ModelRegistry:
         model = self._models.get(model_id)
         if not model:
             raise KeyError(f"Modèle inconnu : '{model_id}'")
-        # Recréer avec le nouveau flag enabled
+        # Recréer avec le nouveau flag enabled — préserver tous les champs optionnels
         updated = ModelDefinition(
             id=model.id,
             path=model.path,
@@ -360,6 +426,8 @@ class ModelRegistry:
             capabilities=model.capabilities,
             llama_params=model.llama_params,
             mmproj_path=model.mmproj_path,
+            load_timeout_seconds=model.load_timeout_seconds,
+            speculative=model.speculative,
         )
         self._models[model_id] = updated
         self._save()
@@ -400,6 +468,7 @@ class ModelRegistry:
             llama_params=new_llama_params,
             mmproj_path=model.mmproj_path,
             load_timeout_seconds=model.load_timeout_seconds,
+            speculative=model.speculative,
         )
         if updated.vram_gb <= 0:
             raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")

@@ -629,6 +629,37 @@ curl -s -X PATCH "$GW/admin/models/llama-3.3-70b-instruct" \
 > doit correspondre à l'utilisation **avec** `cpu_moe` (uniquement les couches attention +
 > embeddings restent en GPU).
 
+#### Speculative decoding MTP (`speculative`) — YAML uniquement
+
+Le bloc `speculative` active le **Multi-Token Prediction** (tête intégrée au GGUF,
+sans modèle draft séparé). Il se déclare **par édition manuelle de `models.yaml`** —
+il n'est pas encore exposé via l'API admin (pas de champ `speculative` dans le corps
+POST/PATCH). Après édition, redémarrer le gateway (le registre relit `models.yaml` au
+démarrage) ; le modèle sera lancé avec les nouveaux flags `--spec-*` à son prochain
+chargement (au besoin `POST /admin/models/{id}/unload` puis `/load`).
+
+```yaml
+    speculative:
+      type: mtp        # seul type supporté
+      draft_max: 16    # --spec-draft-n-max : nb de tokens draftés (défaut 16)
+      draft_min: 0     # --spec-draft-n-min (optionnel, défaut 0)
+      draft_p_min: 0.0 # --spec-draft-p-min (optionnel, défaut 0.0)
+```
+
+| Champ | Type | Défaut | Description |
+|-------|------|--------|-------------|
+| `type` | str | `mtp` | Type de speculative (seul `mtp` supporté) |
+| `draft_max` | int | 16 | Nb de tokens draftés par étape (`--spec-draft-n-max`) |
+| `draft_min` | int | 0 | Minimum de draft tokens (`--spec-draft-n-min`) |
+| `draft_p_min` | float | 0.0 | Proba min d'acceptation greedy (`--spec-draft-p-min`) |
+
+> **VRAM inchangée** : la tête MTP est dans le même GGUF, donc `vram_gb` reste
+> l'empreinte du modèle seul (aucun second modèle à charger).
+> **Prérequis** : le binaire `llama-server` doit supporter `--spec-type`
+> (vérifier avec `llama-server --help | grep spec`). En cluster, c'est le binaire
+> de chaque **node** qui doit le supporter. Le bloc `speculative` est visible dans
+> `GET /admin/status` une fois le modèle chargé.
+
 ### Enregistrer un nouveau modèle (sans redémarrage)
 
 ```bash

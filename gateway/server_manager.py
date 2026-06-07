@@ -435,4 +435,14 @@ class ServerManager:
                 "cache_type_v": self._model.llama_params.cache_type_v,
                 "cpu_moe": self._model.llama_params.cpu_moe,
             },
+            "speculative": (
+                {
+                    "type": self._model.speculative.type,
+                    "draft_max": self._model.speculative.draft_max,
+                    "draft_min": self._model.speculative.draft_min,
+                    "draft_p_min": self._model.speculative.draft_p_min,
+                }
+                if self._model.speculative is not None
+                else None
+            ),
         }
