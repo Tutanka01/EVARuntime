@@ -66,7 +66,7 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 ```
 
 ---
-
+ 
 ## Registre des modèles (models.yaml)
 
 ### Source de vérité
