@@ -58,9 +58,14 @@ def _cmd(model):
         binary=Path("/usr/bin/llama-server"),
         host="127.0.0.1",
         port=8081,
-        internal_api_key="k",
         log_path=Path("/tmp/x.log"),
     )
+
+
+def test_cmd_never_contains_api_key():
+    """La clé interne passe par l'env (LLAMA_API_KEY), jamais par argv (visible via ps)."""
+    cmd = _cmd(_model())
+    assert "--api-key" not in cmd
 
 
 def test_no_speculative_block_emits_no_spec_flags():

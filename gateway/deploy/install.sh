@@ -99,8 +99,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
 
+# Package cluster/ — requis en CLUSTER_MODE=cluster (importé par model_manager)
+mkdir -p "$INSTALL_DIR/cluster"
+cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
+
+# Fichiers statiques (dashboard admin servi par /admin/dashboard)
+if [[ -d "$SCRIPT_DIR/static" ]]; then
+    mkdir -p "$INSTALL_DIR/static"
+    cp -r "$SCRIPT_DIR/static/." "$INSTALL_DIR/static/"
+fi
+
 chown -R root:"$SERVICE_USER" "$INSTALL_DIR"
 chmod -R 640 "$INSTALL_DIR"/*.py
+chmod 640 "$INSTALL_DIR/cluster"/*.py
+chmod 750 "$INSTALL_DIR/cluster"
+if [[ -d "$INSTALL_DIR/static" ]]; then
+    find "$INSTALL_DIR/static" -type d -exec chmod 755 {} \;
+    find "$INSTALL_DIR/static" -type f -exec chmod 644 {} \;
+fi
 chmod 644 "$INSTALL_DIR/requirements.txt"
 
 # ── 5. Environnement virtuel Python ──────────────────────────────────────────

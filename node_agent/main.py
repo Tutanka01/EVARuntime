@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import sys
 import tempfile
 from contextlib import asynccontextmanager
@@ -62,7 +63,21 @@ _bearer = HTTPBearer(auto_error=True)
 def require_agent_secret(
     creds: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> None:
-    if creds.credentials != settings.agent_secret:
+    # Fail-closed : l'agent écoute sur le réseau (0.0.0.0 par défaut) — un
+    # secret laissé à sa valeur d'exemple équivaudrait à aucune authentification.
+    if settings.agent_secret_is_placeholder():
+        log.critical(
+            "Requête refusée : AGENT_SECRET non configuré (vide ou CHANGE_ME_*). "
+            "Définissez un secret fort identique sur l'orchestrateur et l'agent."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Agent désactivé : AGENT_SECRET non configuré.",
+        )
+    # Comparaison constant-time — évite les attaques par timing sur le secret
+    if not secrets.compare_digest(
+        creds.credentials.encode(), settings.agent_secret.encode()
+    ):
         raise HTTPException(status_code=401, detail="Agent secret invalide.")
 
 
@@ -238,6 +253,11 @@ async def lifespan(app: FastAPI):
         "=== Node Agent démarrage — node_id=%s, port=%d ===",
         settings.node_id, settings.agent_port,
     )
+    if settings.agent_secret_is_placeholder():
+        log.critical(
+            "AGENT_SECRET non configuré (vide ou CHANGE_ME_*) — toutes les "
+            "requêtes seront refusées (503) tant qu'un secret fort n'est pas défini."
+        )
     log.info(
         "Budget VRAM : %.1f GB total → %.1f GB net",
         settings.total_vram_gb, settings.effective_vram_budget_gb(),

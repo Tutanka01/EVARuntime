@@ -142,10 +142,15 @@ class ModelDefinition:
         binary: Path,
         host: str,
         port: int,
-        internal_api_key: str,
         log_path: Path,
     ) -> list[str]:
-        """Construit la liste d'arguments pour lancer llama-server."""
+        """
+        Construit la liste d'arguments pour lancer llama-server.
+
+        La clé interne n'apparaît volontairement PAS ici : elle est transmise
+        via la variable d'environnement LLAMA_API_KEY (cf. ServerManager).
+        Les arguments de commande sont visibles via ps/procfs et dans les logs.
+        """
         p = self.llama_params
         cmd = [
             str(binary),
@@ -164,7 +169,6 @@ class ModelDefinition:
             "--cont-batching",
             "--cache-prompt",
             "--metrics",
-            "--api-key", internal_api_key,
             "--log-file", str(log_path),
         ]
         if p.flash_attn:
@@ -236,7 +240,12 @@ class ModelRegistry:
 
     def __init__(self, config_path: Path, allowed_model_dirs: list[str] | None = None) -> None:
         self._path = config_path
-        self._allowed_dirs: list[Path] = [Path(d) for d in (allowed_model_dirs or [])]
+        # Résolus dès l'init : les chemins de modèles sont comparés après
+        # resolve(), les répertoires autorisés doivent l'être aussi (sinon un
+        # répertoire autorisé qui est un symlink rejetterait tous les modèles).
+        self._allowed_dirs: list[Path] = [
+            Path(d).resolve() for d in (allowed_model_dirs or [])
+        ]
         self._models: dict[str, ModelDefinition] = {}
         self._load()
 

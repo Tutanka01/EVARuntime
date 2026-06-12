@@ -237,7 +237,17 @@ async def lookup_key(raw_key: str) -> dict | None:
 
     row = dict(row)
     if row["expires_at"]:
-        if row["expires_at"] < datetime.now(timezone.utc).isoformat():
+        # Parsing réel plutôt que comparaison lexicale : les formats ISO 8601
+        # ("2026-01-01", "2026-01-01 12:00:00", avec/sans timezone) ne se
+        # comparent pas correctement en tant que chaînes. Fail-closed si le
+        # format est invalide.
+        try:
+            expires = datetime.fromisoformat(str(row["expires_at"]))
+        except ValueError:
+            return None
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires < datetime.now(timezone.utc):
             return None
 
     return row
@@ -286,6 +296,25 @@ async def touch_key_last_used(key_id: int) -> None:
 
 
 # ── Helpers usage ─────────────────────────────────────────────────────────────
+
+async def tokens_used_last_30_days(user_id: int) -> int:
+    """
+    Total de tokens consommés sur les 30 derniers jours (fenêtre glissante).
+    Utilisé pour appliquer monthly_token_limit — même fenêtre que le dashboard
+    (tokens_30d dans get_user_period_stats). Requête couverte par idx_usage_user_time.
+    """
+    async with get_db() as db:
+        row = await (await db.execute(
+            """
+            SELECT COALESCE(SUM(total_tokens), 0) AS total
+            FROM usage_log
+            WHERE user_id = ?
+              AND timestamp >= datetime('now', '-30 days')
+            """,
+            (user_id,),
+        )).fetchone()
+        return int(row["total"] or 0)
+
 
 async def log_usage(
     user_id: int,

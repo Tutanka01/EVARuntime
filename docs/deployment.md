@@ -260,8 +260,17 @@ CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 
 # ── Secrets (générés par install.sh — ne pas modifier manuellement) ───────────
+# IMPORTANT : les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou
+# laissé à une valeur d'exemple CHANGE_ME_*. La clé interne est transmise à
+# llama-server via la variable d'environnement LLAMA_API_KEY (jamais en argument
+# de commande, qui serait visible via ps).
 INTERNAL_API_KEY=<généré>
 ADMIN_SECRET=<généré>
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Origines navigateur autorisées (séparées par des virgules). "*" par défaut ;
+# en production, restreindre aux domaines clients connus.
+# CORS_ALLOW_ORIGINS=https://app.univ-pau.fr
 ```
 
 ---
@@ -881,6 +890,11 @@ sudo nano /etc/llm-gateway-agent/env
 sudo systemctl start llm-gateway-agent
 sudo journalctl -fu llm-gateway-agent
 ```
+
+> **Fail-closed :** un `AGENT_SECRET` vide ou laissé à sa valeur d'exemple
+> (`CHANGE_ME_*`) fait refuser toutes les requêtes par l'agent (503), et la
+> gateway refuse de démarrer en `CLUSTER_MODE=cluster` tant que ce secret
+> n'est pas défini.
 
 ### Configuration TLS (certificats auto-signés)
 

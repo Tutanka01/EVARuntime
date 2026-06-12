@@ -46,6 +46,11 @@ Toutes les routes `/admin/` nécessitent :
 - L'`ADMIN_SECRET` (dans `/etc/llm-gateway/env`) en Bearer token
 - Être sur le réseau campus (filtrage IP nginx)
 
+> **Fail-closed :** si `ADMIN_SECRET` est vide ou laissé à sa valeur d'exemple
+> (`CHANGE_ME_*`), toutes les routes `/admin/` répondent 503 tant qu'un secret
+> fort n'est pas configuré. Générer avec :
+> `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`
+
 ```bash
 # Récupérer l'ADMIN_SECRET
 sudo grep ADMIN_SECRET /etc/llm-gateway/env
@@ -90,7 +95,7 @@ curl -s -X POST "$GW/admin/users" \
 | Paramètre | Défaut | Description |
 |-----------|--------|-------------|
 | `rpm_limit` | 20 | Requêtes par minute maximum |
-| `monthly_token_limit` | 0 | Quota tokens/mois (0 = illimité) |
+| `monthly_token_limit` | 0 | Quota tokens/mois (0 = illimité). Appliqué sur une fenêtre glissante de 30 jours : tout dépassement retourne 429 jusqu'à ce que la consommation repasse sous la limite |
 | `email` | — | Email institutionnel (optionnel) |
 | `notes` | — | Notes libres pour l'admin |
 

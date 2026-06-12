@@ -99,5 +99,9 @@ class AgentSettings(BaseSettings):
             - self.total_vram_gb * self.vram_safety_margin
         )
 
+    def agent_secret_is_placeholder(self) -> bool:
+        """True si AGENT_SECRET est vide ou laissé à sa valeur d'exemple."""
+        return not self.agent_secret or self.agent_secret.strip().upper().startswith("CHANGE_ME")
+
 
 settings = AgentSettings()

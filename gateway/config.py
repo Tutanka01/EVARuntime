@@ -12,6 +12,11 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def secret_is_placeholder(secret: str) -> bool:
+    """True si un secret est vide ou laissé à sa valeur d'exemple CHANGE_ME_*."""
+    return not secret or secret.strip().upper().startswith("CHANGE_ME")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -78,6 +83,12 @@ class Settings(BaseSettings):
     gateway_host: str = "127.0.0.1"
     gateway_port: int = 8000
 
+    # ── CORS ──────────────────────────────────────────────────────────────────
+    # Origines autorisées, séparées par des virgules.
+    # "*" (défaut) convient en dev ; en production, restreindre aux domaines
+    # clients connus : CORS_ALLOW_ORIGINS=https://app.univ-pau.fr
+    cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"])
+
     # ── Rate limiting par défaut ───────────────────────────────────────────────
     default_rpm_limit: int = 20
     # 0 = quota mensuel illimité
@@ -141,6 +152,13 @@ class Settings(BaseSettings):
     def coerce_cluster_path(cls, v: object) -> Path:
         return Path(str(v))
 
+    @field_validator("cors_allow_origins", mode="before")
+    @classmethod
+    def split_cors_origins(cls, v: object) -> object:
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",") if origin.strip()]
+        return v
+
     @field_validator("cluster_health_interval", "cluster_health_failures_to_offline")
     @classmethod
     def validate_cluster_positive(cls, v: int) -> int:
@@ -151,6 +169,15 @@ class Settings(BaseSettings):
     def effective_vram_budget_gb(self) -> float:
         """Budget VRAM net disponible pour les modèles (après overhead et marge)."""
         return self.total_vram_gb - self.vram_overhead_gb - (self.total_vram_gb * self.vram_safety_margin)
+
+    def admin_secret_is_placeholder(self) -> bool:
+        return secret_is_placeholder(self.admin_secret)
+
+    def internal_api_key_is_placeholder(self) -> bool:
+        return secret_is_placeholder(self.internal_api_key)
+
+    def agent_secret_is_placeholder(self) -> bool:
+        return secret_is_placeholder(self.agent_secret)
 
 
 # Instance globale — importée partout dans l'application

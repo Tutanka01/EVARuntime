@@ -12,14 +12,15 @@ La mise à jour de last_used est faite en fire-and-forget (hors critical path).
 """
 from __future__ import annotations
 
-import asyncio
 import logging
+import secrets
 
 from fastapi import HTTPException, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import JSONResponse
 
 import database as db
+from background import fire_and_forget
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ async def get_current_user(
         )
 
     # Mise à jour last_used en arrière-plan — non bloquant
-    asyncio.create_task(db.touch_key_last_used(user["key_id"]))
+    fire_and_forget(db.touch_key_last_used(user["key_id"]), name="touch_key_last_used")
 
     return user
 
@@ -94,11 +95,27 @@ async def require_admin(
     Dependency pour les routes /admin.
     Vérifie que le header Authorization: Bearer <ADMIN_SECRET> est correct.
     En production, ces routes sont également filtrées par IP dans nginx.
+
+    Fail-closed : si ADMIN_SECRET est vide ou laissé à sa valeur d'exemple,
+    les routes admin sont désactivées plutôt que protégées par un secret connu.
     """
     from config import settings  # import local pour éviter la circularité
+
+    if settings.admin_secret_is_placeholder():
+        log.critical(
+            "Tentative d'accès admin alors qu'ADMIN_SECRET n'est pas configuré "
+            "(vide ou valeur CHANGE_ME_*). Routes admin désactivées."
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Administration désactivée : ADMIN_SECRET non configuré sur le serveur.",
+        )
 
     if not credentials or credentials.scheme.lower() != "bearer":
         raise HTTPException(status_code=403, detail="Accès refusé.")
 
-    if credentials.credentials != settings.admin_secret:
+    # Comparaison constant-time — évite les attaques par timing sur le secret
+    if not secrets.compare_digest(
+        credentials.credentials.encode(), settings.admin_secret.encode()
+    ):
         raise HTTPException(status_code=403, detail="Secret admin incorrect.")

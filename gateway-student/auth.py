@@ -11,6 +11,17 @@ import database as db
 log = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
 
+# Références fortes vers les tâches fire-and-forget : asyncio ne garde qu'une
+# référence faible — sans ce set, une tâche peut être ramassée par le GC avant
+# d'avoir tourné.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> None:
+    task = asyncio.get_running_loop().create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials | None = Security(bearer)) -> dict:
     if not credentials or credentials.scheme.lower() != "bearer":
@@ -25,7 +36,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials | None = Se
         log.warning("Student auth failed with invalid/revoked/expired key")
         raise_auth("Cle API invalide, revoquee ou expiree.")
 
-    asyncio.create_task(db.touch_key_last_used(user["key_id"]))
+    _fire_and_forget(db.touch_key_last_used(user["key_id"]))
     return user
 
 

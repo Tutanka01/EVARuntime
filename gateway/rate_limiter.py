@@ -18,6 +18,7 @@ from collections import deque
 
 from fastapi import Depends, HTTPException
 
+import database as db
 from auth import get_current_user
 
 
@@ -78,7 +79,7 @@ async def check_rate_limit(
     user: dict = Depends(get_current_user),
 ) -> dict:
     """
-    Dependency FastAPI combinant auth + rate limiting.
+    Dependency FastAPI combinant auth + rate limiting + quota mensuel.
     Injecter cette dependency dans toutes les routes /v1/*.
     """
     rpm_limit = user.get("rpm_limit", 20)
@@ -99,5 +100,26 @@ async def check_rate_limit(
                 "X-RateLimit-Reset": "60",
             },
         )
+
+    # Quota mensuel de tokens — fenêtre glissante de 30 jours, cohérente avec
+    # le dashboard (tokens_30d). 0 = illimité.
+    monthly_limit = int(user.get("monthly_token_limit") or 0)
+    if monthly_limit > 0:
+        used = await db.tokens_used_last_30_days(user["user_id"])
+        if used >= monthly_limit:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {
+                        "message": (
+                            f"Quota mensuel de tokens atteint "
+                            f"({used:,}/{monthly_limit:,} sur 30 jours glissants)."
+                        ),
+                        "type": "rate_limit_error",
+                        "code": "429",
+                    }
+                },
+                headers={"Retry-After": "86400"},
+            )
 
     return user

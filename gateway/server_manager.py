@@ -136,12 +136,20 @@ class ServerManager:
         """
         was_pinned = self._active_requests > 0
         self._active_requests = max(0, self._active_requests - 1)
+        # Une requête vient de se terminer : repartir d'une fenêtre idle fraîche.
+        # Sans ça, un stream plus long qu'idle_timeout serait déchargé
+        # immédiatement après son dernier chunk.
+        self._last_request_time = time.monotonic()
         if was_pinned and self._active_requests == 0 and self._on_capacity_change:
             self._on_capacity_change()
 
     def llama_url(self, path: str) -> str:
         """URL complète vers llama-server pour ce modèle."""
         return f"http://{settings.llama_server_host}:{self._port}{path}"
+
+    def auth_headers(self) -> dict[str, str]:
+        """Headers d'authentification interne gateway ↔ llama-server."""
+        return {"Authorization": f"Bearer {settings.internal_api_key}"}
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
@@ -229,13 +237,16 @@ class ServerManager:
             binary=settings.llama_server_bin,
             host=settings.llama_server_host,
             port=self._port,
-            internal_api_key=settings.internal_api_key,
             log_path=settings.log_dir / f"llama-server-{self._model.id}.log",
         )
         log.info("Lancement llama-server '%s' : %s", self._model.id, " ".join(cmd))
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = settings.cuda_visible_devices
+        # Clé interne passée par variable d'environnement (équivalent --api-key)
+        # plutôt qu'en argument : les arguments sont visibles de tous les
+        # utilisateurs locaux via ps/procfs et finiraient aussi dans les logs.
+        env["LLAMA_API_KEY"] = settings.internal_api_key
 
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -245,25 +256,27 @@ class ServerManager:
             start_new_session=True,
         )
 
-        asyncio.create_task(self._drain_logs())
+        # Drainer les DEUX pipes : un pipe plein (64 KB) bloque llama-server.
+        asyncio.create_task(self._drain_stream(self._process.stderr))
+        asyncio.create_task(self._drain_stream(self._process.stdout))
 
-    async def _drain_logs(self) -> None:
+    async def _drain_stream(self, stream: asyncio.StreamReader | None) -> None:
         """
-        Lit le stderr de llama-server en continu pour éviter le blocage du pipe.
-        Alimente _stderr_tail (30 lignes max) pour diagnostic en cas de crash.
+        Lit un pipe (stdout ou stderr) de llama-server en continu pour éviter
+        son blocage. Alimente _stderr_tail (30 lignes max) pour diagnostic
+        en cas de crash.
         """
-        if not self._process:
+        if stream is None:
             return
         llama_log = logging.getLogger(f"llama-server.{self._model.id}")
         try:
             while True:
-                if self._process.stderr:
-                    line = await self._process.stderr.readline()
-                    if not line:
-                        break
-                    decoded = line.decode(errors="replace").rstrip()
-                    self._stderr_tail.append(decoded)
-                    llama_log.debug(decoded)
+                line = await stream.readline()
+                if not line:
+                    break
+                decoded = line.decode(errors="replace").rstrip()
+                self._stderr_tail.append(decoded)
+                llama_log.debug(decoded)
         except Exception:
             pass
 
@@ -281,7 +294,7 @@ class ServerManager:
         async with httpx.AsyncClient(timeout=3.0) as client:
             while time.monotonic() < deadline:
                 if self._process and self._process.returncode is not None:
-                    # Laisser _drain_logs vider le pipe avant de lire le tail
+                    # Laisser _drain_stream vider les pipes avant de lire le tail
                     await asyncio.sleep(0.15)
                     tail = list(self._stderr_tail)
                     tail_text = "\n  ".join(tail) if tail else "(aucune sortie capturée)"
@@ -397,6 +410,13 @@ class ServerManager:
 
             if self._state != ModelState.READY:
                 break
+
+            # INVARIANT : un modèle avec des requêtes actives ne doit jamais être
+            # déchargé. Un stream plus long qu'idle_timeout ne rafraîchit
+            # _last_request_time qu'à son admission — sans ce garde-fou, le
+            # moniteur tuerait llama-server en plein milieu de la génération.
+            if self.is_pinned:
+                continue
 
             idle_for = time.monotonic() - self._last_request_time
             log.debug("'%s' idle depuis %.0fs / %ds", self._model.id, idle_for, timeout)

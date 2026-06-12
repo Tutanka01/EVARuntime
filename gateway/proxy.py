@@ -36,13 +36,14 @@ import json
 import logging
 import time
 import uuid
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Callable
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import database as db
+from background import fire_and_forget
 from config import settings
 from model_manager import CapacityQueueFull, CapacityQueueTimeout, ModelManager
 from server_manager import ServerManager
@@ -52,17 +53,13 @@ log = logging.getLogger(__name__)
 # Timeout total pour une génération (10 minutes)
 _INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0)
 
-_INTERNAL_HEADERS = {
-    "Authorization": f"Bearer {settings.internal_api_key}",
-}
-
 
 def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
     """
     Résout l'ID du modèle à utiliser pour une requête.
     Priorité : champ "model" du body → default_model_id → premier modèle enabled.
     """
-    requested = body.get("model", "").strip()
+    requested = (body.get("model") or "").strip()
     if requested:
         return requested
 
@@ -97,6 +94,11 @@ async def proxy_request(
         body = json.loads(body_bytes) if body_bytes else {}
     except json.JSONDecodeError:
         return _openai_error(400, "Corps JSON invalide.", "invalid_request_error")
+
+    if not isinstance(body, dict):
+        return _openai_error(400, "Le corps JSON doit être un objet.", "invalid_request_error")
+    if "model" in body and body["model"] is not None and not isinstance(body["model"], str):
+        return _openai_error(400, "Le champ 'model' doit être une chaîne.", "invalid_request_error")
 
     # ── Résoudre le modèle ────────────────────────────────────────────────────
     model_id = _resolve_model_id(body, model_manager)
@@ -135,11 +137,35 @@ async def proxy_request(
     start_time = time.monotonic()
 
     if is_streaming:
-        # Le pin est géré DANS le générateur (_stream_proxy appelle manager.pin() en premier
-        # et manager.unpin() dans son finally). Ainsi le modèle reste protégé pendant toute
-        # la durée du stream, y compris en cas de déconnexion client (GeneratorExit → finally).
+        # Le pin du stream est géré DANS le générateur (_stream_proxy appelle
+        # manager.pin() en premier et manager.unpin() dans son finally). Ainsi le
+        # modèle reste protégé pendant toute la durée du stream, y compris en cas
+        # de déconnexion client (GeneratorExit → finally).
+        #
+        # Pin de garde : entre le return de cette fonction et le démarrage effectif
+        # du générateur par Starlette, le modèle n'est pas encore pinné et pourrait
+        # être évincé par une requête concurrente. On pose donc un pin temporaire,
+        # relâché dès que le générateur démarre (on_start) — ou par timer si le
+        # générateur ne démarre jamais (déconnexion immédiate), pour ne pas
+        # bloquer l'éviction indéfiniment.
+        manager.pin()
+        guard_released = False
+
+        def _release_stream_guard() -> None:
+            nonlocal guard_released
+            if guard_released:
+                return
+            guard_released = True
+            guard_timer.cancel()
+            manager.unpin()
+
+        guard_timer = asyncio.get_running_loop().call_later(30.0, _release_stream_guard)
+
         return StreamingResponse(
-            _stream_proxy(path, body, user, request_id, start_time, manager),
+            _stream_proxy(
+                path, body, user, request_id, start_time, manager,
+                on_start=_release_stream_guard,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -170,7 +196,7 @@ async def _non_stream_proxy(
             response = await client.post(
                 manager.llama_url(path),
                 json=body,
-                headers=_INTERNAL_HEADERS,
+                headers=manager.auth_headers(),
             )
     except httpx.TimeoutException:
         return _openai_error(504, "Timeout : le modèle n'a pas répondu à temps.", "server_error")
@@ -179,36 +205,46 @@ async def _non_stream_proxy(
         return _openai_error(502, "Impossible de joindre le backend d'inférence.", "server_error")
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
-    data = response.json()
+    try:
+        data = response.json()
+    except ValueError:
+        log.error(
+            "Réponse non-JSON de llama-server '%s' (HTTP %d)",
+            manager.model.id, response.status_code,
+        )
+        return _openai_error(502, "Réponse invalide du backend d'inférence.", "server_error")
 
-    data["model"] = manager.model.id
+    usage: dict = {}
+    if isinstance(data, dict):
+        data["model"] = manager.model.id
 
-    has_any_tool_calls = any(
-        choice.get("message", {}).get("tool_calls")
-        for choice in data.get("choices", [])
-    )
-    for choice in data.get("choices", []):
-        msg = choice.get("message", {})
-        msg.pop("reasoning_content", None)
-        if has_any_tool_calls and msg.get("content"):
-            msg["content"] = None
+        has_any_tool_calls = any(
+            choice.get("message", {}).get("tool_calls")
+            for choice in data.get("choices", [])
+        )
+        for choice in data.get("choices", []):
+            msg = choice.get("message", {})
+            msg.pop("reasoning_content", None)
+            if has_any_tool_calls and msg.get("content"):
+                msg["content"] = None
 
-    # Supporte le format OpenAI {"usage": {...}} ET le format natif llama.cpp /completion
-    # qui retourne {"tokens_predicted": N, "tokens_evaluated": M} à la racine.
-    usage = data.get("usage") or {
-        "prompt_tokens": data.get("tokens_evaluated", 0),
-        "completion_tokens": data.get("tokens_predicted", 0),
-    }
-    asyncio.create_task(db.log_usage(
+        # Supporte le format OpenAI {"usage": {...}} ET le format natif llama.cpp
+        # /completion qui retourne {"tokens_predicted": N, "tokens_evaluated": M}.
+        usage = data.get("usage") or {
+            "prompt_tokens": data.get("tokens_evaluated", 0),
+            "completion_tokens": data.get("tokens_predicted", 0),
+        }
+
+    fire_and_forget(db.log_usage(
         user_id=user["user_id"],
         key_id=user["key_id"],
         model=manager.model.id,
-        prompt_tokens=usage.get("prompt_tokens", 0),
-        completion_tokens=usage.get("completion_tokens", 0),
+        prompt_tokens=int(usage.get("prompt_tokens") or 0),
+        completion_tokens=int(usage.get("completion_tokens") or 0),
         duration_ms=duration_ms,
         status_code=response.status_code,
         request_id=request_id,
-    ))
+    ), name="log_usage")
 
     return JSONResponse(content=data, status_code=response.status_code)
 
@@ -222,6 +258,7 @@ async def _stream_proxy(
     request_id: str,
     start_time: float,
     manager: ServerManager,
+    on_start: Callable[[], None] | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Générateur async qui pipe les chunks SSE de llama-server vers le client.
@@ -235,8 +272,13 @@ async def _stream_proxy(
     manager.unpin() est garanti dans le finally, même en cas de déconnexion
     client (GeneratorExit) ou d'exception réseau. Cela protège le modèle
     contre une éviction LRU pendant toute la durée du stream.
+
+    on_start : callback appelé dès que le pin du stream est posé — utilisé par
+    proxy_request pour relâcher son pin de garde.
     """
     manager.pin()
+    if on_start is not None:
+        on_start()
     prompt_tokens = 0
     completion_tokens = 0
     status_code = 200
@@ -250,7 +292,7 @@ async def _stream_proxy(
                 "POST",
                 manager.llama_url(path),
                 json=body_with_usage,
-                headers=_INTERNAL_HEADERS,
+                headers=manager.auth_headers(),
             ) as response:
                 status_code = response.status_code
 
@@ -338,16 +380,16 @@ async def _stream_proxy(
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
 
-    asyncio.create_task(db.log_usage(
+    fire_and_forget(db.log_usage(
         user_id=user["user_id"],
         key_id=user["key_id"],
         model=manager.model.id,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        prompt_tokens=int(prompt_tokens or 0),
+        completion_tokens=int(completion_tokens or 0),
         duration_ms=duration_ms,
         status_code=status_code,
         request_id=request_id,
-    ))
+    ), name="log_usage_stream")
 
 
 # ── /v1/models ────────────────────────────────────────────────────────────────

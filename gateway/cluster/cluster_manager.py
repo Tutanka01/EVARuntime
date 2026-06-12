@@ -121,6 +121,7 @@ class ClusterModelHandle:
       handle.pin()
       handle.unpin()
       handle.llama_url(path)
+      handle.auth_headers()
       handle.model.id          (→ ModelDefinition)
     """
 
@@ -134,9 +135,19 @@ class ClusterModelHandle:
 
     def unpin(self) -> None:
         self._info._active_requests = max(0, self._info._active_requests - 1)
+        # Fenêtre idle fraîche après la fin d'une requête (cohérent avec ServerManager).
+        self._info.touch()
 
     def llama_url(self, path: str) -> str:
         return self._info.llama_url.rstrip("/") + path
+
+    def auth_headers(self) -> dict[str, str]:
+        """
+        Clé interne du llama-server DISTANT, reçue dans LoadResponse.
+        Chaque nœud a sa propre INTERNAL_API_KEY — ne pas utiliser celle de
+        l'orchestrateur (settings.internal_api_key) pour le canal de données.
+        """
+        return {"Authorization": f"Bearer {self._info.internal_api_key}"}
 
     @property
     def active_requests(self) -> int:

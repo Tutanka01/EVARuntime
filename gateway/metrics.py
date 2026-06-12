@@ -21,17 +21,12 @@ from fastapi import APIRouter, Depends, Query
 
 import database as db
 from auth import require_admin
-from config import settings
 from model_manager import model_manager
 from server_manager import ModelState
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/metrics", tags=["metrics"])
-
-_INTERNAL_HEADERS = {
-    "Authorization": f"Bearer {settings.internal_api_key}",
-}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -177,9 +172,15 @@ async def metrics_llama(
     """
     result: dict = {}
 
+    # Uniquement en mode local : en mode cluster, le manager n'a pas de pool
+    # de sous-processus local (_managers) — on retourne {} proprement.
+    managers = getattr(model_manager, "_managers", None)
+    if not managers:
+        return {}
+
     ready_managers = [
         (mid, mgr)
-        for mid, mgr in model_manager._managers.items()
+        for mid, mgr in managers.items()
         if mgr.state == ModelState.READY
     ]
 
@@ -191,7 +192,7 @@ async def metrics_llama(
             try:
                 resp = await client.get(
                     mgr.llama_url("/metrics"),
-                    headers=_INTERNAL_HEADERS,
+                    headers=mgr.auth_headers(),
                 )
                 if resp.status_code != 200:
                     continue

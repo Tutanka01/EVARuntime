@@ -1208,7 +1208,7 @@ for i, prompt in enumerate(prompts):
 | Tokens de contexte max | 32 768 par requête | Prompt + réponse combinés (dépend du modèle) |
 | Slots parallèles — modèle 70B | 4 | Partagés entre tous les utilisateurs du même modèle |
 | Slots parallèles — modèle 8B | 8 | Indépendants de ceux du 70B |
-| Quota mensuel de tokens | Illimité | Configurable par l'admin si nécessaire |
+| Quota mensuel de tokens | Illimité | Configurable par l'admin ; appliqué sur une fenêtre glissante de 30 jours — dépassement → 429 avec `Retry-After` |
 
 > Les slots parallèles sont propres à chaque modèle. Des requêtes simultanées vers le 70B
 > et vers le 8B ne se bloquent pas mutuellement.

@@ -476,6 +476,13 @@ def _build_manager():
     # ── Mode cluster ──────────────────────────────────────────────────────────
     log.info("Mode CLUSTER_MODE=cluster — gateway multi-nœuds.")
 
+    if settings.agent_secret_is_placeholder():
+        raise RuntimeError(
+            "CLUSTER_MODE=cluster mais AGENT_SECRET est vide ou laissé à sa "
+            "valeur d'exemple. Définissez un secret fort partagé avec tous les "
+            "agents : python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+
     from cluster.nodes_config import load_nodes_config
     from cluster.node_client import RemoteNodeClient
     from cluster.cluster_manager import ClusterManager

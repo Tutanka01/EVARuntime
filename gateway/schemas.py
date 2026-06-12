@@ -5,7 +5,7 @@ on ne les revalide pas pour éviter de casser la compatibilité avec les futurs 
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -49,11 +49,21 @@ class KeyCreate(BaseModel):
     @field_validator("expires_at", mode="before")
     @classmethod
     def validate_expiry(cls, v: object) -> str | None:
-        if v is None:
+        if v is None or v == "":
             return None
         if isinstance(v, datetime):
-            return v.isoformat()
-        return str(v)
+            dt = v
+        else:
+            try:
+                dt = datetime.fromisoformat(str(v))
+            except ValueError:
+                raise ValueError(
+                    "expires_at doit être une date ISO 8601 valide "
+                    "(ex: 2026-12-31 ou 2026-12-31T23:59:59+00:00)"
+                )
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.isoformat()
 
 
 class KeyCreateResponse(BaseModel):

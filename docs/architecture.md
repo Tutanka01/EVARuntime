@@ -230,6 +230,14 @@ le modèle entre `manager.pin()` (avant proxy) et `manager.unpin()` (dans le fin
 Quand `unpin()` fait retomber ce compteur à zéro, les requêtes en attente sont
 réveillées et peuvent retenter l'éviction LRU.
 
+Le moniteur d'inactivité respecte le même invariant : un modèle pinné n'est
+jamais déchargé pour idle timeout, même si la génération en cours dure plus
+longtemps qu'`IDLE_TIMEOUT_SECONDS` (cas des streams longs). `unpin()` repart
+d'une fenêtre idle fraîche à la fin de chaque requête. Pour le streaming, un
+pin de garde couvre aussi la fenêtre entre la création de la réponse SSE et le
+démarrage effectif du générateur (relâché au premier chunk, ou après 30 s si
+le client se déconnecte avant).
+
 ---
 
 ## Flux d'une requête multi-modèle

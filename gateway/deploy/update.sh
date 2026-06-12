@@ -73,11 +73,20 @@ section "2/5  Synchronisation du code source"
 cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
 
+# Package cluster/ — requis en CLUSTER_MODE=cluster (importé par model_manager)
+mkdir -p "$INSTALL_DIR/cluster"
+cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
+
+# Purger le bytecode obsolète (modules renommés ou supprimés entre versions)
+rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
+
 chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
-chmod 640 "$INSTALL_DIR"/*.py
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+chmod 640 "$INSTALL_DIR"/*.py "$INSTALL_DIR/cluster"/*.py
+chmod 750 "$INSTALL_DIR/cluster"
 chmod 644 "$INSTALL_DIR/requirements.txt"
 
-info "Fichiers Python copiés."
+info "Fichiers Python copiés (gateway + cluster/)."
 
 # ── 3. Synchronisation des fichiers statiques ─────────────────────────────────
 
@@ -150,6 +159,14 @@ if [[ "$HEALTHY" == true ]]; then
 else
     warn "Le service ne répond pas encore. Vérifiez :"
     warn "  sudo journalctl -u llm-gateway -f --since now"
+fi
+
+# ── Vérification des secrets ──────────────────────────────────────────────────
+# Les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou CHANGE_ME_*.
+if grep -qE '^(ADMIN_SECRET|INTERNAL_API_KEY|AGENT_SECRET)=(CHANGE_ME|[[:space:]]*$)' /etc/llm-gateway/env 2>/dev/null; then
+    warn "Des secrets non configurés (CHANGE_ME_* ou vides) subsistent dans /etc/llm-gateway/env."
+    warn "Les routes /admin restent DÉSACTIVÉES (503) tant qu'ADMIN_SECRET n'est pas défini."
+    warn "Générer : python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
 fi
 
 # ── Résumé ────────────────────────────────────────────────────────────────────

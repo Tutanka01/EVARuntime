@@ -66,6 +66,18 @@ async def lifespan(app: FastAPI):
     """Initialisation au démarrage, nettoyage à l'arrêt."""
     log.info("=== LLM Gateway UPPA démarrage ===")
 
+    # Vérification des secrets — fail-closed côté routes, alerte côté logs.
+    if settings.admin_secret_is_placeholder():
+        log.critical(
+            "ADMIN_SECRET non configuré (vide ou CHANGE_ME_*) — les routes /admin "
+            "sont DÉSACTIVÉES tant qu'un secret fort n'est pas défini."
+        )
+    if settings.internal_api_key_is_placeholder():
+        log.critical(
+            "INTERNAL_API_KEY non configurée (vide ou CHANGE_ME_*) — la clé "
+            "gateway ↔ llama-server est prévisible. Définissez un secret fort."
+        )
+
     # Afficher le registre des modèles et le budget VRAM
     registry = model_manager.registry
     all_models = registry.list_all()
@@ -128,7 +140,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Remplacer par ["https://your-domain.univ-pau.fr"] en production
+    # Configurable via CORS_ALLOW_ORIGINS (liste séparée par des virgules).
+    # En production, restreindre aux domaines clients connus.
+    allow_origins=settings.cors_allow_origins,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
     max_age=600,
