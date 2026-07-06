@@ -1,0 +1,15 @@
+[Unit]
+Description=Déclencheur quotidien de la sauvegarde SQLite de la LLM Gateway
+Documentation=https://github.com/uppa/llm-gateway
+
+[Timer]
+# Tous les jours à 03h15 (heure locale). Heure creuse : peu de trafic d'inférence.
+OnCalendar=*-*-* 03:15:00
+# Rattrape une exécution manquée (serveur éteint à 03h15) au prochain démarrage.
+Persistent=true
+# Étale l'heure de déclenchement de ±5 min pour éviter les pics synchronisés.
+RandomizedDelaySec=300
+Unit=llm-gateway-backup.service
+
+[Install]
+WantedBy=timers.target

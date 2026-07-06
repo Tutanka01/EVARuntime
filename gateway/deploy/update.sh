@@ -34,6 +34,9 @@ done
 
 # Répertoires
 INSTALL_DIR="/opt/llm-gateway"
+DATA_DIR="/var/lib/llm-gateway"
+DB_PATH="$DATA_DIR/gateway.db"
+BACKUP_DIR="$DATA_DIR/backups"
 SERVICE_USER="llmservice"
 # SCRIPT_DIR = gateway/  (un niveau au-dessus de deploy/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,6 +44,34 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 [[ -d "$INSTALL_DIR" ]] || error "$INSTALL_DIR n'existe pas — lancez d'abord install.sh"
 [[ -f "$INSTALL_DIR/venv/bin/python" ]] || error "venv introuvable — lancez d'abord install.sh"
+
+# ── Fonction : synchronise le code Python + static du dépôt vers INSTALL_DIR ──
+# Utilisée par le flux normal ET par le rollback (après git checkout). Idempotente.
+sync_code() {
+    cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
+    cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
+
+    mkdir -p "$INSTALL_DIR/cluster"
+    cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
+
+    rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
+
+    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
+    chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+    chmod 640 "$INSTALL_DIR"/*.py "$INSTALL_DIR/cluster"/*.py
+    chmod 750 "$INSTALL_DIR/cluster"
+    chmod 644 "$INSTALL_DIR/requirements.txt"
+
+    if [[ -d "$SCRIPT_DIR/static" ]]; then
+        mkdir -p "$INSTALL_DIR/static"
+        cp -r "$SCRIPT_DIR/static/." "$INSTALL_DIR/static/"
+        chown -R root:"$SERVICE_USER" "$INSTALL_DIR/static"
+        find "$INSTALL_DIR/static" -type d -exec chmod 755 {} \;
+        find "$INSTALL_DIR/static" -type f -exec chmod 644 {} \;
+    fi
+
+    "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
+}
 
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
@@ -126,6 +157,37 @@ if [[ "$UPDATE_NGINX" == true ]]; then
     fi
 fi
 
+# ── 4c. Sauvegarde de la base de données AVANT redémarrage ────────────────────
+# On sauvegarde AVANT de redémarrer : si le nouveau code migre/altère le schéma
+# au démarrage, on garde une copie cohérente de l'état d'avant la mise à jour.
+# `sqlite3 .backup` gère correctement une base WAL active (contrairement à un
+# simple `cp` qui peut capturer un WAL incohérent).
+
+section "4c. Sauvegarde de la base de données"
+BACKUP_FILE=""
+if [[ -f "$DB_PATH" ]]; then
+    if command -v sqlite3 &>/dev/null; then
+        mkdir -p "$BACKUP_DIR"
+        chown "$SERVICE_USER:$SERVICE_USER" "$BACKUP_DIR" 2>/dev/null || true
+        chmod 750 "$BACKUP_DIR"
+        BACKUP_FILE="$BACKUP_DIR/gateway-pre-update-$(date +%Y%m%d-%H%M%S).db"
+        # .backup est atomique et sûr sur une base WAL active
+        if sqlite3 "$DB_PATH" ".backup '$BACKUP_FILE'"; then
+            chown "$SERVICE_USER:$SERVICE_USER" "$BACKUP_FILE" 2>/dev/null || true
+            chmod 600 "$BACKUP_FILE"
+            info "Sauvegarde DB : $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
+        else
+            warn "Échec de la sauvegarde SQLite — la mise à jour continue quand même."
+            warn "Vérifiez manuellement la base $DB_PATH avant de poursuivre."
+            BACKUP_FILE=""
+        fi
+    else
+        warn "sqlite3 introuvable — sauvegarde DB ignorée (installer : apt install sqlite3)."
+    fi
+else
+    info "Pas de base de données à sauvegarder ($DB_PATH absent)."
+fi
+
 # ── 5. Mise à jour du service systemd + redémarrage ──────────────────────────
 
 section "5/5  Redémarrage du service"
@@ -157,8 +219,52 @@ if [[ "$HEALTHY" == true ]]; then
     HEALTH=$(curl -s http://127.0.0.1:8000/health)
     info "Service opérationnel : $HEALTH"
 else
-    warn "Le service ne répond pas encore. Vérifiez :"
-    warn "  sudo journalctl -u llm-gateway -f --since now"
+    # ── Rollback automatique ──────────────────────────────────────────────────
+    # Le service n'est pas devenu healthy après les tentatives. On revient à la
+    # version d'avant (BEFORE) SEULEMENT si le code a réellement changé. On ne
+    # restaure PAS la DB automatiquement (la sauvegarde 4c reste disponible pour
+    # une restauration manuelle si nécessaire) : le schéma peut avoir évolué et
+    # écraser la base sans arbitrage humain serait plus risqué qu'utile.
+    warn "Le service ne répond pas après $((20 * 2))s."
+
+    if [[ "$BEFORE" == "$AFTER" ]]; then
+        warn "Aucun changement de code à annuler (HEAD inchangé)."
+        warn "Diagnostiquez : sudo journalctl -u llm-gateway -f --since now"
+    else
+        section "ROLLBACK  Retour à la version précédente (${BEFORE:0:8})"
+        if git -C "$REPO_DIR" checkout --quiet "$BEFORE"; then
+            info "Dépôt ramené à ${BEFORE:0:8}. Re-déploiement du code précédent…"
+            sync_code
+            cp "$SCRIPT_DIR/deploy/llm-gateway.service" /etc/systemd/system/
+            systemctl daemon-reload
+            systemctl stop llm-gateway || true
+            systemctl start llm-gateway
+
+            echo -n "  Attente du démarrage (rollback)"
+            ROLLBACK_OK=false
+            for i in $(seq 1 20); do
+                sleep 2
+                echo -n "."
+                if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+                    ROLLBACK_OK=true
+                    break
+                fi
+            done
+            echo ""
+
+            if [[ "$ROLLBACK_OK" == true ]]; then
+                warn "Rollback réussi : le service est reparti sur ${BEFORE:0:8}."
+                warn "La mise à jour vers ${AFTER:0:8} a ÉCHOUÉ — investiguez avant de réessayer."
+                warn "Note : le dépôt est en 'detached HEAD' sur ${BEFORE:0:8}."
+                warn "  Pour repartir de la branche : git -C \"$REPO_DIR\" checkout main"
+                [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update disponible : $BACKUP_FILE"
+            else
+                error "Rollback ÉCHOUÉ : le service ne démarre ni en neuf ni en ancien. Intervention manuelle requise. Logs : sudo journalctl -u llm-gateway -n 100 --no-pager"
+            fi
+        else
+            error "git checkout $BEFORE a échoué (dépôt sale ?). Rollback manuel requis. Logs : sudo journalctl -u llm-gateway -f"
+        fi
+    fi
 fi
 
 # ── Vérification des secrets ──────────────────────────────────────────────────

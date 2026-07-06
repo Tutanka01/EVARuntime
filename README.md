@@ -32,13 +32,15 @@ The project is intentionally pragmatic: FastAPI, SQLite WAL, systemd, nginx and 
 - OpenAI-compatible chat completions API, including Server-Sent Events streaming.
 - Per-user API keys stored as SHA-256 hashes.
 - Sliding-window rate limiting and monthly token quotas.
-- SQLite WAL storage for users, keys and usage logs.
-- On-demand `llama-server` lifecycle management.
-- Full GPU memory release when models are idle.
-- Multi-model VRAM budgeting with LRU eviction.
-- Optional multi-node mode with lightweight GPU agents.
+- SQLite WAL storage with per-connection robustness pragmas and a manual retention purge.
+- On-demand `llama-server` lifecycle management with a shared keep-alive HTTP client on the hot path.
+- Full GPU memory release when models are idle, plus a bounded drain of active requests on shutdown.
+- Multi-model VRAM budgeting with LRU eviction and best-effort VRAM reconciliation via `nvidia-smi`.
+- Optional multi-node mode with lightweight GPU agents, state reconciliation on startup and fast failover.
+- Supply-chain hardening: optional GGUF `sha256` integrity checks and `llama-server` build pinning.
+- Observability: Prometheus text exposition (`/admin/metrics/prometheus`) and a `/ready` readiness probe.
 - Admin CLI and REST API for users, keys, models and reports.
-- Deployment assets for systemd and nginx.
+- Deployment assets for systemd, nginx, journald and scheduled SQLite backups.
 
 ## Architecture
 
@@ -151,7 +153,7 @@ Start with [gateway/.env.example](gateway/.env.example). The important settings 
 | `INTERNAL_API_KEY` | Internal gateway-to-backend key |
 | `ADMIN_SECRET` | Secret for admin endpoints |
 | `IDLE_TIMEOUT_SECONDS` | Idle delay before unloading a model |
-| `MAX_VRAM_GB` | VRAM budget used by the model manager |
+| `TOTAL_VRAM_GB` | Total GPU VRAM used to compute the model manager budget |
 | `CLUSTER_MODE` | `local` or `cluster` |
 
 Never publish real `.env` files, generated secrets, TLS private keys, databases or logs.
@@ -162,6 +164,7 @@ Never publish real `.env` files, generated secrets, TLS private keys, databases 
 - [API guide](docs/api.md)
 - [Admin guide](docs/admin.md)
 - [Deployment guide](docs/deployment.md)
+- [Observability guide](docs/observability.md)
 - [llama.cpp build notes](docs/build-llama-cpp-dgx-spark.md)
 
 ## Public Release Checklist

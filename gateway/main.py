@@ -23,9 +23,11 @@ import database as db
 from admin import router as admin_router
 from auth import get_current_user
 from config import settings
+from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
 from model_manager import model_manager
-from proxy import models_response, proxy_request
+from model_registry import IntegrityError
+from proxy import aclose_http_client, init_http_client, models_response, proxy_request
 from rate_limiter import check_rate_limit
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -109,16 +111,69 @@ async def lifespan(app: FastAPI):
     )
     log.info("Idle timeout  : %ds", settings.idle_timeout_seconds)
 
+    # ── Garde-fou supply-chain : version du binaire llama-server ──────────────
+    # NON FATAL par défaut : en test/CI il n'y a aucun binaire llama-server réel,
+    # donc la sonde se contente d'un avertissement et le démarrage continue. Le
+    # seul cas de refus est un enforcement EXPLICITE (LLAMA_SERVER_MIN_BUILD > 0)
+    # avec un build lu strictement inférieur au minimum patché.
+    ok = await enforce_llama_min_build(
+        settings.llama_server_bin, settings.llama_server_min_build
+    )
+    if not ok:
+        raise RuntimeError(
+            "llama-server ne satisfait pas LLAMA_SERVER_MIN_BUILD — "
+            "démarrage refusé (binaire potentiellement vulnérable)."
+        )
+
+    # ── Garde-fou supply-chain : intégrité SHA-256 des GGUF (opt-in) ──────────
+    # Inerte tant qu'aucun modèle ne déclare `sha256` (cas des modèles de test).
+    # Un mismatch sur un modèle activé est traité comme critique : on refuse de
+    # démarrer plutôt que de servir un GGUF potentiellement substitué/corrompu.
+    for model in enabled_models:
+        if model.sha256 is None:
+            continue
+        try:
+            model.verify_integrity()
+            log.info("Intégrité SHA-256 vérifiée : %s", model.id)
+        except IntegrityError as exc:
+            log.critical("Intégrité GGUF compromise : %s", exc)
+            raise RuntimeError(
+                f"Vérification d'intégrité échouée pour '{model.id}' — démarrage refusé."
+            ) from exc
+
     await db.init_db()
     log.info("Base de données initialisée : %s", settings.db_path)
 
     log.info("Mode déploiement : CLUSTER_MODE=%s", settings.cluster_mode)
     await model_manager.start_health_monitor()
 
+    # ── Robustesse cycle de vie (mode local uniquement) ───────────────────────
+    # Détection best-effort des llama-server orphelins tenant un port du pool
+    # (survivants d'un crash gateway). LOG seulement par défaut — ne tue rien.
+    # En test (ports libres) : aucune détection, retour immédiat.
+    if hasattr(model_manager, "detect_orphan_ports"):
+        try:
+            await model_manager.detect_orphan_ports()
+        except Exception as exc:  # best-effort — jamais fatal au démarrage
+            log.warning("Détection des orphelins au démarrage ignorée : %s", exc)
+
+    # Réconciliation VRAM périodique (nvidia-smi) — inerte sans GPU/nvidia-smi.
+    if hasattr(model_manager, "start_vram_reconcile"):
+        try:
+            await model_manager.start_vram_reconcile()
+        except Exception as exc:
+            log.warning("Réconciliation VRAM non démarrée (non fatal) : %s", exc)
+
+    # Client HTTP partagé vers les llama-server (chemin chaud d'inférence).
+    # Créé une fois ici, réutilisé par toutes les requêtes proxy (keep-alive),
+    # fermé au shutdown. Jamais recréé par requête.
+    init_http_client()
+
     yield
 
     log.info("Arrêt de la gateway — déchargement de tous les modèles…")
     await model_manager.shutdown()
+    await aclose_http_client()
     log.info("=== LLM Gateway UPPA arrêt propre ===")
 
 
@@ -192,6 +247,61 @@ async def health():
         "vram_used_gb": status["vram_budget"]["used_gb"],
         "vram_available_gb": status["vram_budget"]["available_gb"],
     }
+
+
+@app.get("/ready", include_in_schema=False)
+async def ready():
+    """
+    Readiness (distincte de la liveness de /health).
+
+    Renvoie 200 si la gateway peut SERVIR au moins une requête d'inférence :
+      - au moins un modèle est déjà ready, OU
+      - il reste de la capacité VRAM pour en charger un (mode local),
+        ou au moins un nœud est online (mode cluster).
+    Sinon 503 (aucun modèle ready ET aucune capacité / tous nœuds offline).
+
+    /health reste inchangé (liveness : le process répond). Le corps précise la
+    raison sans divulguer d'infra sensible (pas de chemins fichiers, pas d'URL).
+    """
+    try:
+        status = model_manager.status()
+    except Exception:
+        # status() ne devrait pas lever, mais fail-safe : pas de fuite d'infra.
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "reason": "status_unavailable"},
+        )
+
+    models = status.get("models") or []
+    ready_models = [m["id"] for m in models if m.get("state") == "ready"]
+
+    budget = status.get("vram_budget") or {}
+    available_gb = budget.get("available_gb") or 0.0
+    # En cluster, status() expose nodes_online dans vram_budget ; en local,
+    # cette clé est absente → None (non contraignant côté local).
+    nodes_online = budget.get("nodes_online")
+
+    has_capacity = available_gb > 0.0
+    cluster_has_node = nodes_online is None or nodes_online > 0
+
+    is_ready = bool(ready_models) or (has_capacity and cluster_has_node)
+
+    body = {
+        "status": "ready" if is_ready else "not_ready",
+        "models_ready": ready_models,
+        "vram_available_gb": round(float(available_gb), 2),
+    }
+    if nodes_online is not None:
+        body["nodes_online"] = nodes_online
+
+    if is_ready:
+        return body
+
+    if nodes_online is not None and nodes_online == 0:
+        body["reason"] = "all_nodes_offline"
+    else:
+        body["reason"] = "no_model_ready_and_no_capacity"
+    return JSONResponse(status_code=503, content=body)
 
 
 @app.get("/v1/models")

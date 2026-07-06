@@ -1,0 +1,22 @@
+# Configuration ruff pour gateway-student/ (composant isolé — cf. AGENTS.md).
+#
+# Même approche conservatrice que gateway/ et node_agent/ : E + F seulement,
+# avec des `per-file-ignores` ciblés sur les violations préexistantes plutôt
+# que des ignores globaux ou une modification du code source.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Imports non utilisés, variable locale non utilisée, f-string sans placeholder
+# — préexistants dans le CLI admin.
+"cli.py" = ["F401", "F841", "F541"]
+# Ligne de field_validator légèrement au-dessus de 120 colonnes.
+"config.py" = ["E501"]
+# Ligne de test légèrement au-dessus de 120 colonnes ; import `time` non utilisé.
+"tests/test_policy.py" = ["E501"]
+"tests/test_rate_limiter.py" = ["F401"]

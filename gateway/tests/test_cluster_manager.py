@@ -24,6 +24,7 @@ from cluster.cluster_manager import ClusterManager, ClusterModelHandle
 from cluster.node_client import LocalNodeAdapter, NodeUnreachableError
 from cluster.node_protocol import (
     LoadResponse,
+    ModelStateOnNode,
     NodeHealth,
     NodeStatus,
     UnloadResponse,
@@ -82,12 +83,21 @@ class FakeNodeBackend:
         total_vram: float = 48.0,
         max_ports: int = 5,
         fail_health: bool = False,
+        health_exc: Exception | None = None,
+        fail_unload: bool = False,
+        preloaded: dict[str, float] | None = None,
     ):
         self._nid = node_id
         self._total = total_vram
         self._max_ports = max_ports
-        self._loaded: dict[str, float] = {}  # model_id → vram_gb
+        self._loaded: dict[str, float] = dict(preloaded or {})  # model_id → vram_gb
         self.fail_health = fail_health
+        # Si fourni, health() lève cette exception « inattendue » (ni
+        # NodeUnreachableError ni NodeProtocolError) — pour tester le catch-all.
+        self.health_exc = health_exc
+        # Si True, unload_model lève NodeUnreachableError (nœud flaky) sans
+        # retirer le modèle de l'inventaire (le llama-server tourne toujours).
+        self.fail_unload = fail_unload
         self.load_calls: list[dict] = []
         self.unload_calls: list[str] = []
         self.unload_all_called = False
@@ -97,6 +107,8 @@ class FakeNodeBackend:
         return sum(self._loaded.values())
 
     async def health(self) -> NodeHealth:
+        if self.health_exc is not None:
+            raise self.health_exc
         if self.fail_health:
             raise NodeUnreachableError("simulated network failure")
         return NodeHealth(
@@ -109,22 +121,31 @@ class FakeNodeBackend:
         )
 
     async def status(self) -> NodeStatus:
-        return NodeStatus(node_id=self._nid, health=await self.health(), models=[])
+        models = [
+            ModelStateOnNode(id=mid, state="ready", port=8081, vram_gb=vram)
+            for mid, vram in self._loaded.items()
+        ]
+        return NodeStatus(node_id=self._nid, health=await self.health(), models=models)
 
     async def load_model(self, model_dict: dict) -> LoadResponse:
         self.load_calls.append(model_dict)
         mid = model_dict["id"]
         vram = float(model_dict.get("vram_gb", 0.0))
+        already = mid in self._loaded
         self._loaded[mid] = vram
         return LoadResponse(
             model_id=mid,
             llama_url=f"http://{self._nid}:8081",
             internal_api_key="internal-key",
             port=8081,
+            already_loaded=already,
         )
 
     async def unload_model(self, model_id: str) -> UnloadResponse:
         self.unload_calls.append(model_id)
+        if self.fail_unload:
+            # Nœud flaky : l'appel réseau échoue et le modèle reste chargé.
+            raise NodeUnreachableError("simulated unload failure")
         freed = self._loaded.pop(model_id, 0.0)
         return UnloadResponse(model_id=model_id, unloaded=True, freed_vram_gb=freed)
 
@@ -426,3 +447,169 @@ class TestStatus:
         assert cluster[0]["node_id"] == "a"
         assert cluster[0]["online"] is True
         assert cluster[0]["total_vram_gb"] == 48.0
+
+
+# ── Réconciliation d'état au démarrage ────────────────────────────────────────
+
+class TestReconciliation:
+    @pytest.mark.anyio
+    async def test_reconciles_already_loaded_model(self):
+        """
+        Au démarrage, un nœud rapporte déjà m1 chargé via status() →
+        _placement / loaded sont reconstruits SANS rechargement.
+        """
+        backend = FakeNodeBackend("a", total_vram=48.0, preloaded={"m1": 20.0})
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        try:
+            # Placement restauré directement depuis status(), aucun load appelé.
+            assert mgr._placement.get("m1") == "a"
+            assert "m1" in mgr._nodes["a"].loaded
+            assert len(backend.load_calls) == 0
+            assert mgr._nodes["a"].loaded["m1"].vram_gb == 20.0
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_reconciled_entry_refreshed_on_first_request(self):
+        """
+        Une entrée réconciliée (internal_api_key vide) est rafraîchie via un
+        load_model idempotent (already_loaded) au premier ensure_model_loaded,
+        sur le MÊME nœud, sans replacement ailleurs.
+        """
+        backend = FakeNodeBackend("a", total_vram=48.0, preloaded={"m1": 20.0})
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        try:
+            assert mgr._nodes["a"].loaded["m1"].internal_api_key == ""
+            handle = await mgr.ensure_model_loaded("m1")
+            # Un unique load idempotent, resté sur le nœud 'a'.
+            assert len(backend.load_calls) == 1
+            assert backend.load_calls[0]["id"] == "m1"
+            assert handle.auth_headers()["Authorization"] == "Bearer internal-key"
+            assert mgr._placement["m1"] == "a"
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_reconciliation_skips_unreachable_node(self):
+        """Un nœud dont status() échoue (offline) est sauté proprement."""
+        offline = FakeNodeBackend("off", total_vram=48.0, fail_health=True,
+                                  preloaded={"m1": 20.0})
+        mgr = make_manager([offline], failures_threshold=1)
+        await mgr.start_health_monitor()
+        try:
+            # Nœud offline → aucune réconciliation, placement vide.
+            assert "m1" not in mgr._placement
+        finally:
+            await mgr.shutdown()
+
+
+# ── Failover rapide (nœud offline entre deux heartbeats) ──────────────────────
+
+class TestFailover:
+    @pytest.mark.anyio
+    async def test_offline_node_invalidates_fast_path_and_replaces(self):
+        """
+        m1 est chargé sur node-a. node-a crashe (online=False) SANS heartbeat.
+        Le fast-path ne doit PAS renvoyer son handle : ensure_model_loaded
+        replace m1 sur node-b (online).
+        """
+        a = FakeNodeBackend("a", total_vram=48.0)
+        b = FakeNodeBackend("b", total_vram=48.0)
+        mgr = make_manager([a, b])
+        await mgr.start_health_monitor()
+        try:
+            h1 = await mgr.ensure_model_loaded("m1")
+            first_node = mgr._placement["m1"]
+            # Simuler le crash du nœud qui héberge m1 (sans attendre le heartbeat).
+            mgr._nodes[first_node].online = False
+
+            h2 = await mgr.ensure_model_loaded("m1")
+            second_node = mgr._placement["m1"]
+        finally:
+            await mgr.shutdown()
+
+        # Replacé sur un nœud ONLINE différent du nœud crashé.
+        assert second_node != first_node
+        assert mgr._nodes[second_node].online is True
+        assert h2.llama_url("/") == f"http://{second_node}:8081/"
+        # L'ancien handle pointait vers le nœud crashé, le nouveau vers l'autre.
+        assert h1.llama_url("/") != h2.llama_url("/")
+
+
+# ── _check_node robuste à toute exception ─────────────────────────────────────
+
+class TestCheckNodeRobustness:
+    @pytest.mark.anyio
+    async def test_unexpected_exception_marks_offline(self):
+        """
+        Un health() qui lève une exception INATTENDUE (ValueError) incrémente
+        consecutive_failures et finit par passer le nœud offline.
+        """
+        backend = FakeNodeBackend("a", total_vram=48.0)
+        mgr = make_manager([backend], failures_threshold=3, health_interval=999)
+        await mgr.start_health_monitor()
+        assert mgr._nodes["a"].online is True
+
+        backend.health_exc = ValueError("boom inattendu")
+        for _ in range(3):
+            await mgr._check_node(mgr._nodes["a"])
+
+        assert mgr._nodes["a"].consecutive_failures == 3
+        assert mgr._nodes["a"].online is False
+        await mgr.shutdown()
+
+
+# ── _do_unload sur nœud flaky (pas de purge optimiste) ────────────────────────
+
+class TestFlakyUnload:
+    @pytest.mark.anyio
+    async def test_failed_unload_keeps_state_when_model_still_loaded(self):
+        """
+        unload_model échoue (nœud flaky) ET le modèle tourne toujours côté nœud.
+        L'état local NE doit PAS être purgé de façon optimiste (VRAM occupée),
+        pour ne pas sur-réserver au placement suivant.
+        """
+        backend = FakeNodeBackend("a", total_vram=48.0)
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        try:
+            await mgr.ensure_model_loaded("m1")
+            assert "m1" in mgr._placement
+
+            # Rendre le nœud flaky : unload lèvera, mais health() confirme que
+            # m1 est toujours chargé → l'entrée doit être conservée.
+            backend.fail_unload = True
+            await mgr.unload_model("m1")
+
+            # Non purgé : placement + comptabilité VRAM conservés.
+            assert mgr._placement.get("m1") == "a"
+            assert "m1" in mgr._nodes["a"].loaded
+        finally:
+            backend.fail_unload = False
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_failed_unload_purges_when_node_confirms_gone(self):
+        """
+        unload_model échoue MAIS health() montre que le modèle n'est plus chargé
+        (parti quand même côté nœud) → purge sûre de l'état local.
+        """
+        backend = FakeNodeBackend("a", total_vram=48.0)
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        try:
+            await mgr.ensure_model_loaded("m1")
+
+            # unload lèvera, mais on retire m1 de l'inventaire du nœud pour
+            # simuler un modèle réellement parti malgré l'échec réseau.
+            backend.fail_unload = True
+            backend._loaded.pop("m1", None)
+            await mgr.unload_model("m1")
+
+            assert "m1" not in mgr._placement
+            assert "m1" not in mgr._nodes["a"].loaded
+        finally:
+            backend.fail_unload = False
+            await mgr.shutdown()

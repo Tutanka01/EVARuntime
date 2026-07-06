@@ -1,0 +1,27 @@
+# Configuration ruff pour gateway/ (composant isolé — cf. AGENTS.md).
+#
+# Choix conservateur : seules les règles E (pycodestyle erreurs) et F (pyflakes)
+# sont activées, avec des `per-file-ignores` ciblés sur les violations
+# préexistantes du code actuel plutôt que des ignores globaux ou une réécriture
+# du code source. Objectif : `ruff check .` doit sortir en exit 0 sans modifier
+# le moindre fichier Python.
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Ligne de tableau CLI légèrement au-dessus de 120 colonnes (rich console.print).
+"cli.py" = ["E501", "F401"]
+# Import FastAPI non utilisé, préexistant.
+"admin.py" = ["F401"]
+# Import de fallback d'éviction non utilisé, préexistant.
+"cluster/cluster_manager.py" = ["F401"]
+# `field` (dataclasses) et `Literal` importés mais non utilisés, préexistants.
+"model_registry.py" = ["F401"]
+# Imports de test non utilisés, préexistants — ne pas modifier les tests.
+"tests/test_cluster_manager.py" = ["F401"]
+"tests/test_model_registry_mtp.py" = ["F401"]

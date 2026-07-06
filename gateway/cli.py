@@ -324,6 +324,33 @@ def usage_report(
     _run(_do())
 
 
+# ── Rétention / purge ─────────────────────────────────────────────────────────
+
+@app.command("purge-usage")
+def purge_usage(
+    older_than_days: int = typer.Option(
+        ..., "--older-than-days", help="Supprime les entrées usage_log plus anciennes que N jours"
+    ),
+):
+    """
+    Purge de rétention MANUELLE du journal d'usage puis VACUUM.
+    À exécuter hors ligne : VACUUM verrouille la base.
+    """
+    if older_than_days < 0:
+        console.print("[red]--older-than-days doit être >= 0.[/red]")
+        raise typer.Exit(1)
+
+    async def _do():
+        await _ensure_db()
+        deleted = await db.purge_usage_older_than(older_than_days)
+        console.print(
+            f"[green]Purge terminée :[/green] {deleted} entrée(s) usage_log "
+            f"supprimée(s) (> {older_than_days} jours)."
+        )
+
+    _run(_do())
+
+
 # ── Statut ────────────────────────────────────────────────────────────────────
 
 @app.command("status")

@@ -15,6 +15,7 @@ import audit
 import database as db
 import upstream
 from auth import get_current_user
+from background import fire_and_forget
 from config import settings
 from policy import normalize_chat_body, prompt_char_count
 from rate_limiter import (
@@ -131,6 +132,11 @@ async def chat_completions(request: Request, user: dict = Depends(get_current_us
     await check_hourly_tokens(user)
     await check_daily_tokens(user)
 
+    # Défense en profondeur : refuser tout body non-JSON (conforme OpenAI).
+    media_type = (request.headers.get("content-type", "").split(";", 1)[0]).strip().lower()
+    if media_type != "application/json":
+        return openai_error(415, "Content-Type doit etre application/json.", "invalid_request_error")
+
     try:
         raw = await request.body()
         if len(raw) > settings.max_body_bytes:
@@ -162,15 +168,19 @@ async def chat_completions(request: Request, user: dict = Depends(get_current_us
 
     duration_ms = int((time.monotonic() - started) * 1000)
     usage = data.get("usage", {})
-    await db.log_usage(
-        user["user_id"],
-        user["key_id"],
-        normalized["model"],
-        int(usage.get("prompt_tokens", 0)),
-        int(usage.get("completion_tokens", 0)),
-        duration_ms,
-        response.status_code,
-        request_id,
+    # Hors du chemin de requête : la comptabilisation ne doit pas ajouter de latence.
+    fire_and_forget(
+        db.log_usage(
+            user["user_id"],
+            user["key_id"],
+            normalized["model"],
+            int(usage.get("prompt_tokens", 0) or 0),
+            int(usage.get("completion_tokens", 0) or 0),
+            duration_ms,
+            response.status_code,
+            request_id,
+        ),
+        name=f"log_usage:{request_id}",
     )
     emit_audit(request, user, request_id, normalized["model"], prompt_chars, usage, duration_ms, response.status_code)
     return JSONResponse(content=data, status_code=response.status_code)
@@ -186,11 +196,17 @@ async def stream_response(
 ):
     status_code = 200
     usage: dict = {}
+    # Anti-contournement de quota : on compte les caractères de complétion reçus au
+    # fil de l'eau. Si l'étudiant coupe le stream avant le chunk `usage` final,
+    # on impute cette estimation au quota au lieu de 0 (génération GPU non gratuite).
+    completion_chars = 0
     try:
         async for chunk in upstream.stream_chat(body, user):
             extracted = extract_usage_from_sse_chunk(chunk)
             if extracted:
                 usage = extracted
+            else:
+                completion_chars += delta_content_size(chunk)
             yield chunk
     except httpx.TimeoutException:
         status_code = 504
@@ -201,17 +217,28 @@ async def stream_response(
     finally:
         await concurrency.release(user)
         duration_ms = int((time.monotonic() - started) * 1000)
-        await db.log_usage(
-            user["user_id"],
-            user["key_id"],
-            body["model"],
-            int(usage.get("prompt_tokens", 0) or 0),
-            int(usage.get("completion_tokens", 0) or 0),
-            duration_ms,
-            status_code,
-            request_id,
+        prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        # Si l'usage exact est arrivé, on l'utilise (pas de double comptage).
+        # Sinon (coupure/erreur), on impute l'estimation dérivée des deltas.
+        if usage:
+            completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+        else:
+            completion_tokens = _estimate_tokens(completion_chars)
+        fire_and_forget(
+            db.log_usage(
+                user["user_id"],
+                user["key_id"],
+                body["model"],
+                prompt_tokens,
+                completion_tokens,
+                duration_ms,
+                status_code,
+                request_id,
+            ),
+            name=f"log_usage:{request_id}",
         )
-        emit_audit(request, user, request_id, body["model"], prompt_chars, usage, duration_ms, status_code)
+        audit_usage = usage or {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
+        emit_audit(request, user, request_id, body["model"], prompt_chars, audit_usage, duration_ms, status_code)
 
 
 def extract_usage_from_sse_chunk(chunk: bytes) -> dict:
@@ -223,6 +250,41 @@ def extract_usage_from_sse_chunk(chunk: bytes) -> dict:
     except json.JSONDecodeError:
         return {}
     return payload.get("usage") or {}
+
+
+def delta_content_size(chunk: bytes) -> int:
+    """Nombre de caractères de complétion dans un chunk SSE (deltas assistant).
+
+    Utilisé pour estimer le volume généré en cas de coupure de stream avant le
+    chunk `usage`. Ignore les chunks non-data, [DONE], et le JSON invalide.
+    """
+    text = chunk.decode(errors="ignore").strip()
+    if not text.startswith("data: ") or text == "data: [DONE]":
+        return 0
+    try:
+        payload = json.loads(text[6:])
+    except json.JSONDecodeError:
+        return 0
+    total = 0
+    for choice in payload.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        content = choice.get("delta", {}).get("content")
+        if isinstance(content, str):
+            total += len(content)
+    return total
+
+
+def _estimate_tokens(char_count: int) -> int:
+    """Estime un nombre de tokens à partir d'un nombre de caractères.
+
+    Estimation grossière (~N caractères/token) imputée au quota uniquement
+    lorsque l'usage exact n'a pas été reçu (stream coupé). Voir config.
+    """
+    per_token = max(1, settings.est_chars_per_token)
+    if char_count <= 0:
+        return 0
+    return max(1, (char_count + per_token - 1) // per_token)
 
 
 def emit_audit(

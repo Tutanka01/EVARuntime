@@ -72,14 +72,34 @@ PRAGMA foreign_keys = ON;
 PRAGMA temp_store   = MEMORY;
 """
 
+# PRAGMAs de robustesse appliqués à CHAQUE connexion (pas seulement à l'init) :
+# - busy_timeout : attend au lieu d'échouer immédiatement en « database is locked ».
+# - wal_autocheckpoint / journal_size_limit : bornent la croissance du WAL.
+# Ce sont des réglages de session, légers, compatibles WAL (aucun changement de mode).
+_SESSION_PRAGMAS = """
+PRAGMA foreign_keys        = ON;
+PRAGMA busy_timeout        = 5000;
+PRAGMA wal_autocheckpoint  = 1000;
+PRAGMA journal_size_limit  = 67108864;
+"""
+
 
 # ── Connexion ─────────────────────────────────────────────────────────────────
+
+async def _apply_session_pragmas(db: aiosqlite.Connection) -> None:
+    """Applique les PRAGMAs de session/robustesse sur une connexion ouverte."""
+    for pragma in _SESSION_PRAGMAS.strip().splitlines():
+        pragma = pragma.strip()
+        if pragma:
+            await db.execute(pragma)
+
 
 @asynccontextmanager
 async def get_db() -> AsyncGenerator[aiosqlite.Connection, None]:
     """Context manager : connexion aiosqlite avec Row factory."""
     async with aiosqlite.connect(settings.db_path) as db:
         db.row_factory = aiosqlite.Row
+        await _apply_session_pragmas(db)
         yield db
 
 
@@ -92,6 +112,7 @@ async def init_db() -> None:
             pragma = pragma.strip()
             if pragma:
                 await db.execute(pragma)
+        await _apply_session_pragmas(db)
         await db.executescript(_SCHEMA)
         await db.commit()
 
@@ -342,6 +363,31 @@ async def log_usage(
             ),
         )
         await db.commit()
+
+
+async def purge_usage_older_than(days: int) -> int:
+    """
+    Purge de rétention MANUELLE (opt-in) des entrées `usage_log` plus anciennes
+    que `days` jours, puis `VACUUM` complet pour restituer l'espace disque.
+
+    Le `timestamp` est stocké en UTC au format SQLite (`datetime('now')`), donc la
+    comparaison à `datetime('now', '-N days')` est correcte. Retourne le nombre de
+    lignes supprimées. Aucune suppression automatique n'est déclenchée ailleurs ;
+    à exécuter hors ligne (VACUUM verrouille la base).
+    """
+    if days < 0:
+        raise ValueError("days doit être >= 0")
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM usage_log WHERE timestamp < datetime('now', ? || ' days')",
+            (f"-{days}",),
+        )
+        deleted = cursor.rowcount
+        await db.commit()
+        # VACUUM complet (pas de PRAGMA incremental_vacuum : auto_vacuum n'est pas
+        # activé, et on ne le change pas sur une base existante).
+        await db.execute("VACUUM")
+        return deleted
 
 
 async def get_usage_report(

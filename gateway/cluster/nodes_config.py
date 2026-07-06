@@ -24,6 +24,7 @@ Structure du fichier :
 from __future__ import annotations
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,14 @@ from urllib.parse import urlparse
 import yaml
 
 log = logging.getLogger(__name__)
+
+# Garde-fou opt-in : si activé, une config https:// + tls_verify=false (TLS
+# activé mais jamais vérifié — incohérent et dangereux, cf. `_check_tls_verify_
+# consistency`) fait échouer le chargement au lieu d'un simple warning. Réservé
+# aux déploiements qui veulent un fail-fast strict ; désactivé par défaut pour
+# ne pas casser les configs de dev existantes (cert auto-signé + tls_verify:
+# false est un usage documenté, cf. nodes.yaml.example).
+_STRICT_TLS_ENV = "CLUSTER_STRICT_TLS_VERIFY"
 
 # Même grammaire que model_id : minuscules + chiffres + . _ -.
 _NODE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
@@ -113,6 +122,8 @@ def load_nodes_config(path: Path) -> ClusterConfig:
         seen_urls.add(node.base_url)
         nodes.append(node)
 
+    _check_tls_verify(tls_verify, nodes, source=path)
+
     log.info(
         "Configuration cluster chargée depuis %s — %d nœud(s), tls_verify=%r",
         path, len(nodes), tls_verify,
@@ -166,6 +177,53 @@ def _validate_base_url(node_id: str, base_url: str) -> None:
             "à remplacer par HTTPS pour tout déploiement réseau partagé.",
             node_id, base_url,
         )
+
+
+def _check_tls_verify(
+    tls_verify: bool | str, nodes: list[NodeConfig], *, source: Path
+) -> None:
+    """
+    Avertit (et, en mode strict opt-in, refuse) quand la vérification TLS est
+    désactivée. Symétrique au warning HTTP en clair de `_validate_base_url`.
+
+    - `tls_verify=False` seul : warning explicite, vérification TLS totalement
+      désactivée côté httpx → vulnérable au MITM sur le LAN inter-nœuds.
+    - `tls_verify=False` + au moins un nœud en `https://` : incohérence forte
+      (on paie le coût TLS mais sans jamais vérifier le certificat serveur —
+      aucune protection contre un `llama_url` usurpé). Warning renforcé.
+      Refus dur uniquement si `CLUSTER_STRICT_TLS_VERIFY=true` est positionné :
+      par défaut on NE bloque PAS, pour ne pas casser les déploiements de dev
+      existants qui utilisent des certs auto-signés avec tls_verify: false.
+    """
+    if tls_verify is not False:
+        return
+
+    log.warning(
+        "Configuration cluster (%s) : tls_verify=false — la vérification du "
+        "certificat TLS des node_agent est DÉSACTIVÉE. À réserver strictement "
+        "au dev/LAN isolé et de confiance : ce réglage expose la liaison "
+        "orchestrateur ↔ node-agent (et donc les prompts) à une interception "
+        "(MITM). Pour la production, utilisez tls_verify avec un chemin vers "
+        "un bundle CA valide.",
+        source,
+    )
+
+    https_nodes = [n.id for n in nodes if urlparse(n.base_url).scheme == "https"]
+    if not https_nodes:
+        return
+
+    strict = os.environ.get(_STRICT_TLS_ENV, "").strip().lower() in ("true", "1", "yes")
+    message = (
+        "Configuration cluster (%s) incohérente : les nœuds %s utilisent "
+        "https:// mais tls_verify=false — le certificat serveur n'est jamais "
+        "vérifié. Cette combinaison n'apporte AUCUNE protection contre un "
+        "'llama_url' usurpé (MITM) tout en payant le coût TLS. Corrigez en "
+        "pointant tls_verify vers un bundle CA, ou repassez ces nœuds en "
+        "http:// si le LAN est réellement isolé."
+    )
+    if strict:
+        raise ValueError(message % (source, https_nodes))
+    log.warning(message, source, https_nodes)
 
 
 def _parse_tls_verify(raw: object) -> bool | str:

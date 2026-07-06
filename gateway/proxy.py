@@ -54,6 +54,68 @@ log = logging.getLogger(__name__)
 _INFERENCE_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=5.0)
 
 
+# ── Client HTTP partagé (chemin chaud) ────────────────────────────────────────
+#
+# Un unique httpx.AsyncClient par processus proxifie toutes les requêtes vers
+# les sous-processus llama-server locaux. Le pool de connexions keep-alive évite
+# un handshake TCP par requête vers 127.0.0.1:<port_llama>. Le client est créé
+# au démarrage (lifespan) via init_http_client() et fermé au shutdown via
+# aclose_http_client() — JAMAIS par requête (ce serait rouvrir le pool à chaque
+# appel, exactement le gaspillage qu'on élimine).
+#
+# En test (pas de lifespan monté), get_http_client() initialise paresseusement
+# un client par défaut ; les tests peuvent aussi injecter un client mocké via
+# set_http_client() (MockTransport).
+_http_client: httpx.AsyncClient | None = None
+
+
+def _build_http_client() -> httpx.AsyncClient:
+    """Construit le client partagé avec un pool dimensionné sur la config."""
+    limits = httpx.Limits(
+        # 0 dans la config = illimité → None côté httpx.Limits.
+        max_connections=settings.httpx_max_connections or None,
+        max_keepalive_connections=settings.httpx_max_keepalive or None,
+        keepalive_expiry=settings.httpx_keepalive_expiry,
+    )
+    return httpx.AsyncClient(timeout=_INFERENCE_TIMEOUT, limits=limits)
+
+
+def init_http_client() -> httpx.AsyncClient:
+    """
+    Initialise le client HTTP partagé. Appelé par le lifespan de main.py au
+    démarrage. Idempotent : ne recrée pas un client déjà initialisé.
+    """
+    global _http_client
+    if _http_client is None:
+        _http_client = _build_http_client()
+    return _http_client
+
+
+async def aclose_http_client() -> None:
+    """Ferme proprement le client partagé. Appelé par le lifespan au shutdown."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
+
+
+def set_http_client(client: httpx.AsyncClient | None) -> None:
+    """Injecte un client (tests : MockTransport). None réinitialise l'état."""
+    global _http_client
+    _http_client = client
+
+
+def get_http_client() -> httpx.AsyncClient:
+    """
+    Retourne le client partagé, en l'initialisant paresseusement si le lifespan
+    n'a pas été monté (chemin des tests). Ne ferme jamais ce client par requête.
+    """
+    global _http_client
+    if _http_client is None:
+        _http_client = _build_http_client()
+    return _http_client
+
+
 def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
     """
     Résout l'ID du modèle à utiliser pour une requête.
@@ -192,12 +254,14 @@ async def _non_stream_proxy(
     manager: ServerManager,
 ) -> JSONResponse:
     try:
-        async with httpx.AsyncClient(timeout=_INFERENCE_TIMEOUT) as client:
-            response = await client.post(
-                manager.llama_url(path),
-                json=body,
-                headers=manager.auth_headers(),
-            )
+        # Client partagé : on emprunte une connexion keep-alive du pool. Ne
+        # jamais fermer ce client ici — il vit toute la durée du processus.
+        client = get_http_client()
+        response = await client.post(
+            manager.llama_url(path),
+            json=body,
+            headers=manager.auth_headers(),
+        )
     except httpx.TimeoutException:
         return _openai_error(504, "Timeout : le modèle n'a pas répondu à temps.", "server_error")
     except httpx.RequestError as exc:
@@ -287,82 +351,85 @@ async def _stream_proxy(
     body_with_usage = {**body, "stream_options": {"include_usage": True}}
 
     try:
-        async with httpx.AsyncClient(timeout=_INFERENCE_TIMEOUT) as client:
-            async with client.stream(
-                "POST",
-                manager.llama_url(path),
-                json=body_with_usage,
-                headers=manager.auth_headers(),
-            ) as response:
-                status_code = response.status_code
+        # Client partagé : client.stream(...) emprunte une connexion du pool le
+        # temps du stream puis la rend au context-exit. On NE ferme JAMAIS le
+        # client partagé ici — seule la connexion empruntée est libérée.
+        client = get_http_client()
+        async with client.stream(
+            "POST",
+            manager.llama_url(path),
+            json=body_with_usage,
+            headers=manager.auth_headers(),
+        ) as response:
+            status_code = response.status_code
 
-                if has_tools:
-                    # ── Mode bufferisé (requête avec tools) ──────────────────
-                    chunks: list[dict] = []
-                    has_tool_calls = False
+            if has_tools:
+                # ── Mode bufferisé (requête avec tools) ──────────────────
+                chunks: list[dict] = []
+                has_tool_calls = False
 
-                    async for line in response.aiter_lines():
-                        if not line or line == "data: [DONE]":
-                            continue
-                        if line.startswith("data: "):
-                            try:
-                                chunk = json.loads(line[6:])
-                                if "model" in chunk:
-                                    chunk["model"] = manager.model.id
-                                for choice in chunk.get("choices", []):
-                                    delta = choice.get("delta", {})
-                                    delta.pop("reasoning_content", None)
-                                    if delta.get("tool_calls"):
-                                        has_tool_calls = True
-                                if usage := chunk.get("usage"):
-                                    prompt_tokens = usage.get("prompt_tokens", 0)
-                                    completion_tokens = usage.get("completion_tokens", 0)
-                                chunks.append(chunk)
-                            except json.JSONDecodeError:
-                                pass
-
-                    for chunk in chunks:
-                        if has_tool_calls:
+                async for line in response.aiter_lines():
+                    if not line or line == "data: [DONE]":
+                        continue
+                    if line.startswith("data: "):
+                        try:
+                            chunk = json.loads(line[6:])
+                            if "model" in chunk:
+                                chunk["model"] = manager.model.id
                             for choice in chunk.get("choices", []):
                                 delta = choice.get("delta", {})
-                                if delta.get("content") and not delta.get("tool_calls"):
-                                    delta.pop("content", None)
+                                delta.pop("reasoning_content", None)
+                                if delta.get("tool_calls"):
+                                    has_tool_calls = True
+                            if usage := chunk.get("usage"):
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                completion_tokens = usage.get("completion_tokens", 0)
+                            chunks.append(chunk)
+                        except json.JSONDecodeError:
+                            pass
 
-                        choices = chunk.get("choices", [])
-                        all_empty = all(
-                            not choice.get("delta") and choice.get("finish_reason") is None
-                            for choice in choices
-                        ) if choices else False
-                        if not all_empty or not choices:
-                            yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()
+                for chunk in chunks:
+                    if has_tool_calls:
+                        for choice in chunk.get("choices", []):
+                            delta = choice.get("delta", {})
+                            if delta.get("content") and not delta.get("tool_calls"):
+                                delta.pop("content", None)
 
-                    yield b"data: [DONE]\n\n"
+                    choices = chunk.get("choices", [])
+                    all_empty = all(
+                        not choice.get("delta") and choice.get("finish_reason") is None
+                        for choice in choices
+                    ) if choices else False
+                    if not all_empty or not choices:
+                        yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()
 
-                else:
-                    # ── Mode streaming direct (sans tools) ───────────────────
-                    async for line in response.aiter_lines():
-                        if not line:
-                            yield b"\n"
-                            continue
+                yield b"data: [DONE]\n\n"
 
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            try:
-                                chunk = json.loads(line[6:])
-                                if "model" in chunk:
-                                    chunk["model"] = manager.model.id
-                                for choice in chunk.get("choices", []):
-                                    delta = choice.get("delta", {})
-                                    reasoning = delta.pop("reasoning_content", None)
-                                    if reasoning and not delta.get("content"):
-                                        delta["content"] = reasoning
-                                if usage := chunk.get("usage"):
-                                    prompt_tokens = usage.get("prompt_tokens", 0)
-                                    completion_tokens = usage.get("completion_tokens", 0)
-                                line = "data: " + json.dumps(chunk, ensure_ascii=False)
-                            except json.JSONDecodeError:
-                                pass
+            else:
+                # ── Mode streaming direct (sans tools) ───────────────────
+                async for line in response.aiter_lines():
+                    if not line:
+                        yield b"\n"
+                        continue
 
-                        yield (line + "\n\n").encode()
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            chunk = json.loads(line[6:])
+                            if "model" in chunk:
+                                chunk["model"] = manager.model.id
+                            for choice in chunk.get("choices", []):
+                                delta = choice.get("delta", {})
+                                reasoning = delta.pop("reasoning_content", None)
+                                if reasoning and not delta.get("content"):
+                                    delta["content"] = reasoning
+                            if usage := chunk.get("usage"):
+                                prompt_tokens = usage.get("prompt_tokens", 0)
+                                completion_tokens = usage.get("completion_tokens", 0)
+                            line = "data: " + json.dumps(chunk, ensure_ascii=False)
+                        except json.JSONDecodeError:
+                            pass
+
+                    yield (line + "\n\n").encode()
 
     except httpx.TimeoutException:
         err = _sse_error("Timeout d'inférence dépassé.")

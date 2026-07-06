@@ -50,6 +50,14 @@ class AgentSettings(BaseSettings):
     base_llama_port: int = 8081
     max_loaded_models: int = 5
 
+    # ── Épinglage de version llama-server (mitigation supply-chain) ────────────
+    # Build minimal accepté du binaire llama-server. 0 = pas d'enforcement (défaut).
+    # Recommandé : fixer au premier build patché contre GHSA-8947-pfff-2f3c
+    # (écriture OOB via n_discard/context-shift) et les overflows de parsing GGUF.
+    # Si > 0 et que le binaire lu est plus ancien, le démarrage de l'agent est
+    # REFUSÉ ; si la version est illisible, on se contente d'un avertissement.
+    llama_server_min_build: int = 0
+
     # ── Mémoire GPU (unifiée sur GB10) ────────────────────────────────────────
     # Sur GB10 128 GB physiques : nvidia-smi rapporte ~122 GiB → 120 GB net
     total_vram_gb: float = 120.0

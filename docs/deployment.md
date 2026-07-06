@@ -20,6 +20,12 @@ de la mise en production.
 10. [Dashboard de monitoring](#10-dashboard-de-monitoring)
 11. [Mise à jour](#11-mise-à-jour)
 12. [Dépannage](#12-dépannage)
+13. [Déploiement multi-nœuds (optionnel)](#13-déploiement-multi-nœuds-optionnel--avancé)
+14. [Sauvegardes SQLite et restauration](#14-sauvegardes-sqlite-et-restauration)
+15. [Durcissement systemd du service principal](#15-durcissement-systemd-du-service-principal)
+16. [Durcissement nginx](#16-durcissement-nginx-anti-slowloris-et-concurrence)
+17. [Rotation des logs journald](#17-rotation-des-logs-journald)
+18. [Référence de configuration (variables d'environnement)](#18-référence-de-configuration-variables-denvironnement)
 
 ---
 
@@ -359,6 +365,35 @@ models:
 > image. La gateway émet un avertissement dans les logs au démarrage si `mmproj_path`
 > est absent pour un modèle vision.
 
+### Vérification d'intégrité `sha256` (optionnel — supply-chain)
+
+Champ optionnel par modèle : l'empreinte SHA-256 attendue du fichier GGUF.
+
+```yaml
+  - id: "llama-3.3-70b-instruct"
+    path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+    sha256: "3f2a...<64 hex>"   # empreinte attendue (64 caractères hexadécimaux)
+    # ...
+```
+
+Calculer l'empreinte d'un GGUF :
+
+```bash
+sha256sum /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
+```
+
+Comportement :
+
+- **absent** (défaut) → aucune vérification (rétro-compatible) ;
+- **présent** → au démarrage (gateway) et avant chaque chargement (node-agent),
+  le SHA-256 réel du fichier est recalculé et comparé. Un écart bloque le
+  chargement du modèle (log critical côté gateway, HTTP 422 côté node-agent) —
+  protection contre un GGUF substitué ou corrompu.
+
+> **Coût :** hacher un GGUF de plusieurs Go prend plusieurs secondes. La
+> vérification n'a lieu qu'au démarrage/chargement, jamais dans le chemin de
+> requête. À réserver aux modèles critiques.
+
 ### Activer un modèle
 
 ```bash
@@ -659,15 +694,53 @@ sudo bash gateway/deploy/update.sh
 
 Ce que fait le script :
 
-1. `git pull` dans le dépôt
+1. `git pull` dans le dépôt (capture le commit `BEFORE` pour un éventuel rollback)
 2. Synchronise les fichiers Python et `requirements.txt` vers `/opt/llm-gateway/`
 3. Synchronise le répertoire `static/` (dashboard HTML…)
 4. Met à jour les dépendances pip si `requirements.txt` a changé
-5. Copie le fichier systemd et recharge `daemon-reload`
-6. Redémarre le service proprement et attend le health check
+5. **Sauvegarde la base SQLite** avant redémarrage (voir ci-dessous)
+6. Copie le fichier systemd et recharge `daemon-reload`
+7. Redémarre le service proprement et attend le health check
+8. **Rollback automatique** si le service ne redevient pas healthy (voir ci-dessous)
 
 > **Note :** Le script ne touche jamais à `/etc/llm-gateway/env` (secrets),
-> à `/etc/llm-gateway/models.yaml` (registre), à la base de données, ni aux modèles GGUF.
+> à `/etc/llm-gateway/models.yaml` (registre), ni aux modèles GGUF. La base de
+> données n'est jamais écrasée automatiquement — elle est seulement **sauvegardée**.
+
+#### Sauvegarde automatique avant mise à jour
+
+Juste avant le redémarrage, `update.sh` crée une copie horodatée de la base :
+
+```
+/var/lib/llm-gateway/backups/gateway-pre-update-AAAAMMJJ-HHMMSS.db
+```
+
+La copie utilise `sqlite3 "$DB" ".backup '$DEST'"` — sûr sur une base **WAL
+active** (un simple `cp` pourrait capturer un WAL incohérent). Si `sqlite3` est
+absent, l'étape est ignorée avec un avertissement (la mise à jour continue).
+
+#### Rollback automatique
+
+Si, après les tentatives de health check, le service ne répond toujours pas sur
+`http://127.0.0.1:8000/health` :
+
+- si le code n'a **pas** changé (`BEFORE == AFTER`), le script se contente
+  d'inviter à consulter les logs ;
+- sinon, il exécute un **rollback** : `git checkout <BEFORE>`, re-synchronise le
+  code précédent, réinstalle les dépendances, recopie l'unité systemd et redémarre.
+  Il attend de nouveau le health check.
+
+Après un rollback réussi, le dépôt est en **detached HEAD** sur la version
+précédente. Pour repartir de la branche :
+
+```bash
+git -C <repo> checkout main
+```
+
+Le rollback **ne restaure pas** la base de données automatiquement : le schéma
+peut avoir évolué et écraser la base sans arbitrage humain serait plus risqué
+qu'utile. La sauvegarde `gateway-pre-update-*.db` reste disponible pour une
+restauration manuelle (voir [Sauvegardes SQLite](#14-sauvegardes-sqlite-et-restauration)).
 
 ### Mettre à jour llama.cpp
 
@@ -681,6 +754,30 @@ sudo cp build/bin/llama-server /usr/local/bin/
 # Redémarrer la gateway pour prendre en compte le nouveau binaire
 sudo systemctl restart llm-gateway
 ```
+
+#### Politique de version (mitigation supply-chain)
+
+`llama-server` a fait l'objet de CVEs 2025-2026 (écriture hors-bornes non
+authentifiée via `n_discard`/context-shift — GHSA-8947-pfff-2f3c —, overflows de
+parsing GGUF menant au RCE). Suivez les advisories llama.cpp et, après avoir
+installé un build patché, épinglez-le :
+
+```bash
+# Vérifier le build installé
+llama-server --version   # → version: <build> (<hash>)
+
+# Fixer le minimum accepté dans /etc/llm-gateway/env (et sur chaque node-agent)
+LLAMA_SERVER_MIN_BUILD=<build_patché>
+```
+
+Au démarrage, la gateway (et chaque node-agent) sonde `llama-server --version` :
+
+- build lu `<` `LLAMA_SERVER_MIN_BUILD` (si > 0) → **démarrage refusé** (log critical) ;
+- version illisible / binaire absent → simple avertissement, démarrage poursuivi ;
+- `LLAMA_SERVER_MIN_BUILD=0` (défaut) → aucun enforcement.
+
+> Le durcissement inclut aussi l'absence délibérée du flag `--context-shift`
+> (vecteur de la CVE `n_discard`) dans la commande de lancement.
 
 ### Ajouter ou modifier des modèles
 
@@ -956,3 +1053,257 @@ systemctl restart llm-gateway
 # Aucune modification de configuration nécessaire.
 # CLUSTER_MODE=local reste le défaut — comportement inchangé.
 ```
+
+---
+
+## 14. Sauvegardes SQLite et restauration
+
+La base `gateway.db` contient les utilisateurs, clés API (hashées), quotas et
+logs d'usage. Deux mécanismes de sauvegarde coexistent :
+
+1. **Ponctuelle** : `update.sh` crée `gateway-pre-update-*.db` avant chaque
+   mise à jour (voir [section 11](#11-mise-à-jour)).
+2. **Périodique** : une unité systemd `timer` déclenche une sauvegarde
+   quotidienne avec rotation.
+
+Toutes les sauvegardes utilisent `sqlite3 .backup` (cohérent sur une base **WAL
+active**) et vivent dans `/var/lib/llm-gateway/backups/` (permissions `600`,
+propriétaire `llmservice`).
+
+### Installation du timer de sauvegarde quotidienne
+
+```bash
+# Copier le script et les unités (déjà présents dans le dépôt)
+sudo cp gateway/deploy/llm-gateway-backup.sh /opt/llm-gateway/deploy/
+sudo chmod 755 /opt/llm-gateway/deploy/llm-gateway-backup.sh
+sudo cp gateway/deploy/llm-gateway-backup.service /etc/systemd/system/
+sudo cp gateway/deploy/llm-gateway-backup.timer   /etc/systemd/system/
+
+# Activer le déclencheur quotidien (03h15, avec rattrapage si serveur éteint)
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-gateway-backup.timer
+
+# Vérifier
+systemctl list-timers llm-gateway-backup.timer
+sudo systemctl start llm-gateway-backup.service   # test manuel immédiat
+journalctl -u llm-gateway-backup.service --no-pager -n 20
+```
+
+### Paramètres
+
+Le script lit les variables d'environnement (surchargées par
+`/etc/llm-gateway/env` si présentes) :
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `DB_PATH` | `/var/lib/llm-gateway/gateway.db` | Base source |
+| `BACKUP_DIR` | `/var/lib/llm-gateway/backups` | Destination |
+| `BACKUP_RETENTION_DAYS` | `14` | Rotation : suppression au-delà de N jours |
+
+Après chaque sauvegarde, un `PRAGMA integrity_check` est exécuté ; une copie
+corrompue est supprimée et le job échoue (visible dans `journalctl`).
+
+### Restauration depuis une sauvegarde `.backup`
+
+Un fichier `.backup` est une base SQLite complète et autonome — la restauration
+est une simple copie, service arrêté :
+
+```bash
+# 1. Arrêter la gateway (libère les verrous WAL)
+sudo systemctl stop llm-gateway
+
+# 2. (Prudence) archiver la base actuelle avant de l'écraser
+sudo mv /var/lib/llm-gateway/gateway.db \
+        /var/lib/llm-gateway/gateway.db.corrompue-$(date +%Y%m%d-%H%M%S)
+
+# 3. Restaurer la sauvegarde choisie
+sudo cp /var/lib/llm-gateway/backups/gateway-20260706-031500.db \
+        /var/lib/llm-gateway/gateway.db
+
+# 4. Rétablir propriétaire/permissions
+sudo chown llmservice:llmservice /var/lib/llm-gateway/gateway.db
+sudo chmod 640 /var/lib/llm-gateway/gateway.db
+
+# 5. Redémarrer
+sudo systemctl start llm-gateway
+curl http://127.0.0.1:8000/health
+```
+
+> **Note WAL :** un `.backup` est déjà consolidé (pas de `-wal`/`-shm` à copier).
+> Supprimer d'éventuels fichiers `gateway.db-wal`/`gateway.db-shm` résiduels
+> **avant** l'étape 3 si la base courante était corrompue.
+
+---
+
+## 15. Durcissement systemd du service principal
+
+`gateway/deploy/llm-gateway.service` est aligné sur le niveau de durcissement du
+service étudiant, **à l'exception des directives incompatibles avec l'accès GPU**.
+Directives ajoutées : `ProtectKernelTunables`, `ProtectKernelModules`,
+`ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `RestrictNamespaces`,
+`RestrictRealtime`, `RestrictSUIDSGID`, `LockPersonality`,
+`SystemCallArchitectures=native`, `SystemCallFilter=@system-service` (moins
+`@privileged @resources @mount @reboot @swap @debug`), et des limites
+`MemoryHigh`/`MemoryMax`/`TasksMax`.
+
+### Directives volontairement OMISES (casseraient le GPU)
+
+| Directive | Pourquoi omise |
+|-----------|----------------|
+| `PrivateDevices=true` | Masquerait `/dev/nvidia*` et `/dev/dri/*` → CUDA indisponible pour les sous-processus `llama-server`. (Le service étudiant l'active car il ne touche jamais au GPU.) |
+| `MemoryDenyWriteExecute=true` | Casse le JIT (CUDA PTX/JIT, certains chemins Python/allocateurs). |
+| `CapabilityBoundingSet=` (vide) | Non nécessaire au GPU (l'accès passe par les nœuds devices + groupes `render,video`), laissé au défaut pour rester conservateur. |
+
+### Directives à VALIDER en staging avant prod
+
+- **`DevicePolicy=closed` + `DeviceAllow=...`** : restreint explicitement l'accès
+  aux nœuds devices NVIDIA/DRI usuels. Si votre pilote expose des nœuds
+  supplémentaires (`nvidia-caps`, MIG…), les ajouter ; en cas de doute,
+  **commenter tout le bloc** pour revenir au comportement par défaut (accès régi
+  par l'appartenance aux groupes `render,video`, cf. `install.sh`).
+- **`MemoryHigh=48G` / `MemoryMax=64G` / `TasksMax=4096`** : valeurs de départ
+  pour un hôte L40S 48 Go avec ~128 Go de RAM. Les poids modèle sont en VRAM,
+  mais le `mmap` GGUF, le KV host et les buffers HTTP consomment de la RAM.
+  **Dimensionner à la charge réelle** (nombre de modèles chargés simultanément,
+  `MAX_LOADED_MODELS`). Un `MemoryMax` trop bas provoquerait un OOM-kill du
+  service et de ses `llama-server`.
+
+> Après modification, valider avec `systemd-analyze verify
+> /etc/systemd/system/llm-gateway.service` puis un cycle
+> `stop`/`start`/inférence de bout en bout **en staging** avant la prod.
+
+---
+
+## 16. Durcissement nginx (anti-slowloris et concurrence)
+
+`gateway/deploy/nginx.conf` ajoute une défense en profondeur sans toucher aux
+réglages SSE existants.
+
+### Anti-slowloris
+
+Timeouts courts sur la **réception** de la requête client (n'affectent PAS le
+streaming de la réponse) :
+
+```nginx
+client_header_timeout   15s;
+client_body_timeout     15s;
+client_body_buffer_size 128k;
+large_client_header_buffers 4 16k;
+```
+
+`client_max_body_size 10m` reste **inchangé** (prompts longs).
+
+### Granularité du rate-limiting
+
+La `location /v1/` est scindée :
+
+- **`= /v1/models`** — route légère non-streamante : rate-limit souple, **pas de
+  `limit_conn`** (un GET rapide ne doit pas consommer un slot de concurrence GPU) ;
+- **`~ ^/v1/(chat/completions|completions|embeddings)$`** — routes d'inférence :
+  `limit_req` + **`limit_conn api_conn 4`** qui borne les streams SSE concurrents
+  par IP (protection contre le DoS GPU) ;
+- **`/v1/`** (fallback) — conserve par prudence le comportement streaming
+  d'origine, borné en concurrence.
+
+> **Réglages SSE préservés à l'identique** sur les routes streamantes :
+> `proxy_buffering off`, `proxy_cache off`, `chunked_transfer_encoding on`,
+> `add_header X-Accel-Buffering no`, `proxy_read_timeout 600s`,
+> `proxy_send_timeout 600s`. Ne pas réduire ces timeouts : cela casserait les
+> générations longues.
+
+Recharger après modification :
+
+```bash
+sudo nginx -t && sudo nginx -s reload
+```
+
+---
+
+## 17. Rotation des logs journald
+
+`llm-gateway` et ses `llama-server` peuvent être verbeux (`--access-log`
+uvicorn, logs d'inférence). journald n'a **pas** de quota par service ; le
+drop-in fixe donc des limites **globales** au journal système.
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo cp gateway/deploy/journald-llm-gateway.conf \
+        /etc/systemd/journald.conf.d/llm-gateway.conf
+sudo systemctl restart systemd-journald
+```
+
+Réglages appliqués (à ajuster selon l'espace disque de `/var/log/journal`) :
+
+| Clé | Valeur | Effet |
+|-----|--------|-------|
+| `SystemMaxUse` | `500M` | Taille max du journal persistant |
+| `SystemKeepFree` | `1G` | Espace libre garanti sur le FS |
+| `SystemMaxFileSize` | `100M` | Taille max d'un fichier journal |
+| `MaxRetentionSec` | `30day` | Purge des entrées de plus de 30 jours |
+
+Vérifier :
+
+```bash
+journalctl --disk-usage
+sudo journalctl --vacuum-time=30d   # purge manuelle immédiate si besoin
+```
+
+---
+
+## 18. Référence de configuration (variables d'environnement)
+
+Toutes les variables ci-dessous vivent dans `/etc/llm-gateway/env` (gateway
+principale/orchestrateur) et, pour le cluster, sur chaque node-agent dans
+`/etc/llm-gateway-agent/env`. Les noms sont insensibles à la casse. Cette section
+consolide les réglages **récemment ajoutés** ; les paramètres historiques
+(`TOTAL_VRAM_GB`, `BASE_LLAMA_PORT`, `MAX_LOADED_MODELS`, `IDLE_TIMEOUT_SECONDS`,
+`CAPACITY_QUEUE_*`, secrets…) sont couverts en [section 5](#5-configuration).
+
+### Intégrité et version llama-server (supply-chain)
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `LLAMA_SERVER_MIN_BUILD` | `0` | Build minimal accepté du binaire `llama-server`. `0` = aucun enforcement. Si `> 0` et build lu strictement inférieur → **démarrage refusé** ; version illisible → simple avertissement (non fatal). À fixer sur le premier build patché (cf. [section 11](#11-mise-à-jour)). |
+
+> Le champ `sha256` par modèle (intégrité GGUF) se configure dans `models.yaml`,
+> pas ici — voir [section 6](#6-registre-des-modèles-modelsyaml).
+
+### Pool de connexions HTTP vers llama-server (chemin chaud)
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `HTTPX_MAX_CONNECTIONS` | `200` | Connexions totales max du client partagé (`0` = illimité, déconseillé). |
+| `HTTPX_MAX_KEEPALIVE` | `100` | Connexions keep-alive conservées au repos (`0` = illimité). |
+| `HTTPX_KEEPALIVE_EXPIRY` | `30.0` | Durée de vie (s) d'une connexion keep-alive inactive. |
+
+### Robustesse du cycle de vie (shutdown, VRAM, orphelins)
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `25.0` | Attente max des requêtes actives (modèles pinnés) au SIGTERM avant déchargement forcé (`0` = pas d'attente). |
+| `SHUTDOWN_DRAIN_POLL_SECONDS` | `0.2` | Intervalle de poll pendant le drain. |
+| `VRAM_RECONCILE_INTERVAL_SECONDS` | `60.0` | Intervalle entre deux sondes `nvidia-smi` de réconciliation VRAM (`0` = désactivé). |
+| `VRAM_RECONCILE_PROBE_TIMEOUT_SECONDS` | `5.0` | Timeout de la sonde `nvidia-smi`. |
+| `VRAM_RECONCILE_DRIFT_THRESHOLD` | `0.15` | Seuil de dérive relative déclenchant un warning (0.15 = +15 %). |
+| `KILL_ORPHAN_LLAMA_ON_STARTUP` | `false` | Tenter de tuer les `llama-server` orphelins occupant un port du pool au démarrage (best-effort, nécessite `psutil`). Par défaut : LOG seulement. |
+
+La réconciliation VRAM et la détection d'orphelins sont **non fatales** et
+inertes sans GPU / `nvidia-smi` / port occupé. Détails :
+[architecture.md](architecture.md#robustesse-du-cycle-de-vie-shutdown-vram-orphelins).
+
+### Cluster multi-nœuds (mode `cluster` uniquement)
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `CLUSTER_STRICT_TLS_VERIFY` | `false` | Si `true`, refuse au démarrage une config `tls_verify: false` combinée à un nœud `https://` (fail-fast). Par défaut : simple avertissement (compatibilité dev/certs auto-signés). |
+| `CLUSTER_LOAD_TIMEOUT` | `300.0` | Timeout (s) dédié au chargement d'un modèle sur un agent — un gros GGUF prend plusieurs minutes, bien au-delà de `CLUSTER_REQUEST_TIMEOUT` (défaut `10.0`, plan de contrôle). |
+
+`tls_verify` lui-même (bundle CA, `true`/`false`) se déclare dans `nodes.yaml`
+(section `cluster:`), pas via une variable d'environnement — voir
+[section 13](#13-déploiement-multi-nœuds-optionnel--avancé). `CLUSTER_HEALTH_INTERVAL`
+(défaut `10`) et `CLUSTER_HEALTH_FAILURES_TO_OFFLINE` (défaut `3`) pilotent le
+heartbeat.
+
+> Ces variables s'appliquent à l'**orchestrateur**. Le node-agent lit sa propre
+> config (`node_agent/config.py` : `NODE_ID`, `AGENT_PORT`, `AGENT_SECRET`,
+> `TOTAL_VRAM_GB`, `LLAMA_SERVER_BIN`, `LLAMA_SERVER_MIN_BUILD`…).
