@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     max_messages: int = 32
     max_tools_bytes: int = 16 * 1024
     max_completion_tokens: int = 2048
+    max_stop_sequences: int = 4        # nombre max de séquences stop (aligné OpenAI)
+    max_stop_sequence_chars: int = 64  # longueur max d'une séquence stop
+
+    # Estimation du volume complété en cas de coupure de stream (pas de chunk usage).
+    # ~4 caractères par token pour l'anglais/français ; imputé au quota si l'usage exact manque.
+    est_chars_per_token: int = 4
 
     audit_hmac_secret: str = "CHANGE_ME_AUDIT_HMAC_SECRET"
     audit_log_path: Path = Path("/var/log/llm-gateway-student/audit.jsonl")

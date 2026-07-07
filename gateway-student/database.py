@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
@@ -9,6 +11,8 @@ from typing import AsyncGenerator
 import aiosqlite
 
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 
 SCHEMA = """
@@ -52,6 +56,7 @@ CREATE TABLE IF NOT EXISTS usage_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash);
+CREATE INDEX IF NOT EXISTS idx_keys_user ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_usage_user_time ON usage_log(user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_log(timestamp);
 """
@@ -62,11 +67,29 @@ _MIGRATIONS = [
 ]
 
 
+# PRAGMAs de robustesse appliqués à CHAQUE connexion (pas seulement à l'init) :
+# - busy_timeout : attend au lieu d'échouer immédiatement en « database is locked ».
+# - wal_autocheckpoint / journal_size_limit : bornent la croissance du WAL.
+# Réglages de session légers, compatibles WAL (aucun changement de mode).
+_SESSION_PRAGMAS = (
+    "PRAGMA foreign_keys = ON",
+    "PRAGMA busy_timeout = 5000",
+    "PRAGMA wal_autocheckpoint = 1000",
+    "PRAGMA journal_size_limit = 67108864",
+)
+
+
+async def _apply_session_pragmas(db: aiosqlite.Connection) -> None:
+    """Applique les PRAGMAs de session/robustesse sur une connexion ouverte."""
+    for pragma in _SESSION_PRAGMAS:
+        await db.execute(pragma)
+
+
 @asynccontextmanager
 async def get_db() -> AsyncGenerator[aiosqlite.Connection, None]:
     async with aiosqlite.connect(settings.db_path) as db:
         db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA foreign_keys = ON")
+        await _apply_session_pragmas(db)
         yield db
 
 
@@ -75,12 +98,17 @@ async def init_db() -> None:
     async with aiosqlite.connect(settings.db_path) as db:
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("PRAGMA synchronous = NORMAL")
+        await _apply_session_pragmas(db)
         await db.executescript(SCHEMA)
         for migration in _MIGRATIONS:
             try:
                 await db.execute(migration)
-            except Exception:
-                pass  # Colonne déjà existante
+            except sqlite3.OperationalError as exc:
+                # On n'ignore QUE l'ajout d'une colonne déjà existante ; toute
+                # autre erreur de migration doit remonter.
+                if "duplicate column" not in str(exc).lower():
+                    raise
+                logger.debug("Migration ignorée (colonne déjà existante) : %s", exc)
         await db.commit()
 
 
@@ -330,6 +358,31 @@ async def tokens_used_last_minutes(user_id: int, minutes: int) -> int:
             (user_id, f"-{minutes}"),
         )).fetchone()
         return int(row["total"] or 0)
+
+
+async def purge_usage_older_than(days: int) -> int:
+    """
+    Purge de rétention MANUELLE (opt-in) des entrées `usage_log` plus anciennes
+    que `days` jours, puis `VACUUM` complet pour restituer l'espace disque.
+
+    Le `timestamp` est stocké en UTC au format SQLite (`datetime('now')`), donc la
+    comparaison à `datetime('now', '-N days')` est correcte. Retourne le nombre de
+    lignes supprimées. Aucune suppression automatique n'est déclenchée ailleurs ;
+    à exécuter hors ligne (VACUUM verrouille la base).
+    """
+    if days < 0:
+        raise ValueError("days doit être >= 0")
+    async with get_db() as db:
+        cursor = await db.execute(
+            "DELETE FROM usage_log WHERE timestamp < datetime('now', ? || ' days')",
+            (f"-{days}",),
+        )
+        deleted = cursor.rowcount
+        await db.commit()
+        # VACUUM complet (pas de PRAGMA incremental_vacuum : auto_vacuum n'est pas
+        # activé, et on ne le change pas sur une base existante).
+        await db.execute("VACUUM")
+        return deleted
 
 
 # ---------------------------------------------------------------------------

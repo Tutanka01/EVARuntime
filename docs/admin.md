@@ -421,6 +421,51 @@ curl -s "$GW/admin/metrics/llama" \
 # Retourne {} si aucun modèle n'est chargé
 ```
 
+### Exposition Prometheus texte (`/admin/metrics/prometheus`)
+
+Pour un scraping par un Prometheus mono-binaire local, la gateway expose un
+endpoint au **format texte Prometheus** (version 0.0.4), protégé par
+`ADMIN_SECRET` comme les autres routes `/admin/*` :
+
+```bash
+curl -s "$GW/admin/metrics/prometheus" \
+  -H "Authorization: Bearer $ADMIN_SECRET"
+```
+
+Métriques exposées (noms exacts) :
+
+| Métrique | Type | Labels | Description |
+|----------|------|--------|-------------|
+| `eva_requests_total` | counter | `model`, `status` | Requêtes par modèle et code HTTP (fenêtre 24h) |
+| `eva_tokens_total` | counter | `model`, `type` (`prompt`/`completion`) | Tokens par modèle et type (fenêtre 24h) |
+| `eva_request_latency_seconds` | gauge | `quantile` (0.5/0.95/0.99) | Percentiles de latence (fenêtre 7j) |
+| `eva_vram_used_gb` / `eva_vram_total_gb` / `eva_vram_available_gb` | gauge | — | Budget VRAM comptabilisé |
+| `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
+| `eva_llama_kv_cache_usage_ratio` | gauge | `model` (+ `node` en cluster) | Occupation du KV cache (0–1) |
+| `eva_llama_tokens_per_second` | gauge | `model` (+ `node`) | Débit de génération |
+| `eva_llama_requests_processing` | gauge | `model` (+ `node`) | Requêtes en cours d'inférence |
+| `eva_llama_requests_deferred` | gauge | `model` (+ `node`) | Requêtes en attente de slot |
+
+Robuste par construction : chaque source indisponible (aucun modèle, pas de
+`nvidia-smi`, mode cluster, DB vide) est silencieusement omise, jamais de 500.
+Ne divulgue aucun contenu de prompt. Voir [observability.md](observability.md)
+pour un exemple de job de scrape et des règles d'alerte.
+
+### Readiness `/ready` (distincte de `/health`)
+
+- **`GET /health`** (non authentifié) : liveness — le process répond. Utilisé
+  par nginx et systemd. Renvoie les modèles chargés et la VRAM.
+- **`GET /ready`** (non authentifié) : readiness — la gateway peut **servir** au
+  moins une requête d'inférence. Renvoie `200` si au moins un modèle est déjà
+  `ready`, **ou** s'il reste de la capacité VRAM (mode local) / au moins un nœud
+  online (mode cluster). Sinon `503` avec une `reason`
+  (`no_model_ready_and_no_capacity` ou `all_nodes_offline`). Le corps ne
+  divulgue aucune infra sensible (ni chemin fichier, ni URL).
+
+Utiliser `/ready` pour l'orchestration/supervision (mise en/hors rotation) et
+`/health` pour le simple redémarrage automatique. Voir
+[observability.md](observability.md).
+
 ---
 
 ## 5. Rapports d'usage
@@ -475,6 +520,27 @@ w.writeheader()
 w.writerows(data)
 " > usage-mars-2025.csv
 ```
+
+### Rétention / purge du journal d'usage
+
+Le journal `usage_log` grossit indéfiniment. La purge est **manuelle et opt-in** :
+aucune suppression n'est déclenchée automatiquement. Utilisez la commande CLI
+`purge-usage` pour supprimer les entrées plus anciennes que N jours, suivie d'un
+`VACUUM` complet qui restitue l'espace disque.
+
+```bash
+# Supprimer les entrées usage_log de plus de 365 jours
+llmgw purge-usage --older-than-days 365
+# → « Purge terminée : N entrée(s) usage_log supprimée(s) (> 365 jours). »
+```
+
+> **Attention :** le `VACUUM` verrouille la base pendant son exécution. Exécutez
+> cette commande **hors ligne** (fenêtre de maintenance), pas pendant les pics de
+> trafic. La suppression est définitive — exportez d'abord les rapports à archiver.
+>
+> La rétention n'affecte que l'historique de reporting. Les quotas glissants
+> (30 jours) ne portent que sur des fenêtres récentes ; conservez donc au moins
+> ~30 jours de journal si vous purgez agressivement.
 
 ---
 

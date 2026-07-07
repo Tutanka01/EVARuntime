@@ -256,6 +256,28 @@ systemctl daemon-reload
 systemctl enable llm-gateway.service
 info "Service systemd installé et activé."
 
+# ── 7b. Timer de sauvegarde quotidienne de la DB ──────────────────────────────
+# Le service oneshot exécute /opt/llm-gateway/deploy/llm-gateway-backup.sh ; le
+# script doit donc être déployé dans INSTALL_DIR (pas seulement dans le dépôt).
+
+info "Installation du timer de sauvegarde SQLite…"
+mkdir -p "$INSTALL_DIR/deploy"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
+systemctl daemon-reload
+# `enable` (sans --now) : planifie le prochain 03:15 sans lancer de backup
+# immédiat — la DB n'est initialisée qu'à l'étape 9.
+if command -v sqlite3 &>/dev/null; then
+    systemctl enable llm-gateway-backup.timer
+    info "Timer de sauvegarde activé (quotidien 03:15, rétention 14 j)."
+else
+    warn "sqlite3 introuvable — timer copié mais NON activé. Après 'apt install sqlite3' :"
+    warn "  sudo systemctl enable --now llm-gateway-backup.timer"
+fi
+
 # ── 8. Nginx ──────────────────────────────────────────────────────────────────
 
 if command -v nginx &>/dev/null; then
@@ -270,6 +292,22 @@ if command -v nginx &>/dev/null; then
     fi
 else
     warn "nginx non trouvé — installer manuellement et copier deploy/nginx.conf"
+fi
+
+# ── 8b. Rotation des logs journald ────────────────────────────────────────────
+# Réglages GLOBAUX au journal système (journald n'a pas de quota par-service).
+# Créé si absent ; jamais écrasé pour préserver un ajustement local (SystemMaxUse
+# dépend de l'espace disque de /var/log/journal).
+
+JOURNALD_DROPIN="/etc/systemd/journald.conf.d/llm-gateway.conf"
+if [[ ! -f "$JOURNALD_DROPIN" ]]; then
+    info "Installation de la rotation journald…"
+    mkdir -p /etc/systemd/journald.conf.d
+    cp "$SCRIPT_DIR/deploy/journald-llm-gateway.conf" "$JOURNALD_DROPIN"
+    systemctl restart systemd-journald
+    info "Rotation journald installée (SystemMaxUse=500M, rétention 30 j)."
+else
+    info "Configuration journald existante conservée : $JOURNALD_DROPIN"
 fi
 
 # ── 9. Initialisation de la DB ────────────────────────────────────────────────

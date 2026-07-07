@@ -284,6 +284,44 @@ python cli.py create-key prenom.nom \
 
 ---
 
+## Comptabilisation et rétention de l'usage
+
+### Comment les tokens sont comptés
+
+Chaque requête écrit une ligne dans `usage_log` (prompt/completion tokens, durée,
+statut). L'écriture (`log_usage`) et l'audit sont en **fire-and-forget** : hors
+du chemin de réponse, ils n'ajoutent pas de latence perçue par l'étudiant.
+
+En streaming, l'usage exact provient du chunk `usage` final renvoyé par
+l'upstream. **Si l'étudiant coupe le flux avant ce chunk**, la gateway estime le
+volume généré à partir des caractères de complétion déjà reçus
+(`EST_CHARS_PER_TOKEN`, ~4 car./token) et l'impute au quota. Conséquence pour
+l'analyse : sur les requêtes interrompues, `completion_tokens` est une estimation,
+pas une mesure exacte. C'est volontaire (anti-contournement de quota) — un stream
+coupé n'est jamais compté à zéro.
+
+### Purge des vieux logs d'usage
+
+Le CLI n'expose pas de commande de purge. Quand `/var/lib/…` se remplit, purger
+manuellement `usage_log`, service arrêté, via SQLite :
+
+```bash
+sudo systemctl stop llm-gateway-student
+
+# Supprimer les entrées de plus de 180 jours (adapter à la politique de rétention)
+sqlite3 /var/lib/llm-gateway-student/students.db \
+  "DELETE FROM usage_log WHERE timestamp < datetime('now', '-180 days'); VACUUM;"
+
+sudo systemctl start llm-gateway-student
+```
+
+> `VACUUM` restitue l'espace disque mais verrouille la base — l'exécuter hors
+> ligne. Conserver au moins ~30 jours de journal : les quotas glissants
+> (tokens/heure, tokens/jour) ne portent que sur des fenêtres récentes, mais
+> l'historique sert au reporting de fin de semestre.
+
+---
+
 ## Monitoring recommandé
 
 ### Alertes à configurer

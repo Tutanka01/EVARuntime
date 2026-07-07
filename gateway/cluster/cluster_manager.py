@@ -28,6 +28,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 from model_registry import ModelDefinition, ModelRegistry
 
@@ -193,6 +194,11 @@ class ClusterManager:
         """Lance la tâche heartbeat. Appelé depuis le lifespan FastAPI."""
         # Premier health-check immédiat pour détecter les nœuds offline au boot
         await self._check_all_nodes()
+        # Réconciliation d'état : après un redémarrage de la gateway, des
+        # llama-server peuvent encore tourner sur les nœuds. On reconstruit
+        # _placement / loaded à partir de status() pour éviter des placements
+        # fantômes et des rechargements redondants.
+        await self._reconcile_state()
         self._monitor_task = asyncio.create_task(self._health_loop())
         log.info(
             "ClusterManager démarré — %d nœud(s) : %s",
@@ -202,6 +208,84 @@ class ClusterManager:
                 for nid, s in self._nodes.items()
             ),
         )
+
+    async def _reconcile_state(self) -> None:
+        """
+        Reconstruit _placement / _NodeState.loaded à partir de l'état réel des
+        nœuds ONLINE (status()). Appelé une fois au démarrage, APRÈS le premier
+        _check_all_nodes, pour ne pas repartir d'un état vide alors que des
+        llama-server tournent encore côté nœuds (placements fantômes /
+        rechargements redondants après un redémarrage de la gateway).
+
+        Note : status() ne renvoie PAS l'internal_api_key du llama-server. Une
+        entrée réconciliée porte donc un internal_api_key vide, ce qui la marque
+        comme "à rafraîchir" : le fast-path de ensure_model_loaded déclenchera
+        un load_model() idempotent (already_loaded côté agent) pour récupérer la
+        vraie clé + l'URL de confiance lors de la première requête sur ce modèle.
+        La réconciliation elle-même ne déclenche AUCUN rechargement.
+        """
+        async with self._lock:
+            for state in self._nodes.values():
+                if not state.online:
+                    continue
+                try:
+                    node_status = await state.client.status()
+                except (NodeUnreachableError, NodeProtocolError) as exc:
+                    log.warning(
+                        "Réconciliation : status() injoignable sur '%s' : %s — nœud sauté.",
+                        state.node_id, exc,
+                    )
+                    continue
+                except Exception as exc:  # défensif : ne jamais bloquer le boot
+                    log.warning(
+                        "Réconciliation : erreur inattendue sur '%s' : %s — nœud sauté.",
+                        state.node_id, exc,
+                    )
+                    continue
+
+                for m in node_status.models:
+                    # On ne réconcilie que les modèles réellement servables.
+                    if m.state != "ready":
+                        continue
+                    llama_url = self._reconciled_llama_url(state, m.port)
+                    if llama_url is None:
+                        continue
+                    info = _LoadedInfo(
+                        node_id=state.node_id,
+                        llama_url=llama_url,
+                        # Clé inconnue via status() → sentinelle vide = "à rafraîchir".
+                        internal_api_key="",
+                        vram_gb=m.vram_gb,
+                    )
+                    state.loaded[m.id] = info
+                    self._placement[m.id] = state.node_id
+                    log.info(
+                        "Réconciliation : modèle '%s' déjà chargé sur '%s' "
+                        "(%.1f GB) — placement restauré sans rechargement.",
+                        m.id, state.node_id, m.vram_gb,
+                    )
+
+    @staticmethod
+    def _reconciled_llama_url(state: _NodeState, port: int | None) -> str | None:
+        """
+        Reconstruit une URL llama-server de confiance (http://<hôte réel>:<port>)
+        pour une entrée réconciliée. L'hôte provient TOUJOURS du base_url du
+        nœud (source de confiance, nodes.yaml) — jamais d'une valeur renvoyée
+        par l'agent — cohérent avec RemoteNodeClient._trusted_llama_url.
+        """
+        if not isinstance(port, int) or not (1 <= port <= 65535):
+            log.warning(
+                "Réconciliation : port invalide (%r) sur '%s' — modèle ignoré.",
+                port, state.node_id,
+            )
+            return None
+        base = state.client.base_url
+        hostname = urlparse(base).hostname if base else None
+        # LocalNodeAdapter expose base_url="in-process" (pas d'hôte) : dans ce
+        # cas on retombe sur le format host:port utilisé par le backend local.
+        if not hostname:
+            hostname = state.node_id
+        return f"http://{hostname}:{port}"
 
     async def shutdown(self) -> None:
         """Arrête le heartbeat et décharge tous les modèles sur tous les nœuds."""
@@ -242,15 +326,34 @@ class ClusterManager:
                 f"Activez-le via PATCH /admin/models/{model_id}."
             )
 
-        # Fast path — pas de lock si déjà chargé
+        # Fast path — sous lock (mutation possible : invalidation d'un placement)
         async with self._lock:
             node_id = self._placement.get(model_id)
             if node_id and node_id in self._nodes:
                 node_state = self._nodes[node_id]
                 info = node_state.loaded.get(model_id)
                 if info:
-                    info.touch()
-                    return ClusterModelHandle(info, model)
+                    # Failover rapide : ne JAMAIS servir un handle vers un nœud
+                    # offline (crash entre deux heartbeats). On invalide l'entrée
+                    # et on retombe sur un placement frais qui choisira un autre
+                    # nœud online.
+                    if not node_state.online:
+                        node_state.loaded.pop(model_id, None)
+                        self._placement.pop(model_id, None)
+                        log.warning(
+                            "Placement de '%s' invalidé : nœud '%s' offline — "
+                            "replacement en cours.",
+                            model_id, node_id,
+                        )
+                    elif not info.internal_api_key:
+                        # Entrée réconciliée au démarrage : la clé interne est
+                        # inconnue via status(). On la rafraîchit via un
+                        # load_model() idempotent (already_loaded côté agent) sur
+                        # le MÊME nœud, sans rechargement réel du modèle.
+                        return await self._refresh_reconciled(node_state, model)
+                    else:
+                        info.touch()
+                        return ClusterModelHandle(info, model)
 
             # Placement fresh
             return await self._place_and_load(model)
@@ -312,6 +415,43 @@ class ClusterManager:
         )
         return ClusterModelHandle(info, model)
 
+    async def _refresh_reconciled(
+        self, node_state: _NodeState, model: ModelDefinition
+    ) -> ClusterModelHandle:
+        """
+        Rafraîchit une entrée réconciliée (internal_api_key vide) sur SON nœud.
+        Appelé sous _lock. load_model est idempotent côté agent (already_loaded)
+        donc le modèle n'est PAS réellement rechargé — on récupère juste la vraie
+        clé interne + l'URL de confiance. En cas d'échec, on invalide l'entrée et
+        on retombe sur un placement frais sur un autre nœud.
+        """
+        try:
+            resp = await node_state.client.load_model(model.to_dict())
+        except (NodeUnreachableError, NodeProtocolError) as exc:
+            log.warning(
+                "Rafraîchissement de '%s' sur '%s' échoué (%s) — replacement.",
+                model.id, node_state.node_id, exc,
+            )
+            node_state.loaded.pop(model.id, None)
+            self._placement.pop(model.id, None)
+            return await self._place_and_load(model)
+
+        info = node_state.loaded.get(model.id)
+        if info is None:
+            info = _LoadedInfo(
+                node_id=node_state.node_id,
+                llama_url=resp.llama_url,
+                internal_api_key=resp.internal_api_key,
+                vram_gb=model.vram_gb,
+            )
+            node_state.loaded[model.id] = info
+        else:
+            info.llama_url = resp.llama_url
+            info.internal_api_key = resp.internal_api_key
+        self._placement[model.id] = node_state.node_id
+        info.touch()
+        return ClusterModelHandle(info, model)
+
     # ── Déchargement ──────────────────────────────────────────────────────────
 
     async def unload_model(self, model_id: str) -> None:
@@ -329,18 +469,26 @@ class ClusterManager:
         """Décharge un modèle sur un nœud précis. Appelé sous _lock."""
         try:
             resp = await node_state.client.unload_model(model_id)
-            log.info(
-                "Modèle '%s' déchargé de '%s' (libéré %.1f GB VRAM)",
-                model_id, node_state.node_id, resp.freed_vram_gb,
-            )
         except (NodeUnreachableError, NodeProtocolError) as exc:
+            # Nœud flaky : l'unload a peut-être échoué → le llama-server tourne
+            # peut-être encore et occupe toujours sa VRAM. On NE purge PAS l'état
+            # de façon optimiste (cela sur-réserverait au prochain placement).
+            # Choix le plus sûr : re-synchroniser immédiatement via health() et
+            # ne libérer localement QUE si le nœud confirme que le modèle est bien
+            # parti. Sinon on laisse l'entrée en place (VRAM considérée occupée).
             log.warning(
-                "Impossible de décharger '%s' de '%s' : %s",
+                "Impossible de décharger '%s' de '%s' : %s — re-synchronisation health().",
                 model_id, node_state.node_id, exc,
             )
+            await self._resync_after_failed_unload(node_state, model_id)
+            return
 
-        # Nettoyer l'état local même si l'appel réseau a échoué — on ne veut
-        # pas bloquer l'éviction à cause d'un nœud flaky.
+        log.info(
+            "Modèle '%s' déchargé de '%s' (libéré %.1f GB VRAM)",
+            model_id, node_state.node_id, resp.freed_vram_gb,
+        )
+
+        # Succès confirmé : purge de l'état local + comptabilité VRAM.
         info = node_state.loaded.pop(model_id, None)
         self._placement.pop(model_id, None)
 
@@ -353,6 +501,44 @@ class ClusterManager:
                     "loaded_model_ids": [m for m in h.loaded_model_ids if m != model_id],
                     "free_ports": h.free_ports + 1,
                 }
+            )
+
+    async def _resync_after_failed_unload(
+        self, node_state: _NodeState, model_id: str
+    ) -> None:
+        """
+        Après un unload_model en échec, re-synchronise l'état local via health().
+        On ne purge l'entrée locale QUE si le nœud confirme que le modèle n'est
+        plus chargé (absent de loaded_model_ids). Sinon on considère la VRAM
+        toujours occupée : le placement suivant ne sur-réservera pas. Appelé sous
+        _lock.
+        """
+        try:
+            health = await node_state.client.health()
+        except Exception as exc:
+            # health() KO aussi : nœud vraisemblablement injoignable. On laisse
+            # l'entrée en place (VRAM occupée) ; le heartbeat le passera offline
+            # et le failover (fix 2) invalidera le placement à la prochaine requête.
+            log.warning(
+                "Re-sync '%s' sur '%s' : health() KO (%s) — entrée conservée (VRAM occupée).",
+                model_id, node_state.node_id, exc,
+            )
+            return
+
+        node_state.last_health = health
+        if model_id not in health.loaded_model_ids:
+            # Le nœud confirme que le modèle est parti : purge sûre.
+            node_state.loaded.pop(model_id, None)
+            self._placement.pop(model_id, None)
+            log.info(
+                "Re-sync '%s' sur '%s' : modèle absent côté nœud — état local purgé.",
+                model_id, node_state.node_id,
+            )
+        else:
+            log.warning(
+                "Re-sync '%s' sur '%s' : modèle TOUJOURS chargé côté nœud — "
+                "entrée conservée (VRAM occupée).",
+                model_id, node_state.node_id,
             )
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
@@ -387,6 +573,23 @@ class ClusterManager:
         except NodeProtocolError as exc:
             log.warning("Nœud '%s' heartbeat KO (protocol) : %s", state.node_id, exc)
             state.consecutive_failures += 1
+            return
+        except Exception as exc:
+            # Toute autre exception (bug client, erreur inattendue) doit COMPTER
+            # comme un échec de heartbeat — sinon un nœud réellement KO resterait
+            # online=True indéfiniment (l'exception était auparavant absorbée en
+            # debug par _check_all_nodes).
+            log.warning(
+                "Nœud '%s' heartbeat : exception inattendue (%s) : %s",
+                state.node_id, exc.__class__.__name__, exc,
+            )
+            state.consecutive_failures += 1
+            if state.online and state.consecutive_failures >= self._failures_threshold:
+                state.online = False
+                log.warning(
+                    "Nœud '%s' marqué OFFLINE après %d échecs consécutifs.",
+                    state.node_id, state.consecutive_failures,
+                )
             return
 
         # Succès
@@ -426,6 +629,46 @@ class ClusterManager:
                     for mid, info in state.loaded.items()
                 ],
             })
+        return result
+
+    async def collect_llama_metrics(self) -> dict:
+        """
+        Agrège les métriques llama-server de tous les nœuds ONLINE (observabilité).
+
+        Additif et hors chemin d'inférence : peuple /admin/metrics/llama et
+        l'exposition Prometheus en mode cluster. Retourne un dict compact
+        {model_id: {clés métriques…, "node": node_id}} ; le node_id est propagé
+        pour tagger la provenance et éviter les collisions de model_id entre
+        nœuds. Best-effort : un nœud injoignable est simplement ignoré, jamais
+        d'exception propagée (le heartbeat reste seul responsable de l'état).
+        """
+        # Snapshot des nœuds online sous lock, puis appels réseau HORS lock pour
+        # ne jamais bloquer le placement/heartbeat sur des I/O métriques.
+        async with self._lock:
+            online = [
+                (state.node_id, state.client)
+                for state in self._nodes.values()
+                if state.online
+            ]
+
+        result: dict = {}
+        for node_id, client in online:
+            try:
+                node_metrics = await client.metrics()
+            except (NodeUnreachableError, NodeProtocolError) as exc:
+                log.debug("Métriques nœud '%s' indisponibles : %s", node_id, exc)
+                continue
+            except Exception as exc:  # défensif : jamais fatal pour l'observabilité
+                log.debug(
+                    "Métriques nœud '%s' : erreur inattendue (%s)", node_id, exc
+                )
+                continue
+            if not isinstance(node_metrics, dict):
+                continue
+            for model_id, m in node_metrics.items():
+                entry = dict(m) if isinstance(m, dict) else {}
+                entry["node"] = node_id
+                result[model_id] = entry
         return result
 
     def status(self) -> dict:

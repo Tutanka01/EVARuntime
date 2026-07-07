@@ -240,6 +240,151 @@ def test_rejects_oversized_tools() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Multimodal content structure validation (SSRF hardening)
+# ---------------------------------------------------------------------------
+
+def test_accepts_text_content_list() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "Bonjour"}]}],
+    }
+    normalized = normalize_chat_body(body, USER)
+    assert normalized["messages"][0]["content"] == [{"type": "text", "text": "Bonjour"}]
+
+
+def test_rejects_image_url_content_item() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "regarde"},
+                    {"type": "image_url", "image_url": {"url": "http://example.com/cat.png"}},
+                ],
+            }
+        ],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_image_url_link_local_ssrf() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "http://169.254.169.254/latest/meta-data/"}},
+                ],
+            }
+        ],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_input_audio_content_item() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [
+            {"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": "AAA"}}]}
+        ],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_text_item_with_extra_key() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi", "image_url": {"url": "http://x"}}]}
+        ],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_non_dict_content_item() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": ["just a string"]}],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_text_item_with_non_string_text() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": [{"type": "text", "text": 42}]}],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# stop sequence bounds
+# ---------------------------------------------------------------------------
+
+def test_accepts_stop_within_bounds() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stop": ["\n", "STOP"],
+    }
+    normalized = normalize_chat_body(body, USER)
+    assert normalized["stop"] == ["\n", "STOP"]
+
+
+def test_accepts_stop_as_string() -> None:
+    body = {"model": VALID_MODEL, "messages": [{"role": "user", "content": "hi"}], "stop": "END"}
+    normalized = normalize_chat_body(body, USER)
+    assert normalized["stop"] == "END"
+
+
+def test_rejects_too_many_stop_sequences() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stop": ["a", "b", "c", "d", "e"],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_oversized_stop_sequence() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stop": ["x" * (settings.max_stop_sequence_chars + 1)],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+def test_rejects_non_string_stop_sequence() -> None:
+    body = {
+        "model": VALID_MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stop": [123],
+    }
+    with pytest.raises(HTTPException) as exc:
+        normalize_chat_body(body, USER)
+    assert exc.value.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # Numeric bounds
 # ---------------------------------------------------------------------------
 

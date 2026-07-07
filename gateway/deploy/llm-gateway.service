@@ -31,12 +31,71 @@ ExecStart=/opt/llm-gateway/venv/bin/uvicorn \
 LimitNOFILE=65536
 LimitNPROC=4096
 
-# Durcissement sécurité
+# ── Durcissement sécurité (aligné sur gateway-student, adapté à l'accès GPU) ──
+# La gateway lance llama-server en sous-processus (create_subprocess_exec,
+# start_new_session=True) et a besoin du GPU CUDA. Les directives qui casseraient
+# ce lancement ou l'accès aux devices NVIDIA sont volontairement OMISES ou
+# commentées ci-dessous avec un avertissement.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/llm-gateway /var/log/llm-gateway /models /data/models
 # Pas de ProtectHome=true car le user n'a pas de home
+
+# Protections noyau / système — sûres pour le GPU (n'affectent pas /dev/nvidia*)
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# NE PAS activer PrivateDevices=true : masquerait /dev/nvidia*, /dev/nvidiactl,
+# /dev/nvidia-uvm et /dev/dri/* → CUDA indisponible pour les sous-processus
+# llama-server. La gateway étudiante l'active car elle ne touche jamais au GPU.
+# PrivateDevices=true   # ← INTERDIT ICI (casse CUDA)
+
+# NE PAS activer MemoryDenyWriteExecute=true : casse le JIT (CUDA PTX/JIT,
+# certains chemins Python/allocateurs). À laisser désactivé pour la gateway GPU.
+# MemoryDenyWriteExecute=true   # ← INTERDIT ICI (casse le JIT CUDA/Python)
+
+# Filtrage des appels système : autoriser le profil "service" standard, puis
+# retirer les groupes dangereux. @system-service inclut fork/exec/socket (requis
+# pour lancer llama-server et servir HTTP) ainsi que les ioctl (requis GPU).
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug
+
+# À VALIDER en staging avant prod : DeviceAllow restreint l'accès aux nœuds
+# devices. La liste ci-dessous couvre les devices NVIDIA usuels + DRI. Si votre
+# pilote expose des nœuds supplémentaires (nvidia-caps, MIG…), les ajouter ici,
+# SINON commenter tout le bloc DevicePolicy/DeviceAllow pour revenir au
+# comportement par défaut (tous devices autorisés selon l'appartenance groupe).
+# Le service est déjà membre des groupes render,video (cf. install.sh).
+DevicePolicy=closed
+DeviceAllow=/dev/nvidia0 rw
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia-uvm-tools rw
+DeviceAllow=/dev/nvidia-modeset rw
+DeviceAllow=char-nvidia-frontend rw
+DeviceAllow=char-nvidia-uvm rw
+DeviceAllow=/dev/dri rw
+DeviceAllow=char-drm rw
+
+# À VALIDER en staging avant prod : limites mémoire/tâches. MemoryMax doit être
+# supérieur à l'empreinte RAM de la gateway + tous les llama-server enfants (les
+# poids modèle sont en VRAM, mais le mmap GGUF, le KV host, et les buffers HTTP
+# consomment de la RAM). Dimensionner selon le GPU et le nombre de modèles
+# chargés simultanément (MAX_LOADED_MODELS). Valeurs de départ prudentes pour un
+# hôte L40S 48 Go avec ~128 Go de RAM ; AJUSTER à la charge réelle.
+# MemoryHigh déclenche une pression douce avant le hard-kill de MemoryMax.
+MemoryHigh=48G
+MemoryMax=64G
+TasksMax=4096
 
 # Restart automatique en cas d'erreur
 Restart=on-failure

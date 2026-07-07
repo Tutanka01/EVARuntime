@@ -179,6 +179,150 @@ class TestRemoteClientHappyPath:
         assert called["count"] == 1
 
 
+# ── RemoteNodeClient — Sécurité : reconstruction de llama_url (anti-SSRF) ─────
+
+class TestRemoteClientTrustedLlamaUrl:
+    """
+    Le llama_url renvoyé par l'agent n'est JAMAIS utilisé tel quel : il est
+    reconstruit à partir de l'hôte réel du nœud (base_url) + le port retourné.
+    """
+
+    def _load_handler(self, llama_url: str, port: int = 8081, already: bool = False):
+        def handler(request):
+            assert request.url.path == "/agent/models/load"
+            return httpx.Response(
+                200,
+                json={
+                    "model_id": "m1",
+                    "llama_url": llama_url,
+                    "internal_api_key": "key",
+                    "port": port,
+                    "pid": 999,
+                    "already_loaded": already,
+                },
+            )
+
+        return handler
+
+    @pytest.mark.anyio
+    async def test_loopback_url_is_rebound_to_node_host(self):
+        # L'agent renvoie 127.0.0.1 (défaut) → doit être remplacé par l'hôte du nœud.
+        client = make_client(self._load_handler("http://127.0.0.1:8081"))
+        try:
+            resp = await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+        assert resp.llama_url == "http://node.test:8081"
+
+    @pytest.mark.anyio
+    async def test_attacker_url_is_ignored(self):
+        # Un agent compromis / MITM renvoie une URL arbitraire → ignorée.
+        client = make_client(self._load_handler("http://attacker.example:80"))
+        try:
+            resp = await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+        assert resp.llama_url == "http://node.test:8081"
+        assert "attacker.example" not in resp.llama_url
+
+    @pytest.mark.anyio
+    async def test_already_loaded_url_is_also_rebound(self):
+        # already_loaded=True passe par le même load_model → même correction.
+        client = make_client(
+            self._load_handler("http://attacker.example:80", port=8082, already=True)
+        )
+        try:
+            resp = await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+        assert resp.already_loaded is True
+        assert resp.llama_url == "http://node.test:8082"
+
+    @pytest.mark.anyio
+    async def test_port_out_of_range_zero_raises_protocol_error(self):
+        client = make_client(self._load_handler("http://node.test:8081", port=0))
+        try:
+            with pytest.raises(NodeProtocolError, match="port"):
+                await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+
+    @pytest.mark.anyio
+    async def test_port_out_of_range_high_raises_protocol_error(self):
+        client = make_client(self._load_handler("http://node.test:8081", port=999999))
+        try:
+            with pytest.raises(NodeProtocolError, match="port"):
+                await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+
+
+# ── RemoteNodeClient — Timeout de chargement dédié ───────────────────────────
+
+class TestRemoteClientLoadTimeout:
+    """
+    load_model doit utiliser le timeout long (self._load_timeout), pas le
+    timeout court du plan de contrôle. Les autres POST gardent le défaut.
+    """
+
+    @pytest.mark.anyio
+    async def test_load_uses_long_timeout_others_default(self):
+        captured: list = []
+
+        client = RemoteNodeClient(
+            node_id="test-node",
+            base_url="https://node.test:9443",
+            agent_secret="s3cret",
+            timeout_seconds=2.0,
+            load_timeout_seconds=300.0,
+            verify=False,
+        )
+
+        original_post = client._post
+
+        async def spy_post(path, *, json=None, timeout=None):
+            captured.append((path, timeout))
+            return await original_post(path, json=json, timeout=timeout)
+
+        client._post = spy_post
+
+        def handler(request):
+            path = request.url.path
+            if path == "/agent/models/load":
+                return httpx.Response(
+                    200,
+                    json={
+                        "model_id": "m1",
+                        "llama_url": "http://node.test:8081",
+                        "internal_api_key": "key",
+                        "port": 8081,
+                        "already_loaded": False,
+                    },
+                )
+            # unload-all
+            return httpx.Response(200, json={})
+
+        client._client = httpx.AsyncClient(
+            base_url="https://node.test:9443",
+            transport=httpx.MockTransport(handler),
+            headers={
+                "Authorization": "Bearer s3cret",
+                "User-Agent": "llm-gateway-orchestrator",
+            },
+        )
+
+        try:
+            await client.load_model({"id": "m1"})
+            await client.unload_all()
+        finally:
+            await client.close()
+
+        by_path = dict(captured)
+        assert by_path["/agent/models/load"] == 300.0
+        # unload-all : pas d'override → None (timeout par défaut du client)
+        assert by_path["/agent/unload-all"] is None
+
+
 # ── RemoteNodeClient — Erreurs réseau ────────────────────────────────────────
 
 class TestRemoteClientNetworkErrors:

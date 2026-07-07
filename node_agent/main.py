@@ -24,6 +24,8 @@ import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
+
 # ── Initialisation sys.path ───────────────────────────────────────────────────
 _AGENT_DIR = Path(__file__).resolve().parent
 _GATEWAY_DIR = _AGENT_DIR.parent / "gateway"
@@ -43,7 +45,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Chargé APRÈS avoir ajusté sys.path
 from config import settings  # → node_agent/config.py
-from model_registry import ModelRegistry
+from llama_version import enforce_llama_min_build
+from model_registry import IntegrityError, ModelRegistry
 from server_manager import ModelState, ServerManager
 from cluster.node_protocol import (
     LoadRequest,
@@ -137,6 +140,19 @@ class _AgentState:
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=f"Définition de modèle invalide : {exc}") from exc
 
+        # Garde-fou supply-chain (opt-in) : si le modèle déclare un `sha256`, on
+        # vérifie l'intégrité du GGUF AVANT de lancer le sous-processus. Coût :
+        # hash complet d'un gros fichier (plusieurs Go) — acceptable au chargement,
+        # jamais dans le chemin de requête. Inerte si `sha256` absent.
+        if model.sha256 is not None:
+            try:
+                model.verify_integrity()
+            except IntegrityError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Vérification d'intégrité échouée : {exc}",
+                ) from exc
+
         async with self._lock:
             existing = self._managers.get(model.id)
             if existing and existing.state in (ModelState.READY, ModelState.LOADING):
@@ -224,6 +240,67 @@ class _AgentState:
             free_ports=len(self._port_pool),
         )
 
+    @staticmethod
+    def _parse_prometheus(text: str) -> dict[str, float]:
+        """
+        Parse minimaliste du format texte Prometheus des llama-server locaux.
+        Extrait les métriques scalaires sans labels (cohérent avec le parseur
+        de la gateway, gateway/metrics.py::_parse_prometheus).
+        """
+        result: dict[str, float] = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "{" in line:
+                continue
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    result[parts[0]] = float(parts[1])
+                except ValueError:
+                    pass
+        return result
+
+    async def agent_metrics(self) -> dict:
+        """
+        Agrège les métriques Prometheus des llama-server READY de CE nœud en un
+        JSON compact {model_id: {clé: valeur|None}}. Ne renvoie AUCUN contenu de
+        prompt. Robuste : un llama-server injoignable est simplement omis, jamais
+        d'exception propagée.
+        """
+        async with self._lock:
+            ready = [
+                (mid, mgr)
+                for mid, mgr in self._managers.items()
+                if mgr.state == ModelState.READY
+            ]
+        result: dict = {}
+        if not ready:
+            return result
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            for model_id, mgr in ready:
+                try:
+                    resp = await client.get(
+                        mgr.llama_url("/metrics"),
+                        headers=mgr.auth_headers(),
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    raw = self._parse_prometheus(resp.text)
+                    result[model_id] = {
+                        "kv_cache_usage_ratio": raw.get("llamacpp:kv_cache_usage_ratio"),
+                        "kv_cache_tokens": raw.get("llamacpp:kv_cache_tokens"),
+                        "requests_processing": raw.get("llamacpp:requests_processing"),
+                        "requests_deferred": raw.get("llamacpp:requests_deferred"),
+                        "tokens_per_second": raw.get("llamacpp:tokens_per_second"),
+                        "prompt_tokens_total": raw.get("llamacpp:prompt_tokens_total"),
+                        "tokens_predicted_total": raw.get("llamacpp:tokens_predicted_total"),
+                    }
+                except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+                    pass
+                except Exception:
+                    log.exception("Métriques llama indisponibles pour '%s'", model_id)
+        return result
+
     def node_status(self) -> NodeStatus:
         models = [
             ModelStateOnNode(
@@ -262,6 +339,19 @@ async def lifespan(app: FastAPI):
         "Budget VRAM : %.1f GB total → %.1f GB net",
         settings.total_vram_gb, settings.effective_vram_budget_gb(),
     )
+
+    # Garde-fou supply-chain : version du binaire llama-server. NON FATAL par
+    # défaut (aucun binaire réel en test). Refuse le démarrage UNIQUEMENT si
+    # LLAMA_SERVER_MIN_BUILD > 0 et build lu < minimum (cf. GHSA-8947-pfff-2f3c).
+    ok = await enforce_llama_min_build(
+        settings.llama_server_bin, settings.llama_server_min_build
+    )
+    if not ok:
+        raise RuntimeError(
+            "llama-server ne satisfait pas LLAMA_SERVER_MIN_BUILD — "
+            "démarrage de l'agent refusé (binaire potentiellement vulnérable)."
+        )
+
     _state = _AgentState()
     yield
     log.info("Arrêt de l'agent — déchargement de tous les modèles…")
@@ -311,6 +401,20 @@ async def status(
     state: _AgentState = Depends(_get_state),
 ) -> NodeStatus:
     return state.node_status()
+
+
+@app.get("/agent/metrics")
+async def agent_metrics(
+    _: None = Depends(require_agent_secret),
+    state: _AgentState = Depends(_get_state),
+) -> dict:
+    """
+    Métriques llama-server agrégées du nœud (Prometheus → JSON compact par
+    model_id). Protégé par AGENT_SECRET, consommé par l'orchestrateur pour
+    peupler /admin/metrics/llama et /admin/metrics/prometheus en mode cluster.
+    Ne renvoie jamais de contenu de prompt.
+    """
+    return await state.agent_metrics()
 
 
 @app.post("/agent/models/load", response_model=LoadResponse)

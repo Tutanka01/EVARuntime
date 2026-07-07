@@ -110,7 +110,7 @@ Seul endpoint d'inférence. Compatible avec les clients OpenAI standard.
 | `top_k` | int | [0, 200] | Clampé si hors bornes |
 | `repeat_penalty` | float | [0.5, 2.0] | Clampé si hors bornes |
 | `seed` | int | [-1, 2147483647] | |
-| `stop` | string ou array | — | |
+| `stop` | string ou array | max 4 séquences, ≤ 64 car. chacune | Sinon 400 |
 | `tools` | array | JSON ≤ 16 KB | |
 | `tool_choice` | string ou object | — | |
 
@@ -119,6 +119,20 @@ Exemples de champs supprimés : `ignore_eos`, `cache_prompt`, `system_prompt`,
 `mirostat*`, `dry_*`, `xtc_*`, `id_slot`, `samplers`, `logit_bias`.
 
 Le champ `user` est **toujours écrasé** par l'identifiant interne de l'étudiant.
+
+**Content-Type requis :** la requête doit porter `Content-Type: application/json`.
+Tout autre type retourne **415** avant parsing du body.
+
+**Contenu texte uniquement :** le champ `content` d'un message doit être une
+chaîne, ou une liste d'items `{"type": "text", "text": "..."}`. Le multimodal
+n'est **pas** supporté : un item `image_url` (ou tout autre `type`) est rejeté en
+**400** (`Seul le contenu texte est autorisé`). Les limites de taille par message
+(≤ 8 KB) et de prompt total (≤ 32 KB) s'appliquent.
+
+**Quota et coupure de stream :** en streaming, si vous fermez la connexion avant
+le chunk `usage` final, la gateway **estime** le nombre de tokens générés (à
+partir des deltas déjà reçus) et l'impute à votre quota. Interrompre un stream ne
+rend donc pas la génération gratuite.
 
 ### Exemple — réponse non-streaming
 
@@ -217,9 +231,10 @@ Toutes les erreurs suivent le format OpenAI :
 
 | Code HTTP | `type` | Cause courante |
 |---|---|---|
-| `400` | `invalid_request_error` | JSON invalide, modèle non autorisé, messages hors limites, paramètre illégal |
+| `400` | `invalid_request_error` | JSON invalide, modèle non autorisé, messages hors limites, contenu multimodal, `stop` hors bornes, paramètre illégal |
 | `401` | `authentication_error` | Clé absente, invalide, révoquée ou expirée |
-| `413` | `invalid_request_error` | Corps > 64 KB (rejeté par nginx avant FastAPI) |
+| `413` | `invalid_request_error` | Corps > 64 KB (rejeté par nginx, ou par la gateway `MAX_BODY_BYTES`) |
+| `415` | `invalid_request_error` | `Content-Type` absent ou différent de `application/json` |
 | `429` | `rate_limit_error` | Burst, RPM, tokens/h, tokens/jour ou concurrence dépassés |
 | `503` | `server_error` | Gateway admin injoignable |
 | `504` | `server_error` | Timeout upstream (>600 s pour un stream) |

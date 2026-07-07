@@ -77,6 +77,10 @@ class ServerManager:
         self._ready_event: asyncio.Event | None = None
         self._load_error: Exception | None = None
         self._idle_task: asyncio.Task | None = None
+        # Task de chargement conservée pour pouvoir l'annuler si un unload()
+        # concurrent survient pendant LOADING (évite une coroutine fantôme qui
+        # continuerait de poller /health sur un port mort jusqu'au timeout).
+        self._load_task: asyncio.Task | None = None
 
         # Compteur de requêtes actuellement en cours sur ce modèle.
         # Incrémenté par pin() avant de proxifier, décrémenté par unpin() après.
@@ -178,7 +182,7 @@ class ServerManager:
                 self._ready_event = event
                 self._load_error = None
                 self._state = ModelState.LOADING
-                asyncio.create_task(self._load_and_signal(event))
+                self._load_task = asyncio.create_task(self._load_and_signal(event))
             else:
                 raise RuntimeError(
                     f"Le modèle '{self._model.id}' est en cours de déchargement, "
@@ -197,6 +201,18 @@ class ServerManager:
         if self._load_error:
             raise self._load_error
 
+        # Le waiter ne doit retourner « prêt » que si le modèle a RÉELLEMENT
+        # atteint READY. Un unload() concurrent pendant LOADING annule la task de
+        # chargement (CancelledError — non capturée par `except Exception`, donc
+        # pas de _load_error) tout en réveillant l'event ; le chemin d'abandon de
+        # _load_and_signal réveille aussi sans erreur. Sans cette vérification, le
+        # waiter retournerait un faux succès sur un modèle UNLOADED → 502 côté proxy.
+        if self._state != ModelState.READY:
+            raise RuntimeError(
+                f"Le modèle '{self._model.id}' n'a pas pu être chargé "
+                f"(déchargement concurrent) — réessayez."
+            )
+
         self._last_request_time = time.monotonic()
 
     # ── Chargement ────────────────────────────────────────────────────────────
@@ -206,11 +222,24 @@ class ServerManager:
         try:
             await self._start_process()
             await self._wait_for_health()
-            self._load_start_time = time.monotonic()
-            self._last_request_time = time.monotonic()
 
             async with self._state_lock:
+                # Un unload() concurrent a pu survenir pendant _wait_for_health
+                # (rien n'interdit d'unload un modèle LOADING) : il a posé
+                # UNLOADING→UNLOADED et tué le process. Ne PAS écraser cet état
+                # avec un READY fantôme (process mort, self._process=None), sinon
+                # ensure_loaded prendrait le fast-path et toutes les requêtes
+                # échoueraient en 502 sans jamais revenir à UNLOADED.
+                if self._state != ModelState.LOADING:
+                    log.info(
+                        "Chargement de '%s' abandonné (état=%s) — unload concurrent.",
+                        self._model.id, self._state.value,
+                    )
+                    await self._kill_process()  # idempotent, sécurité
+                    return  # le finally s'exécute quand même (event.set + capacity)
                 self._state = ModelState.READY
+                self._load_start_time = time.monotonic()
+                self._last_request_time = time.monotonic()
 
             log.info(
                 "llama-server prêt — modèle '%s' chargé sur port %d (PID %d)",
@@ -335,7 +364,37 @@ class ServerManager:
 
         log.info("Déchargement du modèle '%s' (%s)…", self._model.id, reason)
 
-        if self._idle_task and not self._idle_task.done():
+        # Annuler la task de chargement si un unload() survient pendant LOADING :
+        # sans ça elle continuerait de poller /health sur un port mort jusqu'au
+        # timeout complet. Jamais la tâche courante (symétrique à _idle_task).
+        if (
+            self._load_task
+            and not self._load_task.done()
+            and self._load_task is not asyncio.current_task()
+        ):
+            self._load_task.cancel()
+            try:
+                await self._load_task
+            except asyncio.CancelledError:
+                pass
+            self._load_task = None
+            # Débloquer tout waiter d'ensure_loaded : si la task de chargement est
+            # annulée avant d'avoir commencé à s'exécuter, son bloc finally
+            # (event.set) peut ne jamais tourner et les waiters resteraient bloqués
+            # jusqu'au timeout. On garantit ici le réveil (l'état UNLOADED fera que
+            # la requête repassera par ensure_loaded → rechargement).
+            if self._ready_event is not None:
+                self._ready_event.set()
+
+        # Annuler le moniteur d'inactivité, SAUF si on EST dans cette tâche
+        # (unload déclenché par _idle_monitor lui-même) : s'auto-cancel+await
+        # lèverait une erreur asyncio. Dans ce cas, on laisse la tâche courante
+        # se terminer naturellement après le return de unload().
+        if (
+            self._idle_task
+            and not self._idle_task.done()
+            and self._idle_task is not asyncio.current_task()
+        ):
             self._idle_task.cancel()
             try:
                 await self._idle_task
@@ -411,6 +470,19 @@ class ServerManager:
             if self._state != ModelState.READY:
                 break
 
+            # Détection de crash : si llama-server meurt en état READY (CUDA OOM,
+            # segfault…), sa VRAM reste comptée (state READY) et bloque le budget,
+            # forçant des évictions LRU inutiles ailleurs. On transitionne alors
+            # vers UNLOADED pour libérer le port et le budget. On NE fait PAS
+            # unload() ici : elle cancel+await self._idle_task, or on EST dans
+            # cette tâche → auto-annulation. On utilise un nettoyage dédié.
+            # Un process qui a tourné puis est mort a un returncode non nul ;
+            # on ne considère PAS _process is None comme un crash (cet état
+            # n'existe pas pour un vrai modèle READY et casserait des invariants).
+            if self._process is not None and self._process.returncode is not None:
+                await self._mark_crashed()
+                break
+
             # INVARIANT : un modèle avec des requêtes actives ne doit jamais être
             # déchargé. Un stream plus long qu'idle_timeout ne rafraîchit
             # _last_request_time qu'à son admission — sans ce garde-fou, le
@@ -428,6 +500,31 @@ class ServerManager:
                 )
                 await self.unload(reason=f"inactivité ({idle_for:.0f}s)")
                 break
+
+    async def _mark_crashed(self) -> None:
+        """
+        Nettoyage dédié au crash de llama-server détecté en état READY.
+        N'annule PAS la tâche courante (contrairement à unload()) : il est
+        appelé DEPUIS _idle_monitor (donc self._idle_task). Libère le port
+        (on_unload) et signale le changement de capacité (on_capacity_change).
+        """
+        returncode = self._process.returncode if self._process else None
+        tail = list(self._stderr_tail)
+        tail_text = "\n  ".join(tail) if tail else "(aucune sortie capturée)"
+        log.error(
+            "llama-server '%s' a crashé en état READY (code %s) — VRAM libérée, "
+            "modèle marqué UNLOADED.\nStderr (dernières %d lignes) :\n  %s",
+            self._model.id, returncode, len(tail), tail_text,
+        )
+
+        async with self._state_lock:
+            self._state = ModelState.UNLOADED
+        self._process = None
+
+        if self._on_unload:
+            self._on_unload(self._model.id)
+        if self._on_capacity_change:
+            self._on_capacity_change()
 
     # ── Statut ────────────────────────────────────────────────────────────────
 

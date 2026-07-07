@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import time
 from collections import deque
 
@@ -29,6 +30,67 @@ from model_registry import ModelDefinition, ModelRegistry
 from server_manager import ModelState, ServerManager
 
 log = logging.getLogger(__name__)
+
+
+# ── Sondes best-effort (non-fatales, sans GPU requis) ─────────────────────────
+
+async def probe_gpu_used_mb() -> float | None:
+    """
+    Interroge nvidia-smi pour la VRAM utilisée totale (Mo), best-effort.
+
+    Retourne le total des Mo utilisés sur tous les GPU, ou None si nvidia-smi est
+    absent / renvoie une erreur / dépasse le timeout. Attrape TOUT — en test (pas
+    de nvidia-smi) le résultat est None et aucun warning n'est émis.
+    """
+    timeout = settings.vram_reconcile_probe_timeout_seconds
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "nvidia-smi",
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except Exception:
+        # nvidia-smi introuvable (FileNotFoundError) ou autre — non fatal.
+        return None
+
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    try:
+        total_mb = 0.0
+        for line in stdout.decode(errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                total_mb += float(line)
+        return total_mb
+    except Exception:
+        return None
+
+
+def _port_is_occupied(port: int, host: str = "127.0.0.1", connect_timeout: float = 0.2) -> bool:
+    """
+    Détection best-effort d'un port TCP déjà occupé (stdlib, pas de psutil).
+    True si une connexion s'établit (quelqu'un écoute). Attrape TOUT → False
+    en cas d'erreur (jamais fatal, jamais bloquant longtemps).
+    """
+    try:
+        with socket.create_connection((host, port), timeout=connect_timeout):
+            return True
+    except Exception:
+        return False
 
 
 # ── Erreurs d'admission VRAM ──────────────────────────────────────────────────
@@ -75,6 +137,12 @@ class LocalModelManager:
 
         self._capacity_cond = asyncio.Condition()
         self._capacity_waiters: deque[object] = deque()
+
+        # Réconciliation VRAM (nvidia-smi) — additif dans status(). None tant
+        # qu'aucune sonde réussie n'a eu lieu (cas des tests sans GPU).
+        self._vram_reconcile_task: asyncio.Task | None = None
+        self._last_gpu_used_mb: float | None = None
+        self._last_vram_drift_mb: float | None = None
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
@@ -394,12 +462,194 @@ class LocalModelManager:
         await manager.unload(reason="admin request")
 
     async def shutdown(self) -> None:
+        # Arrêter la tâche de réconciliation VRAM en premier (best-effort).
+        await self._stop_vram_reconcile()
+
+        # Drain borné : attendre que les requêtes actives (modèles pinnés) se
+        # terminent avant de tuer leurs llama-server. RETOUR IMMÉDIAT si aucun
+        # modèle n'est pinné (cas des tests → aucun ralentissement du lifespan).
+        await self._drain_pinned(settings.shutdown_drain_timeout_seconds)
+
         model_ids = list(self._managers.keys())
         log.info("Shutdown : déchargement de %d modèle(s)…", len(model_ids))
         for model_id in model_ids:
             manager = self._managers.get(model_id)
             if manager:
                 await manager.unload(reason="shutdown")
+
+    async def _drain_pinned(self, timeout: float) -> None:
+        """
+        Attend (borné par `timeout`) que tous les modèles pinnés libèrent leurs
+        requêtes actives. Poll court. Retourne immédiatement si rien n'est pinné.
+        """
+        def pinned_ids() -> list[str]:
+            return [mid for mid, mgr in self._managers.items() if mgr.is_pinned]
+
+        pinned = pinned_ids()
+        if not pinned:
+            return  # aucune requête active — pas d'attente (cas des tests)
+
+        log.info(
+            "Shutdown : %d modèle(s) avec requêtes actives — drain (max %.0fs) : %s",
+            len(pinned), timeout, ", ".join(pinned),
+        )
+
+        poll = max(0.01, settings.shutdown_drain_poll_seconds)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            pinned = pinned_ids()
+            if not pinned:
+                log.info("Shutdown : toutes les requêtes actives drainées, déchargement.")
+                return
+            await asyncio.sleep(poll)
+
+        still_pinned = pinned_ids()
+        if still_pinned:
+            log.warning(
+                "Shutdown : timeout de drain (%.0fs) — déchargement forcé de %d modèle(s) "
+                "avec requêtes encore actives : %s",
+                timeout, len(still_pinned), ", ".join(still_pinned),
+            )
+
+    # ── Réconciliation VRAM (nvidia-smi) — best-effort, non fatal ─────────────
+
+    async def start_vram_reconcile(self) -> None:
+        """
+        Démarre la tâche périodique de réconciliation VRAM. No-op si désactivée
+        (interval=0) ou si déjà démarrée. Appelée au lifespan.
+        """
+        if settings.vram_reconcile_interval_seconds <= 0:
+            return
+        if self._vram_reconcile_task and not self._vram_reconcile_task.done():
+            return
+        self._vram_reconcile_task = asyncio.create_task(self._vram_reconcile_loop())
+
+    async def _stop_vram_reconcile(self) -> None:
+        task = self._vram_reconcile_task
+        self._vram_reconcile_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+    async def _vram_reconcile_loop(self) -> None:
+        interval = settings.vram_reconcile_interval_seconds
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._reconcile_vram_once()
+                except Exception as exc:  # non fatal — la boucle continue
+                    log.debug("Réconciliation VRAM ignorée (erreur non fatale) : %s", exc)
+        except asyncio.CancelledError:
+            raise
+
+    async def _reconcile_vram_once(self) -> None:
+        """
+        Compare la VRAM réelle (nvidia-smi) à la somme des vram_gb déclarés des
+        modèles READY. Log un warning si dérive significative. Best-effort :
+        si nvidia-smi absent → None → aucune action, aucun champ trompeur.
+        """
+        used_mb = await probe_gpu_used_mb()
+        if used_mb is None:
+            return  # pas de GPU/nvidia-smi (cas des tests) — inerte
+
+        declared_gb = self._used_vram_gb()
+        declared_mb = declared_gb * 1024.0
+        drift_mb = used_mb - declared_mb
+
+        self._last_gpu_used_mb = round(used_mb, 1)
+        self._last_vram_drift_mb = round(drift_mb, 1)
+
+        threshold = settings.vram_reconcile_drift_threshold
+        # Dérive significative : VRAM réelle dépasse le déclaré de plus de seuil %.
+        # On ignore le bruit sous 512 Mo (contexte CUDA résiduel, mesures).
+        if declared_mb > 0 and used_mb > declared_mb * (1.0 + threshold) and drift_mb > 512:
+            log.warning(
+                "Dérive VRAM détectée : nvidia-smi rapporte %.0f Mo utilisés, "
+                "mais le budget déclaré des modèles READY est %.0f Mo (+%.0f Mo, seuil +%.0f%%). "
+                "Vérifiez d'éventuels processus GPU orphelins : pgrep -af llama-server",
+                used_mb, declared_mb, drift_mb, threshold * 100,
+            )
+
+    # ── Détection des llama-server orphelins au démarrage ─────────────────────
+
+    async def detect_orphan_ports(self) -> list[int]:
+        """
+        Détection best-effort des ports du pool déjà occupés au démarrage
+        (llama-server survivants d'un crash gateway). LOG seulement par défaut.
+        Ne tue RIEN sauf si kill_orphan_llama_on_startup=True ET psutil dispo.
+        En test, les ports sont libres → retourne [] et n'agit pas.
+        """
+        occupied = [p for p in self._port_pool if _port_is_occupied(p)]
+        if not occupied:
+            return []
+
+        port_list = ", ".join(str(p) for p in occupied)
+        log.warning(
+            "Port(s) du pool déjà occupé(s) au démarrage : %s — llama-server "
+            "orphelin(s) probable(s) (crash gateway précédent tenant VRAM/ports). "
+            "Diagnostic : pgrep -af llama-server | Nettoyage manuel : "
+            "kill <pid> (ou pkill -f llama-server).",
+            port_list,
+        )
+
+        if settings.kill_orphan_llama_on_startup:
+            for port in occupied:
+                await self._try_kill_orphan_on_port(port)
+
+        return occupied
+
+    async def _try_kill_orphan_on_port(self, port: int) -> None:
+        """
+        Kill best-effort du process écoutant `port` SI c'est bien un llama-server.
+        Strictement borné : port du pool + ligne de commande contenant
+        'llama-server'. Nécessite psutil (import protégé) ; sinon skip + log.
+        Attrape TOUT — jamais fatal.
+        """
+        try:
+            import psutil  # optionnel — pas une dépendance dure
+        except Exception:
+            log.warning(
+                "kill_orphan_llama_on_startup=True mais psutil indisponible — "
+                "port %d NON nettoyé automatiquement. Installez psutil ou "
+                "nettoyez manuellement (pgrep -af llama-server).",
+                port,
+            )
+            return
+
+        try:
+            for conn in psutil.net_connections(kind="inet"):
+                if conn.laddr and conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
+                    pid = conn.pid
+                    if pid is None:
+                        continue
+                    try:
+                        proc = psutil.Process(pid)
+                        cmdline = " ".join(proc.cmdline())
+                    except Exception:
+                        continue
+                    if "llama-server" not in cmdline:
+                        log.warning(
+                            "Port %d occupé par un process NON-llama-server (PID %d) — "
+                            "kill refusé par sécurité.", port, pid,
+                        )
+                        continue
+                    log.critical(
+                        "Kill de l'orphelin llama-server PID %d sur port %d (opt-in activé).",
+                        pid, port,
+                    )
+                    try:
+                        proc.terminate()
+                    except Exception as exc:
+                        log.warning("Échec du kill de l'orphelin PID %d : %s", pid, exc)
+                    return
+        except Exception as exc:
+            log.warning("Détection/kill orphelin sur port %d échouée (non fatal) : %s", port, exc)
 
     async def start_health_monitor(self) -> None:
         """No-op en mode local — pas de heartbeat réseau nécessaire."""
@@ -430,15 +680,23 @@ class LocalModelManager:
                 }
             models_status.append(entry)
 
+        vram_budget = {
+            "total_gb": settings.total_vram_gb,
+            "overhead_gb": settings.vram_overhead_gb,
+            "safety_margin": settings.vram_safety_margin,
+            "used_gb": round(self._used_vram_gb(), 2),
+            "available_gb": round(self._available_vram_gb(), 2),
+            "budget_net_gb": round(settings.effective_vram_budget_gb(), 2),
+        }
+        # Champs additifs de réconciliation VRAM — présents uniquement si une
+        # sonde nvidia-smi a réussi (None en test / sans GPU → clés absentes,
+        # aucune régression de format).
+        if self._last_gpu_used_mb is not None:
+            vram_budget["gpu_used_mb_measured"] = self._last_gpu_used_mb
+            vram_budget["vram_drift_mb"] = self._last_vram_drift_mb
+
         return {
-            "vram_budget": {
-                "total_gb": settings.total_vram_gb,
-                "overhead_gb": settings.vram_overhead_gb,
-                "safety_margin": settings.vram_safety_margin,
-                "used_gb": round(self._used_vram_gb(), 2),
-                "available_gb": round(self._available_vram_gb(), 2),
-                "budget_net_gb": round(settings.effective_vram_budget_gb(), 2),
-            },
+            "vram_budget": vram_budget,
             "models": models_status,
             "capacity_queue": {
                 "enabled": settings.capacity_queue_enabled,
@@ -500,6 +758,7 @@ def _build_manager():
             base_url=node.base_url,
             agent_secret=settings.agent_secret,
             timeout_seconds=settings.cluster_request_timeout,
+            load_timeout_seconds=settings.cluster_load_timeout,
             verify=cluster_cfg.tls_verify,
         )
         for node in cluster_cfg.nodes

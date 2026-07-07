@@ -23,6 +23,7 @@ Structure du fichier YAML :
 """
 from __future__ import annotations
 
+import hashlib
 import re
 import tempfile
 import logging
@@ -36,6 +37,16 @@ log = logging.getLogger(__name__)
 
 # Regex stricte pour les model_id : minuscules, chiffres, tirets, points, underscores
 _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+
+# Un SHA-256 déclaré doit être exactement 64 caractères hexadécimaux.
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+# Taille de bloc pour le hachage incrémental des GGUF (1 Mo).
+_HASH_CHUNK_SIZE = 1024 * 1024
+
+
+class IntegrityError(Exception):
+    """Levée quand la vérification d'intégrité (SHA-256) d'un GGUF échoue."""
 
 # Types valides pour la quantisation du KV cache
 _CACHE_TYPES = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
@@ -136,6 +147,46 @@ class ModelDefinition:
     # Speculative decoding MTP (tête intégrée au GGUF). None = désactivé.
     # N'ajoute pas de VRAM (pas de modèle draft séparé) — vram_gb inchangé.
     speculative: SpeculativeParams | None = None
+    # Empreinte SHA-256 attendue du fichier GGUF (opt-in). None = pas de
+    # vérification d'intégrité. Sert de garde-fou supply-chain contre un GGUF
+    # substitué ou corrompu (overflows de parsing GGUF → RCE). Vérifié hors du
+    # chemin de construction de commande (I/O coûteuse).
+    sha256: str | None = None
+
+    def verify_integrity(self) -> bool:
+        """
+        Vérifie que le SHA-256 du fichier GGUF correspond à `self.sha256`.
+
+        No-op si `sha256` n'est pas déclaré (retourne True). Sinon calcule le
+        hash par blocs de 1 Mo. Lève IntegrityError si le fichier est absent ou
+        si l'empreinte ne correspond pas. Coûteux sur un gros GGUF — à n'appeler
+        qu'au chargement, jamais dans le chemin de requête.
+        """
+        if self.sha256 is None:
+            return True
+
+        try:
+            digest = hashlib.sha256()
+            with self.path.open("rb") as f:
+                for chunk in iter(lambda: f.read(_HASH_CHUNK_SIZE), b""):
+                    digest.update(chunk)
+        except FileNotFoundError as exc:
+            raise IntegrityError(
+                f"[{self.id}] Fichier GGUF introuvable pour vérification d'intégrité : {self.path}"
+            ) from exc
+        except OSError as exc:
+            raise IntegrityError(
+                f"[{self.id}] Lecture impossible pour vérification d'intégrité : {exc}"
+            ) from exc
+
+        actual = digest.hexdigest()
+        if actual.lower() != self.sha256.lower():
+            raise IntegrityError(
+                f"[{self.id}] Empreinte SHA-256 non conforme pour {self.path} : "
+                f"attendu {self.sha256.lower()}, obtenu {actual}. "
+                f"Fichier GGUF potentiellement corrompu ou substitué."
+            )
+        return True
 
     def build_llama_cmd(
         self,
@@ -151,6 +202,11 @@ class ModelDefinition:
         via la variable d'environnement LLAMA_API_KEY (cf. ServerManager).
         Les arguments de commande sont visibles via ps/procfs et dans les logs.
         """
+        # Durcissement sécurité : `--context-shift` est délibérément ABSENT.
+        # C'est le vecteur de la CVE `n_discard` (écriture hors-bornes non
+        # authentifiée, GHSA-8947-pfff-2f3c). Ne PAS l'activer. Sans lui,
+        # llama-server retourne une erreur propre au lieu de décaler le contexte
+        # quand la fenêtre est pleine.
         p = self.llama_params
         cmd = [
             str(binary),
@@ -218,6 +274,8 @@ class ModelDefinition:
             d["mmproj_path"] = str(self.mmproj_path)
         if self.load_timeout_seconds is not None:
             d["load_timeout_seconds"] = self.load_timeout_seconds
+        if self.sha256 is not None:
+            d["sha256"] = self.sha256
         if self.speculative is not None:
             s = self.speculative
             d["speculative"] = {
@@ -319,6 +377,19 @@ class ModelRegistry:
                     f"[{model_id}] load_timeout_seconds doit être ≥ 30, reçu : {load_timeout_seconds}"
                 )
 
+        # sha256 — empreinte GGUF optionnelle (opt-in supply-chain). Si présente,
+        # doit être 64 caractères hexadécimaux. Normalisée en minuscules.
+        raw_sha256 = entry.get("sha256")
+        sha256: str | None = None
+        if raw_sha256 is not None:
+            sha256 = str(raw_sha256).strip()
+            if not _SHA256_RE.match(sha256):
+                raise ValueError(
+                    f"[{model_id}] sha256 invalide : {raw_sha256!r}. "
+                    f"Attendu : 64 caractères hexadécimaux."
+                )
+            sha256 = sha256.lower()
+
         # speculative — bloc optionnel MTP. Absent = comportement inchangé.
         spec_raw = entry.get("speculative")
         speculative: SpeculativeParams | None = None
@@ -339,6 +410,7 @@ class ModelRegistry:
             mmproj_path=mmproj_path,
             load_timeout_seconds=load_timeout_seconds,
             speculative=speculative,
+            sha256=sha256,
         )
 
     def _validate_model_id(self, model_id: str) -> None:
@@ -437,6 +509,7 @@ class ModelRegistry:
             mmproj_path=model.mmproj_path,
             load_timeout_seconds=model.load_timeout_seconds,
             speculative=model.speculative,
+            sha256=model.sha256,
         )
         self._models[model_id] = updated
         self._save()
@@ -478,6 +551,7 @@ class ModelRegistry:
             mmproj_path=model.mmproj_path,
             load_timeout_seconds=model.load_timeout_seconds,
             speculative=model.speculative,
+            sha256=model.sha256,
         )
         if updated.vram_gb <= 0:
             raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")

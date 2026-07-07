@@ -111,6 +111,12 @@ MAX_LOADED_MODELS=5
 # Chemin du binaire llama-server compilé pour sm_121
 LLAMA_SERVER_BIN=/usr/local/bin/llama-server
 
+# Épinglage de version llama-server (mitigation supply-chain).
+# 0 = pas d'enforcement (défaut). Recommandé : fixer au premier build patché
+# contre GHSA-8947-pfff-2f3c (OOB write n_discard) + overflows de parsing GGUF.
+# Si > 0 et binaire plus ancien → démarrage refusé ; version illisible → warning.
+LLAMA_SERVER_MIN_BUILD=0
+
 # Répertoires autorisés pour les .gguf (laisser vide = pas de restriction)
 ALLOWED_MODEL_DIRS=/models
 

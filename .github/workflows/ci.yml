@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Chaque composant (gateway/, gateway-student/, node_agent/) utilise
+# volontairement des noms de modules top-level identiques (config, database,
+# auth, schemas) — cf. AGENTS.md. Ils ne doivent JAMAIS être installés ou
+# testés dans le même process pytest. Chaque job ci-dessous est isolé : son
+# propre environnement Python, son propre pip install, son propre process
+# ruff/pytest, limité au sous-répertoire du composant.
+jobs:
+  gateway:
+    name: gateway
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: gateway/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r gateway/requirements.txt pytest ruff
+
+      - name: Lint (ruff)
+        run: cd gateway && ruff check .
+
+      - name: Test (pytest)
+        run: cd gateway && python -m pytest tests -v
+
+  gateway-student:
+    name: gateway-student
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: gateway-student/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r gateway-student/requirements.txt pytest ruff
+
+      - name: Lint (ruff)
+        run: cd gateway-student && ruff check .
+
+      - name: Test (pytest)
+        run: cd gateway-student && python -m pytest tests -v
+
+  node_agent:
+    name: node_agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: node_agent/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r node_agent/requirements.txt pytest ruff
+
+      - name: Lint (ruff)
+        run: cd node_agent && ruff check .
+
+      - name: Test (pytest)
+        run: cd node_agent && python -m pytest tests -v
+
+  dependency-audit:
+    name: dependency-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install pip-audit
+        run: python -m pip install pip-audit
+
+      - name: Audit gateway dependencies
+        continue-on-error: true
+        run: pip-audit -r gateway/requirements.txt
+
+      - name: Audit gateway-student dependencies
+        continue-on-error: true
+        run: pip-audit -r gateway-student/requirements.txt
+
+      - name: Audit node_agent dependencies
+        continue-on-error: true
+        run: pip-audit -r node_agent/requirements.txt

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from typing import Protocol
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import ValidationError
@@ -53,6 +54,7 @@ class NodeClient(Protocol):
 
     async def health(self) -> NodeHealth: ...
     async def status(self) -> NodeStatus: ...
+    async def metrics(self) -> dict: ...
     async def load_model(self, model_dict: dict) -> LoadResponse: ...
     async def unload_model(self, model_id: str) -> UnloadResponse: ...
     async def unload_all(self) -> None: ...
@@ -79,11 +81,15 @@ class RemoteNodeClient:
         *,
         timeout_seconds: float = 10.0,
         health_timeout_seconds: float = 3.0,
+        load_timeout_seconds: float = 300.0,
         verify: bool | str = True,
     ) -> None:
         self.node_id = node_id
         self.base_url = base_url.rstrip("/")
         self._health_timeout = health_timeout_seconds
+        # Timeout dédié au chargement de modèle — bien plus long que le timeout
+        # du plan de contrôle car un gros GGUF peut prendre plusieurs minutes.
+        self._load_timeout = load_timeout_seconds
 
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -106,12 +112,71 @@ class RemoteNodeClient:
         raw = await self._get("/agent/status")
         return self._parse(NodeStatus, raw)
 
+    async def metrics(self) -> dict:
+        """
+        Métriques llama-server agrégées du nœud (JSON compact par model_id).
+        Additif : purement observabilité, hors chemin d'inférence. Le payload ne
+        contient que des compteurs/gauges — jamais de contenu de prompt.
+        """
+        raw = await self._get("/agent/metrics", timeout=self._health_timeout)
+        # Pas de schéma Pydantic strict (métriques best-effort, clés variables) :
+        # on valide juste que c'est bien un objet JSON.
+        if not isinstance(raw, dict):
+            raise NodeProtocolError(
+                f"Nœud '{self.node_id}' : /agent/metrics n'a pas renvoyé un objet JSON."
+            )
+        return raw
+
     # ── Mutations ─────────────────────────────────────────────────────────────
 
     async def load_model(self, model_dict: dict) -> LoadResponse:
         payload = LoadRequest(model=model_dict).model_dump()
-        raw = await self._post("/agent/models/load", json=payload)
-        return self._parse(LoadResponse, raw)
+        # Timeout long : le chargement d'un gros modèle dépasse largement le
+        # timeout court du plan de contrôle.
+        raw = await self._post(
+            "/agent/models/load", json=payload, timeout=self._load_timeout
+        )
+        resp = self._parse(LoadResponse, raw)
+        # Zéro confiance dans le llama_url renvoyé par l'agent (SSRF /
+        # exfiltration de prompts) : on reconstruit l'URL à partir de l'hôte
+        # RÉEL du nœud (base_url, source de confiance) + le port retourné.
+        # Ce chemin couvre aussi already_loaded=True (idempotent).
+        trusted_url = self._trusted_llama_url(resp)
+        return resp.model_copy(update={"llama_url": trusted_url})
+
+    def _trusted_llama_url(self, resp: LoadResponse) -> str:
+        """
+        Reconstruit l'URL du llama-server à partir de l'hôte de confiance du
+        nœud (self.base_url, issu de nodes.yaml) et du port retourné par l'agent.
+        Le llama-server tourne sur le même hôte physique que l'agent, sur un
+        autre port, en HTTP simple (interne, non exposé).
+        """
+        hostname = urlparse(self.base_url).hostname
+        if not hostname:
+            raise NodeProtocolError(
+                f"Nœud '{self.node_id}' : base_url sans hostname exploitable "
+                f"({self.base_url!r})"
+            )
+        if not isinstance(resp.port, int) or not (1 <= resp.port <= 65535):
+            raise NodeProtocolError(
+                f"Nœud '{self.node_id}' : port llama-server invalide "
+                f"({resp.port!r})"
+            )
+        trusted_url = f"http://{hostname}:{resp.port}"
+
+        # Signal de falsification / mauvaise config : l'agent a renvoyé un hôte
+        # différent de celui du nœud. On loggue mais on utilise TOUJOURS l'URL
+        # de confiance reconstruite.
+        reported_host = urlparse(resp.llama_url).hostname if resp.llama_url else None
+        if reported_host and reported_host != hostname:
+            log.warning(
+                "Nœud '%s' : llama_url renvoyé (hôte=%s) diffère de l'hôte du "
+                "nœud (%s) — URL de confiance utilisée à la place",
+                self.node_id,
+                reported_host,
+                hostname,
+            )
+        return trusted_url
 
     async def unload_model(self, model_id: str) -> UnloadResponse:
         # model_id est validé en amont par ModelRegistry (regex stricte).
@@ -140,9 +205,14 @@ class RemoteNodeClient:
             ) from exc
         return self._extract_json(resp, path)
 
-    async def _post(self, path: str, *, json: dict | None = None) -> dict:
+    async def _post(
+        self, path: str, *, json: dict | None = None, timeout: float | None = None
+    ) -> dict:
         try:
-            resp = await self._client.post(path, json=json)
+            kwargs: dict = {}
+            if timeout is not None:
+                kwargs["timeout"] = timeout
+            resp = await self._client.post(path, json=json, **kwargs)
         except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
             raise NodeUnreachableError(
                 f"Nœud '{self.node_id}' injoignable ({path}) : {exc.__class__.__name__}"
@@ -212,6 +282,13 @@ class LocalNodeAdapter:
 
     async def status(self) -> NodeStatus:
         return await self._backend.status()
+
+    async def metrics(self) -> dict:
+        # Best-effort : tous les backends de test n'implémentent pas metrics().
+        backend_metrics = getattr(self._backend, "metrics", None)
+        if backend_metrics is None:
+            return {}
+        return await backend_metrics()
 
     async def load_model(self, model_dict: dict) -> LoadResponse:
         return await self._backend.load_model(model_dict)

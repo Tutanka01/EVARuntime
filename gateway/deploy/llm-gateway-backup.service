@@ -1,0 +1,48 @@
+[Unit]
+Description=Sauvegarde de la base SQLite de la LLM Gateway UPPA
+Documentation=https://github.com/uppa/llm-gateway
+# Ne pas lancer si le disque n'est pas monté / réseau requis : la DB est locale.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=llmservice
+Group=llmservice
+
+# Réutilise la config de la gateway (DB_PATH, BACKUP_DIR, BACKUP_RETENTION_DAYS).
+# Le fichier peut être absent sur une install partielle → non bloquant.
+EnvironmentFile=-/etc/llm-gateway/env
+
+ExecStart=/opt/llm-gateway/deploy/llm-gateway-backup.sh
+
+# Durcissement : ce job ne touche qu'à la DB et à son répertoire de backups.
+# Pas d'accès GPU ici → durcissement maximal possible (contrairement au service
+# principal). PrivateDevices masque /dev/nvidia* sans conséquence.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Seul chemin en écriture : le répertoire de données (DB + backups).
+ReadWritePaths=/var/lib/llm-gateway
+
+# Empêcher le job de tourner indéfiniment (base multi-Go = quelques secondes).
+TimeoutStartSec=600s
+
+SyslogIdentifier=llm-gateway-backup

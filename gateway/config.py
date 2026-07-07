@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # Hôte partagé par tous les sous-processus llama-server
     llama_server_host: str = "127.0.0.1"
 
+    # ── Épinglage de version llama-server (mitigation supply-chain) ────────────
+    # Build minimal accepté du binaire llama-server. 0 = pas d'enforcement (défaut).
+    # Recommandé : fixer au premier build patché contre GHSA-8947-pfff-2f3c
+    # (écriture OOB via n_discard/context-shift) et les overflows de parsing GGUF.
+    # Si > 0 et que le binaire lu est plus ancien, le démarrage est REFUSÉ ; si la
+    # version est illisible, on se contente d'un avertissement (non fatal).
+    llama_server_min_build: int = 0
+
     # ── Pool de ports multi-modèles ────────────────────────────────────────────
     # Chaque llama-server chargé consomme un port du pool
     # Pool : base_llama_port … base_llama_port + max_loaded_models - 1
@@ -64,6 +72,27 @@ class Settings(BaseSettings):
     model_load_timeout_seconds: int = 180
     idle_check_interval_seconds: int = 30
 
+    # ── Robustesse cycle de vie (shutdown / réconciliation / orphelins) ───────
+    # Drain des requêtes actives au SIGTERM : durée max d'attente que les modèles
+    # pinnés se libèrent avant de forcer le déchargement. 0 = pas d'attente.
+    shutdown_drain_timeout_seconds: float = 25.0
+    # Intervalle de poll pendant le drain (court pour réactivité).
+    shutdown_drain_poll_seconds: float = 0.2
+
+    # Réconciliation VRAM avec nvidia-smi (détection de dérive, NON FATAL).
+    # 0 = désactivé. Intervalle entre deux sondes nvidia-smi.
+    vram_reconcile_interval_seconds: float = 60.0
+    # Timeout de la sonde nvidia-smi (court).
+    vram_reconcile_probe_timeout_seconds: float = 5.0
+    # Seuil de dérive : VRAM réelle > somme des vram_gb déclarés × (1 + seuil)
+    # → warning. 0.15 = +15%.
+    vram_reconcile_drift_threshold: float = 0.15
+
+    # Orphelins llama-server au démarrage : détection best-effort des ports du
+    # pool déjà occupés. Par défaut, on LOG seulement (aucun kill).
+    # Mettre à True pour tenter un kill best-effort (nécessite psutil).
+    kill_orphan_llama_on_startup: bool = False
+
     # ── Queue d'admission VRAM ────────────────────────────────────────────────
     # Quand un modèle ne peut pas être chargé car la VRAM/les ports sont
     # temporairement occupés par des requêtes actives, attendre au lieu de
@@ -72,6 +101,16 @@ class Settings(BaseSettings):
     capacity_queue_timeout_seconds: int = 120
     capacity_queue_max_waiters: int = 100
     capacity_queue_retry_after_seconds: int = 10
+
+    # ── Pool de connexions HTTP vers llama-server (chemin chaud d'inférence) ───
+    # Un unique httpx.AsyncClient partagé par processus proxifie toutes les
+    # requêtes vers les sous-processus llama-server locaux. Le keep-alive évite
+    # un handshake TCP par requête. Dimensionnement par défaut : marge large
+    # au-dessus de max_loaded_models pour absorber le parallélisme par modèle.
+    # 0 = illimité (déconseillé en prod).
+    httpx_max_connections: int = 200
+    httpx_max_keepalive: int = 100
+    httpx_keepalive_expiry: float = 30.0
 
     # ── Sécurité ───────────────────────────────────────────────────────────────
     # Clé interne entre la gateway et llama-server (jamais exposée aux users)
@@ -112,6 +151,11 @@ class Settings(BaseSettings):
 
     # Plan de contrôle (load/unload/health) — timeout court
     cluster_request_timeout: float = 10.0
+    # Timeout dédié au chargement de modèle — un gros GGUF prend souvent
+    # plusieurs minutes côté agent, bien au-delà du timeout court du plan de
+    # contrôle. Distinct de cluster_request_timeout pour ne pas casser le mode
+    # cluster sur les gros modèles.
+    cluster_load_timeout: float = 300.0
     # Heartbeat — intervalle entre deux GET /agent/health par nœud
     cluster_health_interval: int = 10
     # Échecs consécutifs avant de marquer un nœud offline
@@ -164,6 +208,42 @@ class Settings(BaseSettings):
     def validate_cluster_positive(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"Valeur cluster doit être ≥ 1, reçu : {v}")
+        return v
+
+    @field_validator("cluster_request_timeout", "cluster_load_timeout")
+    @classmethod
+    def validate_cluster_timeout_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError(f"Timeout cluster doit être > 0, reçu : {v}")
+        return v
+
+    @field_validator("httpx_max_connections", "httpx_max_keepalive")
+    @classmethod
+    def validate_httpx_pool_non_negative(cls, v: int) -> int:
+        # 0 = illimité (sémantique httpx.Limits : None). Négatif interdit.
+        if v < 0:
+            raise ValueError(f"Valeur httpx pool doit être ≥ 0, reçu : {v}")
+        return v
+
+    @field_validator("httpx_keepalive_expiry")
+    @classmethod
+    def validate_httpx_keepalive_expiry(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError(f"httpx_keepalive_expiry doit être ≥ 0, reçu : {v}")
+        return v
+
+    @field_validator(
+        "shutdown_drain_timeout_seconds",
+        "shutdown_drain_poll_seconds",
+        "vram_reconcile_interval_seconds",
+        "vram_reconcile_probe_timeout_seconds",
+        "vram_reconcile_drift_threshold",
+    )
+    @classmethod
+    def validate_robustness_non_negative(cls, v: float) -> float:
+        # 0 est autorisé (désactivation). Négatif interdit.
+        if v < 0:
+            raise ValueError(f"Valeur robustesse doit être ≥ 0, reçu : {v}")
         return v
 
     def effective_vram_budget_gb(self) -> float:

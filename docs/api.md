@@ -105,6 +105,37 @@ Réponse attendue :
 }
 ```
 
+`/health` est une sonde de **liveness** : elle confirme seulement que le process
+répond. Un service `ok` sans modèle chargé reste capable de servir une requête
+(le modèle chargera à la demande).
+
+### Vérifier la disponibilité — `/ready`
+
+`GET /ready` (non authentifié) est une sonde de **readiness** distincte : elle
+indique si la gateway peut effectivement **servir** au moins une requête
+d'inférence maintenant. Utile pour un load balancer ou un script qui veut éviter
+d'envoyer du trafic à une instance saturée.
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://llm.eva.univ-pau.fr/ready
+```
+
+- **`200`** — au moins un modèle est déjà chargé, **ou** il reste de la capacité
+  pour en charger un (mode local) / au moins un nœud est online (mode cluster) :
+
+  ```json
+  {"status": "ready", "models_ready": ["qwen3.5-9b-q5_k_m"], "vram_available_gb": 12.4}
+  ```
+
+- **`503`** — aucun modèle prêt **et** aucune capacité (ou tous les nœuds
+  offline). Le corps précise la raison (`no_model_ready_and_no_capacity` ou
+  `all_nodes_offline`) sans divulguer d'infrastructure :
+
+  ```json
+  {"status": "not_ready", "models_ready": [], "vram_available_gb": 0.0,
+   "reason": "no_model_ready_and_no_capacity"}
+  ```
+
 ### Lister les modèles disponibles
 
 ```bash

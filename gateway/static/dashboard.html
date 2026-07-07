@@ -391,6 +391,14 @@
       letter-spacing: .8px; color: var(--text3);
       margin-bottom: 8px;
     }
+    .status-section-badge {
+      display: none; margin-left: 6px; padding: 1px 6px;
+      font-size: 9px; font-weight: 600; letter-spacing: .3px;
+      text-transform: none; border-radius: 8px;
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text2);
+      vertical-align: middle;
+    }
+    .status-section-badge.show { display: inline-block; }
     .status-row {
       display: flex; justify-content: space-between; align-items: baseline;
       padding: 5px 0;
@@ -1266,13 +1274,13 @@
       </div>
 
       <div class="status-section">
-        <div class="status-section-label">Model</div>
+        <div class="status-section-label">Model <span id="s-models-loaded" class="status-section-badge"></span></div>
         <div class="status-row"><span class="status-key">Name</span><span class="status-val mono" id="s-model-name">—</span></div>
         <div class="status-row"><span class="status-key">State</span><span id="s-model-state" class="status-val">—</span></div>
         <div class="status-row"><span class="status-key">PID</span><span class="status-val mono" id="s-pid">—</span></div>
         <div class="status-row"><span class="status-key">Uptime</span><span class="status-val mono" id="s-uptime">—</span></div>
         <div class="status-row"><span class="status-key">Idle</span><span class="status-val mono" id="s-idle">—</span></div>
-        <div class="status-row"><span class="status-key">Idle timeout</span><span class="status-val mono" id="s-idle-timeout">—</span></div>
+        <div class="status-row"><span class="status-key">Active requests</span><span class="status-val mono" id="s-active-req">—</span></div>
       </div>
 
       <div class="status-section">
@@ -1284,15 +1292,35 @@
       </div>
 
       <div class="status-section">
-        <div class="status-section-label">Live Metrics</div>
+        <div class="status-section-label">Latency percentiles (7d)</div>
+        <div class="gauge-row">
+          <span class="gauge-label">P50</span>
+          <span class="gauge-pct" id="s-p50" style="width:auto">—</span>
+          <div class="gauge-bar"><div class="gauge-fill" id="s-p50-fill" style="width:0%"></div></div>
+        </div>
+        <div class="gauge-row">
+          <span class="gauge-label">P95</span>
+          <span class="gauge-pct" id="s-p95" style="width:auto">—</span>
+          <div class="gauge-bar"><div class="gauge-fill warn" id="s-p95-fill" style="width:0%"></div></div>
+        </div>
+        <div class="gauge-row">
+          <span class="gauge-label">P99</span>
+          <span class="gauge-pct" id="s-p99" style="width:auto">—</span>
+          <div class="gauge-bar"><div class="gauge-fill crit" id="s-p99-fill" style="width:0%"></div></div>
+        </div>
+      </div>
+
+      <div class="status-section">
+        <div class="status-section-label">Live Metrics <span id="s-live-src" class="status-section-badge"></span></div>
         <div class="gauge-row">
           <span class="gauge-label">KV cache fill</span>
           <span class="gauge-pct" id="g-kv-pct">—</span>
           <div class="gauge-bar"><div class="gauge-fill" id="g-kv-fill" style="width:0%"></div></div>
         </div>
-        <div class="status-row"><span class="status-key">Active requests</span><span class="status-val mono" id="g-req-proc">—</span></div>
-        <div class="status-row"><span class="status-key">Queued requests</span><span class="status-val mono" id="g-req-def">—</span></div>
-        <div class="status-row"><span class="status-key">Speed</span><span class="status-val mono" id="g-tps">—</span></div>
+        <div class="status-row"><span class="status-key">Inference in-flight</span><span class="status-val mono" id="g-req-proc">—</span></div>
+        <div class="status-row"><span class="status-key">Awaiting slot</span><span class="status-val mono" id="g-req-def">—</span></div>
+        <div class="status-row"><span class="status-key">Generation speed</span><span class="status-val mono" id="g-tps">—</span></div>
+        <div class="status-row"><span class="status-key">Capacity queue</span><span class="status-val mono" id="g-queue">—</span></div>
       </div>
     </div>
 
@@ -1678,15 +1706,36 @@ async function fetchLlama() {
 }
 
 // ── Renderers ──────────────────────────────────────────────────────
+// Sélectionne le modèle « principal » à mettre en avant : ready d'abord, puis
+// loading, puis activé, puis le plus gros. Renvoie null si aucun modèle.
+function pickPrimaryModel(list) {
+  if (!list || !list.length) return null;
+  const order = { ready: 0, loading: 1, unloading: 2, unloaded: 3 };
+  return [...list].sort((a, b) => {
+    const oa = order[a.state] ?? 9, ob = order[b.state] ?? 9;
+    if (oa !== ob) return oa - ob;
+    if (!!b.enabled !== !!a.enabled) return (b.enabled ? 1 : 0) - (a.enabled ? 1 : 0);
+    return (b.vram_gb || 0) - (a.vram_gb || 0);
+  })[0];
+}
+
+let _primaryModelId = null;
+
 function renderKPIs(d) {
-  const model = d.model || {};
-  const state = model.model_state || 'unloaded';
+  const st    = d.models || {};
+  const list  = st.models || [];
+  const model = pickPrimaryModel(list) || {};
+  const state = model.state || 'unloaded';
+  const readyCount = list.filter(m => m.state === 'ready').length;
+  _primaryModelId = model.id || null;
 
   const badge = document.getElementById('model-badge');
   badge.className = 'model-badge ' + state;
   badge.querySelector('.badge-dot').className = 'badge-dot' + (['loading','unloading'].includes(state) ? ' pulse' : '');
   document.getElementById('model-state-text').textContent = state.toUpperCase();
-  if (model.model_name) document.getElementById('model-name-sub').textContent = model.model_name;
+  document.getElementById('model-name-sub').textContent = model.id
+    ? model.id + (readyCount > 1 ? ' +' + (readyCount - 1) : '')
+    : 'LLM Gateway';
 
   // BUG FIX: use requests_24h (rolling window) instead of requests_today (UTC midnight)
   const reqs24h  = d.requests_24h  ?? 0;
@@ -1695,11 +1744,29 @@ function renderKPIs(d) {
   const errRate  = d.error_rate_24h ?? 0;
   const errPct   = (errRate * 100).toFixed(1) + '%';
   const errColor = errRate > 0.05 ? 'var(--red)' : errRate > 0.01 ? 'var(--amber)' : 'var(--green)';
-  const p95      = d.latency_p95_ms ? 'P95 ' + fmtMs(d.latency_p95_ms) : '';
   const dlt      = delta(d.requests_today, d.requests_yesterday);
+  const tokDlt   = delta(d.tokens_today, d.tokens_yesterday);
+
+  // Latence : P50 · P95 · P99 (données déjà calculées côté overview).
+  const latParts = [];
+  if (d.latency_p50_ms != null) latParts.push('P50 ' + fmtMs(d.latency_p50_ms));
+  if (d.latency_p95_ms != null) latParts.push('P95 ' + fmtMs(d.latency_p95_ms));
+  if (d.latency_p99_ms != null) latParts.push('P99 ' + fmtMs(d.latency_p99_ms));
+  const latSub = latParts.join(' · ') || 'rolling window';
+
+  // Split prompt/completion sur la journée courante (proxy du mix in/out).
+  const tin  = d.prompt_tokens_today ?? 0;
+  const tout = d.completion_tokens_today ?? 0;
+  const tokSub = (tin || tout)
+    ? `${fmt(tin)} in · ${fmt(tout)} out`
+    : (tokDlt ? tokDlt + ' vs yesterday' : 'rolling window');
 
   const stateColor = { ready: 'var(--green)', loading: 'var(--amber)', unloading: 'var(--amber)', unloaded: 'var(--text3)' }[state] || 'var(--text3)';
-  const uptime = model.uptime_seconds != null ? fmtDuration(model.uptime_seconds) : model.idle_seconds != null ? 'idle ' + fmtDuration(model.idle_seconds) : '—';
+  const stateSub = state === 'ready' && model.uptime_seconds != null
+    ? 'up ' + fmtDuration(model.uptime_seconds) + (readyCount > 1 ? ' · ' + readyCount + ' ready' : '')
+    : model.idle_seconds != null ? 'idle ' + fmtDuration(model.idle_seconds)
+    : list.length ? readyCount + ' / ' + list.length + ' loaded'
+    : 'no models';
 
   document.getElementById('kpi-grid').innerHTML = `
     <div class="kpi-card">
@@ -1710,7 +1777,7 @@ function renderKPIs(d) {
     <div class="kpi-card">
       <div class="kpi-label">Tokens (24h)</div>
       <div class="kpi-value">${fmt(toks24h)}</div>
-      <div class="kpi-sub">rolling window</div>
+      <div class="kpi-sub">${tokSub}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Active users (7d)</div>
@@ -1720,7 +1787,7 @@ function renderKPIs(d) {
     <div class="kpi-card">
       <div class="kpi-label">Avg latency (24h)</div>
       <div class="kpi-value">${fmtMs(d.avg_latency_24h_ms)}</div>
-      <div class="kpi-sub">${p95}</div>
+      <div class="kpi-sub">${latSub}</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Error rate (24h)</div>
@@ -1730,40 +1797,112 @@ function renderKPIs(d) {
     <div class="kpi-card">
       <div class="kpi-label">Model state</div>
       <div class="kpi-value" style="font-size:17px;letter-spacing:0;color:${stateColor}">${state.toUpperCase()}</div>
-      <div class="kpi-sub">${uptime}</div>
+      <div class="kpi-sub">${stateSub}</div>
     </div>
   `;
 }
 
 function renderSystem(d) {
-  const m = d.model || {}, lp = m.llama_params || {};
-  const sc = { ready:'green', loading:'amber', unloading:'amber', unloaded:'muted' };
-  setText('s-model-name',   m.model_name || '—');
-  setHtml('s-model-state',  `<span class="status-val ${sc[m.model_state]||'muted'}">${(m.model_state||'—').toUpperCase()}</span>`);
+  const st   = d.models || {};
+  const list = st.models || [];
+  const m    = pickPrimaryModel(list) || {};
+  const lp   = m.llama_params || {};
+  const sc   = { ready:'green', loading:'amber', unloading:'amber', unloaded:'muted' };
+
+  // Badge « N ready / M loaded » à côté du titre Model.
+  const readyCount  = list.filter(x => x.state === 'ready').length;
+  const loadedCount = list.filter(x => x.state !== 'unloaded').length;
+  const badge = document.getElementById('s-models-loaded');
+  if (badge) {
+    if (list.length) {
+      badge.textContent = readyCount + ' ready / ' + list.length + ' registered';
+      badge.classList.add('show');
+    } else {
+      badge.classList.remove('show');
+    }
+  }
+
+  setText('s-model-name',   m.id || '—');
+  setHtml('s-model-state',  `<span class="status-val ${sc[m.state]||'muted'}">${(m.state||'—').toUpperCase()}</span>`);
   setText('s-pid',          m.pid ?? '—');
   setText('s-uptime',       m.uptime_seconds != null ? fmtDuration(m.uptime_seconds) : '—');
   setText('s-idle',         m.idle_seconds != null ? fmtDuration(m.idle_seconds) : '—');
-  setText('s-idle-timeout', m.idle_timeout_seconds != null ? fmtDuration(m.idle_timeout_seconds) : '—');
+  setText('s-active-req',   m.active_requests != null ? String(m.active_requests) : '—');
   setText('s-ctx',          lp.ctx_size != null ? lp.ctx_size.toLocaleString() + ' tok' : '—');
   setText('s-parallel',     lp.parallel != null ? lp.parallel + ' slots' : '—');
   setText('s-flash',        lp.flash_attn != null ? (lp.flash_attn ? 'ON' : 'OFF') : '—');
   setText('s-cache',        (lp.cache_type_k && lp.cache_type_v) ? lp.cache_type_k + '/' + lp.cache_type_v : '—');
+
+  // Percentiles latence (barres relatives à P99).
+  renderLatencyPercentiles(d.latency_p50_ms, d.latency_p95_ms, d.latency_p99_ms);
+
+  // File d'attente capacité (VRAM/port) — indépendante de llama-server.
+  const cq = st.capacity_queue || {};
+  const qEl = document.getElementById('g-queue');
+  if (qEl) {
+    if (!cq.enabled) {
+      qEl.textContent = 'disabled';
+      qEl.className = 'status-val mono muted';
+    } else {
+      const w = cq.waiters ?? 0, mx = cq.max_waiters ?? 0;
+      qEl.textContent = w + (mx ? ' / ' + mx : '') + ' waiting';
+      qEl.className = 'status-val mono' + (w > 0 ? (mx && w >= mx ? ' red' : ' amber') : ' green');
+    }
+  }
 }
 
+function renderLatencyPercentiles(p50, p95, p99) {
+  const scale = p99 || p95 || p50 || 1;
+  const set = (id, val) => {
+    setText(id, val != null ? fmtMs(val) : '—');
+    const fill = document.getElementById(id + '-fill');
+    if (fill) fill.style.width = (val != null ? Math.min(val / scale * 100, 100) : 0) + '%';
+  };
+  set('s-p50', p50);
+  set('s-p95', p95);
+  set('s-p99', p99);
+}
+
+// /llama renvoie { model_id: { kv_cache_usage_ratio, requests_processing, … } }.
+// On agrège sur tous les modèles chargés et on met en avant le modèle principal.
 function renderLlamaMetrics(d) {
-  if (!d || !Object.keys(d).length) {
-    ['g-kv-pct','g-req-proc','g-req-def','g-tps'].forEach(id => setText(id, '—'));
-    document.getElementById('g-kv-fill').style.width = '0%';
+  const srcBadge = document.getElementById('s-live-src');
+  const entries = (d && typeof d === 'object') ? Object.entries(d).filter(([, m]) => m && typeof m === 'object') : [];
+
+  if (!entries.length) {
+    ['g-req-proc','g-req-def','g-tps'].forEach(id => setText(id, '—'));
+    setText('g-kv-pct', '—');
+    const fill = document.getElementById('g-kv-fill');
+    if (fill) { fill.style.width = '0%'; fill.className = 'gauge-fill'; }
+    if (srcBadge) srcBadge.classList.remove('show');
     return;
   }
-  const kv = d.kv_cache_usage_ratio;
+
+  let proc = 0, def = 0, tpsSum = 0, hasProc = false, hasDef = false, hasTps = false;
+  let ref = null;
+  for (const [id, m] of entries) {
+    if (m.requests_processing != null) { proc += m.requests_processing; hasProc = true; }
+    if (m.requests_deferred   != null) { def  += m.requests_deferred;   hasDef  = true; }
+    if (m.tokens_per_second   != null) { tpsSum += m.tokens_per_second;  hasTps  = true; }
+    if (id === _primaryModelId) ref = m;
+  }
+  if (!ref) ref = entries[0][1];
+
+  if (srcBadge) {
+    srcBadge.textContent = entries.length > 1 ? entries.length + ' models' : (entries[0][0] || '');
+    srcBadge.classList.add('show');
+  }
+
+  const kv = ref.kv_cache_usage_ratio;
   const fill = document.getElementById('g-kv-fill');
-  fill.style.width = kv != null ? Math.min(kv * 100, 100) + '%' : '0%';
-  fill.className = 'gauge-fill' + (kv > .9 ? ' crit' : kv > .7 ? ' warn' : '');
+  if (fill) {
+    fill.style.width = kv != null ? Math.min(kv * 100, 100) + '%' : '0%';
+    fill.className = 'gauge-fill' + (kv > .9 ? ' crit' : kv > .7 ? ' warn' : '');
+  }
   setText('g-kv-pct',   kv != null ? (kv * 100).toFixed(1) + '%' : '—');
-  setText('g-req-proc', d.requests_processing != null ? Math.round(d.requests_processing) : '—');
-  setText('g-req-def',  d.requests_deferred   != null ? Math.round(d.requests_deferred)   : '—');
-  setText('g-tps',      d.tokens_per_second   != null ? d.tokens_per_second.toFixed(1) + ' t/s' : '—');
+  setText('g-req-proc', hasProc ? Math.round(proc) : '—');
+  setText('g-req-def',  hasDef  ? Math.round(def)  : '—');
+  setText('g-tps',      hasTps  ? tpsSum.toFixed(1) + ' t/s' : '—');
 }
 
 function renderUsers(rows) {
@@ -1934,7 +2073,18 @@ function renderVramBudget(vram) {
   const fill = document.getElementById('vram-fill');
   if (fill) { fill.style.width = Math.min(pct, 100) + '%'; fill.className = 'vram-bar-fill ' + cls; }
   setText('vram-stats',  vram.used_gb.toFixed(1) + ' / ' + vram.budget_net_gb.toFixed(1) + ' GB used (' + pct.toFixed(0) + '%)');
-  setText('vram-detail', 'Total ' + vram.total_gb + ' GB — overhead ' + vram.overhead_gb + ' GB — margin ' + (vram.safety_margin * 100).toFixed(0) + '%');
+  let detail = 'Total ' + vram.total_gb + ' GB — overhead ' + vram.overhead_gb + ' GB — margin ' + (vram.safety_margin * 100).toFixed(0) + '%';
+  // Réconciliation nvidia-smi : présente uniquement si une sonde GPU a réussi.
+  if (vram.gpu_used_mb_measured != null) {
+    const measGb = (vram.gpu_used_mb_measured / 1024).toFixed(1);
+    detail += ' — measured ' + measGb + ' GB';
+    if (vram.vram_drift_mb != null) {
+      const driftGb = vram.vram_drift_mb / 1024;
+      const sign = driftGb >= 0 ? '+' : '−';
+      detail += ' (drift ' + sign + Math.abs(driftGb).toFixed(1) + ' GB)';
+    }
+  }
+  setText('vram-detail', detail);
 }
 
 const LOAD_SVG   = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
