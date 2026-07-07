@@ -1072,21 +1072,29 @@ propriétaire `llmservice`).
 
 ### Installation du timer de sauvegarde quotidienne
 
+**Automatique.** `install.sh` déploie le script + les unités et active le timer
+(si `sqlite3` est présent). `update.sh` rafraîchit ensuite ces fichiers à chaque
+mise à jour, et active le timer la première fois. Un timer que vous auriez
+volontairement désactivé (`systemctl disable`) n'est jamais réactivé
+automatiquement. Il n'y a donc normalement **rien à faire manuellement**.
+
+Vérifier / tester :
+
 ```bash
-# Copier le script et les unités (déjà présents dans le dépôt)
-sudo cp gateway/deploy/llm-gateway-backup.sh /opt/llm-gateway/deploy/
-sudo chmod 755 /opt/llm-gateway/deploy/llm-gateway-backup.sh
-sudo cp gateway/deploy/llm-gateway-backup.service /etc/systemd/system/
-sudo cp gateway/deploy/llm-gateway-backup.timer   /etc/systemd/system/
-
-# Activer le déclencheur quotidien (03h15, avec rattrapage si serveur éteint)
-sudo systemctl daemon-reload
-sudo systemctl enable --now llm-gateway-backup.timer
-
-# Vérifier
 systemctl list-timers llm-gateway-backup.timer
 sudo systemctl start llm-gateway-backup.service   # test manuel immédiat
 journalctl -u llm-gateway-backup.service --no-pager -n 20
+```
+
+Installation ou réactivation manuelle (si besoin) :
+
+```bash
+sudo cp gateway/deploy/llm-gateway-backup.sh /opt/llm-gateway/deploy/
+sudo chmod 750 /opt/llm-gateway/deploy/llm-gateway-backup.sh
+sudo cp gateway/deploy/llm-gateway-backup.service /etc/systemd/system/
+sudo cp gateway/deploy/llm-gateway-backup.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now llm-gateway-backup.timer
 ```
 
 ### Paramètres
@@ -1224,6 +1232,13 @@ sudo nginx -t && sudo nginx -s reload
 `llm-gateway` et ses `llama-server` peuvent être verbeux (`--access-log`
 uvicorn, logs d'inférence). journald n'a **pas** de quota par service ; le
 drop-in fixe donc des limites **globales** au journal système.
+
+**Automatique.** `install.sh` et `update.sh` déposent ce drop-in s'il est absent
+et redémarrent `systemd-journald`. Comme les réglages sont globaux et dépendent
+de l'espace disque local, le fichier existant n'est **jamais écrasé** : un
+ajustement manuel de `SystemMaxUse` est donc préservé lors des mises à jour.
+
+Installation ou réinitialisation manuelle (si besoin) :
 
 ```bash
 sudo mkdir -p /etc/systemd/journald.conf.d

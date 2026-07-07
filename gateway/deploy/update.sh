@@ -9,6 +9,12 @@
 #   - /var/lib/llm-gateway/gateway.db  (base de données)
 #   - /models/  (modèles GGUF)
 #
+# Il rafraîchit en revanche les artefacts d'exploitation versionnés : service
+# systemd principal, timer de sauvegarde SQLite et son script. La rotation
+# journald est installée si absente (jamais écrasée). Le timer de sauvegarde
+# n'est (ré)activé automatiquement que s'il n'a jamais été installé — un timer
+# volontairement désactivé par l'opérateur est laissé tel quel.
+#
 # Pour mettre à jour aussi nginx : ajouter --nginx en argument.
 
 set -euo pipefail
@@ -186,6 +192,57 @@ if [[ -f "$DB_PATH" ]]; then
     fi
 else
     info "Pas de base de données à sauvegarder ($DB_PATH absent)."
+fi
+
+# ── 4d. Artefacts d'exploitation (timer de sauvegarde + rotation journald) ────
+# Rafraîchis à chaque mise à jour, comme le service principal. On respecte le
+# choix de l'opérateur : le timer n'est activé automatiquement que s'il n'a jamais
+# été installé (première mise à jour depuis cette version) ; s'il a été désactivé
+# délibérément on n'y retouche pas. La conf journald (globale, souvent ajustée au
+# disque local) est créée si absente mais jamais écrasée.
+
+section "4d. Timer de sauvegarde + rotation journald"
+
+# État AVANT copie : distingue « jamais installé » de « désactivé volontairement ».
+BACKUP_TIMER_STATE="$(systemctl is-enabled llm-gateway-backup.timer 2>/dev/null || true)"
+
+mkdir -p "$INSTALL_DIR/deploy"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.sh" "$INSTALL_DIR/deploy/"
+chown -R root:"$SERVICE_USER" "$INSTALL_DIR/deploy"
+chmod 750 "$INSTALL_DIR/deploy" "$INSTALL_DIR/deploy/llm-gateway-backup.sh"
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.service" /etc/systemd/system/
+cp "$SCRIPT_DIR/deploy/llm-gateway-backup.timer"   /etc/systemd/system/
+systemctl daemon-reload
+
+case "$BACKUP_TIMER_STATE" in
+    enabled)
+        info "Timer de sauvegarde déjà actif — unités rafraîchies."
+        ;;
+    disabled|masked)
+        warn "Timer de sauvegarde présent mais désactivé (choix opérateur) — laissé tel quel."
+        warn "  Réactiver : sudo systemctl enable --now llm-gateway-backup.timer"
+        ;;
+    *)
+        # Vide/introuvable = jamais installé (première mise à jour depuis cette version).
+        if command -v sqlite3 &>/dev/null; then
+            systemctl enable llm-gateway-backup.timer
+            info "Timer de sauvegarde quotidienne activé (03:15, rétention 14 j)."
+        else
+            warn "sqlite3 introuvable — timer copié mais NON activé."
+            warn "  apt install sqlite3 && sudo systemctl enable --now llm-gateway-backup.timer"
+        fi
+        ;;
+esac
+
+# Rotation journald : créée si absente, jamais écrasée (peut être ajustée localement).
+JOURNALD_DROPIN="/etc/systemd/journald.conf.d/llm-gateway.conf"
+if [[ ! -f "$JOURNALD_DROPIN" ]]; then
+    mkdir -p /etc/systemd/journald.conf.d
+    cp "$SCRIPT_DIR/deploy/journald-llm-gateway.conf" "$JOURNALD_DROPIN"
+    systemctl restart systemd-journald
+    info "Rotation journald installée (SystemMaxUse=500M, rétention 30 j)."
+else
+    info "Rotation journald déjà présente — conservée ($JOURNALD_DROPIN)."
 fi
 
 # ── 5. Mise à jour du service systemd + redémarrage ──────────────────────────
