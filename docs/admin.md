@@ -259,6 +259,11 @@ Connexion avec l'`ADMIN_SECRET`. Le token est stocké dans `sessionStorage` et d
 - Tableau de tous les utilisateurs avec leur consommation et leur quota
 - Métriques GPU en direct par modèle : KV cache fill, slots actifs, tokens/s
 
+Dans le tableau des modèles, le bouton **Info** de la colonne Actions ouvre une
+fiche détaillée : capabilities (dont le support des images / vision), contexte
+maximum et contexte par slot, VRAM estimée, état runtime (PID, port, uptime) et
+tous les paramètres `llama.cpp` du modèle.
+
 Le dashboard se rafraîchit automatiquement toutes les **30 secondes**.
 
 ### Registre des modèles (CLI)

@@ -482,6 +482,17 @@
     .state-badge.unloading { background: var(--amber-bg); border-color: var(--amber-brd); color: var(--amber); }
     .state-dot2 { width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
     .state-dot2.pulse { animation: pulse 1.5s ease-in-out infinite; }
+    /* Model info modal */
+    .mi-section-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; color: var(--text3); margin: 16px 0 6px; }
+    .mi-section-label:first-child { margin-top: 0; }
+    .mi-caps { display: flex; flex-wrap: wrap; gap: 6px; }
+    .cap-chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 3px 9px; border-radius: 20px;
+      font-size: 10.5px; font-weight: 600; white-space: nowrap;
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text2);
+    }
+    .cap-chip.on { background: var(--green-bg); border-color: var(--green-brd); color: var(--green); }
     .toggle { position: relative; display: inline-block; width: 32px; height: 18px; cursor: pointer; flex-shrink: 0; }
     .toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
     .toggle-slider {
@@ -885,6 +896,19 @@
       <button class="btn-cancel-del" onclick="cancelDelete()">Cancel</button>
       <button class="btn-confirm-del" id="btn-confirm-del" onclick="doConfirmDelete()">Delete</button>
     </div>
+  </div>
+</div>
+
+<!-- Model Info Modal -->
+<div id="model-info-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeModelInfo()">
+  <div class="modal-card" style="max-width:520px">
+    <div class="modal-head">
+      <h3>Model details — <span id="mi-title" style="font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600"></span></h3>
+      <button class="modal-close" onclick="closeModelInfo()" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="mi-body"></div>
   </div>
 </div>
 
@@ -2090,6 +2114,10 @@ function renderVramBudget(vram) {
 const LOAD_SVG   = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
 const UNLOAD_SVG = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>`;
 const DEL_SVG    = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
+const INFO_SVG   = `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>`;
+
+// Cache des modèles indexé par id — alimenté par renderModelsTable, lu par openModelInfo.
+let _modelsById = {};
 
 function renderModelsTable(models) {
   const tbody = document.getElementById('models-tbody');
@@ -2098,7 +2126,9 @@ function renderModelsTable(models) {
     tbody.innerHTML = '<tr><td colspan="6" class="empty-state">No models registered. Click "Add Model" to get started.</td></tr>';
     return;
   }
+  _modelsById = {};
   tbody.innerHTML = models.map(m => {
+    _modelsById[m.id] = m;
     const state  = m.state || 'unloaded';
     const isBusy = state === 'loading' || state === 'unloading';
     const isReady = state === 'ready';
@@ -2132,12 +2162,89 @@ function renderModelsTable(models) {
       </td>
       <td>
         <div class="action-group">
+          <button class="btn-action" onclick="openModelInfo('${sid}')" title="View model details">${INFO_SVG} Info</button>
           ${loadBtn}
           <button class="btn-action danger" onclick="confirmDelete('${sid}')" ${isBusy?'disabled':''} title="Remove from registry">${DEL_SVG} Delete</button>
         </div>
       </td>
     </tr>`;
   }).join('');
+}
+
+// Libellés lisibles pour les capabilities déclarées dans models.yaml.
+const CAP_LABELS = {
+  text_generation: 'Text generation',
+  vision:          'Images (vision)',
+  tool_calls:      'Tool calls',
+  streaming:       'Streaming',
+  embedding:       'Embeddings',
+};
+
+function miRow(key, val) {
+  return `<div class="status-row"><span class="status-key">${esc(key)}</span><span class="status-val mono">${val}</span></div>`;
+}
+
+function openModelInfo(id) {
+  const m = _modelsById[id];
+  if (!m) { showToast('Model details unavailable.', 'error'); return; }
+  document.getElementById('mi-title').textContent = m.id;
+
+  const declared = m.capabilities || [];
+  const supportsImages = declared.includes('vision');
+  // Union des capabilities connues et déclarées, sans doublon.
+  const capKeys = Object.keys(CAP_LABELS).concat(declared.filter(c => !(c in CAP_LABELS)));
+  const seen = new Set();
+  const capChips = capKeys.filter(c => !seen.has(c) && seen.add(c)).map(c => {
+    const on = declared.includes(c);
+    return `<span class="cap-chip${on?' on':''}">${on?'✓ ':''}${esc(CAP_LABELS[c] || c)}</span>`;
+  }).join('');
+
+  const lp = m.llama_params || {};
+  const ctx = lp.ctx_size;
+  const parallel = lp.parallel;
+  const perSlot = (ctx != null && parallel) ? Math.floor(ctx / parallel) : null;
+
+  let html = '';
+  html += `<div class="mi-section-label">Overview</div>`;
+  html += `<p style="font-size:12px;color:var(--text2);margin:0 0 4px">${esc(m.description || 'No description.')}</p>`;
+
+  html += `<div class="mi-section-label">Capabilities · Images ${supportsImages ? 'supported ✓' : 'not supported'}</div>`;
+  html += `<div class="mi-caps">${capChips}</div>`;
+
+  html += `<div class="mi-section-label">Context &amp; capacity</div>`;
+  html += miRow('Max context', ctx != null ? ctx.toLocaleString() + ' tokens' : '—');
+  html += miRow('Parallel slots', parallel != null ? String(parallel) : '—');
+  html += miRow('Context per slot', perSlot != null ? perSlot.toLocaleString() + ' tokens' : '—');
+  html += miRow('Estimated VRAM', m.vram_gb != null ? m.vram_gb.toFixed(1) + ' GB' : '—');
+
+  html += `<div class="mi-section-label">Runtime</div>`;
+  html += miRow('State', (m.state || 'unloaded').toUpperCase());
+  html += miRow('Enabled', m.enabled ? 'yes' : 'no');
+  html += miRow('PID', m.pid != null ? String(m.pid) : '—');
+  html += miRow('Port', m.port != null ? String(m.port) : '—');
+  html += miRow('Uptime', m.uptime_seconds != null ? fmtDuration(m.uptime_seconds) : '—');
+  html += miRow('Idle', m.idle_seconds != null ? fmtDuration(m.idle_seconds) : '—');
+
+  html += `<div class="mi-section-label">File</div>`;
+  html += `<div class="status-row"><span class="status-key">Path</span><span class="status-val mono" style="word-break:break-all;text-align:right">${esc(m.path || '—')}</span></div>`;
+
+  if (Object.keys(lp).length) {
+    html += `<div class="mi-section-label">llama.cpp parameters</div>`;
+    const order = ['n_gpu_layers','ctx_size','parallel','batch_size','ubatch_size','cache_type_k','cache_type_v','flash_attn','threads','threads_http','cpu_moe'];
+    const keys = order.filter(k => k in lp).concat(Object.keys(lp).filter(k => !order.includes(k)));
+    for (const k of keys) {
+      let v = lp[k];
+      if (typeof v === 'boolean') v = v ? 'yes' : 'no';
+      html += miRow(k, esc(String(v)));
+    }
+  }
+
+  document.getElementById('mi-body').innerHTML = html;
+  document.getElementById('model-info-modal').classList.remove('hidden');
+}
+
+function closeModelInfo() {
+  document.getElementById('model-info-modal').classList.add('hidden');
 }
 
 async function doLoadModel(id) {
@@ -2709,6 +2816,7 @@ async function doConfirmDeleteUser() {
 // Close modals on Escape key
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
+    if (!document.getElementById('model-info-modal').classList.contains('hidden'))     { closeModelInfo(); return; }
     if (!document.getElementById('key-reveal-modal').classList.contains('hidden'))     { closeKeyReveal(); return; }
     if (!document.getElementById('keys-modal').classList.contains('hidden'))           { closeKeysModal(); return; }
     if (!document.getElementById('add-user-modal').classList.contains('hidden'))       { closeAddUser(); return; }
