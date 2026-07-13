@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# update.sh — Mise à jour du code de la gateway (sans toucher à la config ni à la DB)
+# update.sh — Mise à jour transactionnelle de la gateway
 #
 # Usage (sur le serveur GPU, depuis n'importe quel répertoire) :
 #   sudo bash /chemin/vers/repo/gateway/deploy/update.sh
 #
-# Ce script est idempotent et ne touche PAS à :
-#   - /etc/llm-gateway/env  (config + secrets)
+# Ce script est idempotent et préserve :
+#   - /etc/llm-gateway/env  (hors clés de mode explicitement demandées)
 #   - /var/lib/llm-gateway/gateway.db  (base de données)
 #   - /models/  (modèles GGUF)
 #
@@ -15,9 +15,10 @@
 # n'est (ré)activé automatiquement que s'il n'a jamais été installé — un timer
 # volontairement désactivé par l'opérateur est laissé tel quel.
 #
+# Il ne régénère jamais un secret existant et ne remplace jamais nodes.yaml.
 # Pour mettre à jour aussi nginx : ajouter --nginx en argument.
 
-set -euo pipefail
+set -Eeuo pipefail
 IFS=$'\n\t'
 
 RED='\033[0;31m'
@@ -31,52 +32,205 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 section() { echo -e "\n${CYAN}▶ $*${NC}"; }
 
-[[ $EUID -eq 0 ]] || error "Ce script doit être exécuté en root : sudo bash update.sh"
+# SCRIPT_DIR = gateway/ (un niveau au-dessus de deploy/)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=deploy-mode-lib.sh
+source "$SCRIPT_DIR/deploy/deploy-mode-lib.sh"
+
+usage() {
+    cat <<EOF
+Usage: $0 [--mode local|cluster] [--cluster] [--allow-mode-change] [--nginx] [--dry-run]
+
+Sans --mode, le mode présent dans /etc/llm-gateway/env est conservé (local si
+la clé est absente). --cluster reste un alias de --mode cluster.
+Une migration exige --allow-mode-change. --dry-run ne modifie ni le dépôt ni l'hôte.
+EOF
+}
 
 UPDATE_NGINX=false
-for arg in "$@"; do
-    [[ "$arg" == "--nginx" ]] && UPDATE_NGINX=true
+REQUESTED_MODE=""
+MODE_WAS_EXPLICIT=false
+ALLOW_MODE_CHANGE=false
+DRY_RUN=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mode)
+            [[ $# -ge 2 ]] || { echo "--mode requiert local ou cluster" >&2; usage; exit 2; }
+            deploy_validate_mode "$2" || { echo "Mode invalide : $2" >&2; usage; exit 2; }
+            [[ "$MODE_WAS_EXPLICIT" != true || "$REQUESTED_MODE" == "$2" ]] || { echo "Options de mode contradictoires" >&2; exit 2; }
+            REQUESTED_MODE="$2"; MODE_WAS_EXPLICIT=true; shift 2 ;;
+        --mode=*)
+            value="${1#*=}"
+            deploy_validate_mode "$value" || { echo "Mode invalide : $value" >&2; usage; exit 2; }
+            [[ "$MODE_WAS_EXPLICIT" != true || "$REQUESTED_MODE" == "$value" ]] || { echo "Options de mode contradictoires" >&2; exit 2; }
+            REQUESTED_MODE="$value"; MODE_WAS_EXPLICIT=true; shift ;;
+        --cluster)
+            [[ "$MODE_WAS_EXPLICIT" != true || "$REQUESTED_MODE" == "cluster" ]] || { echo "--cluster contredit --mode $REQUESTED_MODE" >&2; exit 2; }
+            REQUESTED_MODE="cluster"; MODE_WAS_EXPLICIT=true; shift ;;
+        --allow-mode-change) ALLOW_MODE_CHANGE=true; shift ;;
+        --nginx) UPDATE_NGINX=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Option inconnue : $1" >&2; usage; exit 2 ;;
+    esac
 done
 
 # Répertoires
-INSTALL_DIR="/opt/llm-gateway"
-DATA_DIR="/var/lib/llm-gateway"
+INSTALL_DIR="${LLM_GATEWAY_INSTALL_DIR:-/opt/llm-gateway}"
+DATA_DIR="${LLM_GATEWAY_DATA_DIR:-/var/lib/llm-gateway}"
+CONFIG_DIR="${LLM_GATEWAY_CONFIG_DIR:-/etc/llm-gateway}"
 DB_PATH="$DATA_DIR/gateway.db"
 BACKUP_DIR="$DATA_DIR/backups"
 SERVICE_USER="llmservice"
-# SCRIPT_DIR = gateway/  (un niveau au-dessus de deploy/)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_FILE="$CONFIG_DIR/env"
+CURRENT_MODE="$(deploy_env_value "$CONFIG_FILE" CLUSTER_MODE)"
+EFFECTIVE_MODE="$(deploy_select_mode "$CONFIG_FILE" "$REQUESTED_MODE")" || exit 1
+PREVIOUS_MODE="${CURRENT_MODE:-local}"
+
+if [[ -n "$CURRENT_MODE" && "$CURRENT_MODE" != "$EFFECTIVE_MODE" && "$ALLOW_MODE_CHANGE" != true && "$DRY_RUN" != true ]]; then
+    error "Migration $CURRENT_MODE → $EFFECTIVE_MODE non confirmée. Vérifiez avec --dry-run puis ajoutez --allow-mode-change."
+fi
+
+echo ""
+echo "EVARuntime — préflight mise à jour"
+echo "  Mode demandé : ${REQUESTED_MODE:-<auto>}"
+echo "  Mode existant  : ${CURRENT_MODE:-<absent; local par défaut>}"
+echo "  Mode effectif  : $EFFECTIVE_MODE"
+echo "  Conservation   : env, models.yaml, nodes.yaml, secrets, DB et GGUF"
+
+if [[ "$DRY_RUN" == true ]]; then
+    echo "  Action         : aucune (--dry-run; pas de git pull, pip, systemd ou écriture)"
+    if [[ -n "$CURRENT_MODE" && "$CURRENT_MODE" != "$EFFECTIVE_MODE" ]]; then
+        echo "  Migration      : $CURRENT_MODE → $EFFECTIVE_MODE; l'exécution exigera --allow-mode-change"
+    fi
+    [[ "$EFFECTIVE_MODE" == "cluster" ]] && echo "  Agents         : à mettre à jour séparément sur chaque nœud"
+    exit 0
+fi
+
+[[ $EUID -eq 0 ]] || error "Ce script doit être exécuté en root : sudo bash update.sh"
 
 [[ -d "$INSTALL_DIR" ]] || error "$INSTALL_DIR n'existe pas — lancez d'abord install.sh"
 [[ -f "$INSTALL_DIR/venv/bin/python" ]] || error "venv introuvable — lancez d'abord install.sh"
+[[ -f "$CONFIG_FILE" ]] || error "Configuration introuvable : $CONFIG_FILE"
+for required in awk chmod chown cp curl find git mkdir mktemp mv systemctl; do
+    command -v "$required" &>/dev/null || error "Préflight : commande requise introuvable : $required"
+done
+if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
+    [[ -f "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" ]] || error "Préflight : unité orchestrateur introuvable"
+else
+    command -v nvidia-smi &>/dev/null || error "Préflight local : nvidia-smi introuvable"
+    LLAMA_BIN="$(deploy_env_value "$CONFIG_FILE" LLAMA_SERVER_BIN)"
+    [[ -x "${LLAMA_BIN:-/usr/local/bin/llama-server}" ]] || error "Préflight local : llama-server non exécutable (${LLAMA_BIN:-/usr/local/bin/llama-server})"
+fi
+info "Préflight validé; mise à jour en mode $EFFECTIVE_MODE."
 
-# ── Fonction : synchronise le code Python + static du dépôt vers INSTALL_DIR ──
-# Utilisée par le flux normal ET par le rollback (après git checkout). Idempotente.
-sync_code() {
-    cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
-
-    mkdir -p "$INSTALL_DIR/cluster"
-    cp "$SCRIPT_DIR/cluster"/*.py "$INSTALL_DIR/cluster/"
-
-    rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
-
-    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
-    chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
-    chmod 640 "$INSTALL_DIR"/*.py "$INSTALL_DIR/cluster"/*.py
-    chmod 750 "$INSTALL_DIR/cluster"
-    chmod 644 "$INSTALL_DIR/requirements.txt"
-
-    if [[ -d "$SCRIPT_DIR/static" ]]; then
-        mkdir -p "$INSTALL_DIR/static"
-        cp -r "$SCRIPT_DIR/static/." "$INSTALL_DIR/static/"
-        chown -R root:"$SERVICE_USER" "$INSTALL_DIR/static"
-        find "$INSTALL_DIR/static" -type d -exec chmod 755 {} \;
-        find "$INSTALL_DIR/static" -type f -exec chmod 644 {} \;
+prepare_model_registry() {
+    local configured_models_file legacy_models_file
+    configured_models_file="$(deploy_env_value "$CONFIG_FILE" MODELS_CONFIG_PATH)"
+    legacy_models_file="$CONFIG_DIR/models.yaml"
+if [[ -z "$configured_models_file" || "$configured_models_file" == "$legacy_models_file" ]]; then
+    MODELS_FILE="$DATA_DIR/models.yaml"
+    if [[ ! -f "$MODELS_FILE" ]]; then
+        if [[ -f "$legacy_models_file" ]]; then
+            cp "$legacy_models_file" "$MODELS_FILE"
+        else
+            cp "$SCRIPT_DIR/models.yaml" "$MODELS_FILE"
+        fi
     fi
+    chown "$SERVICE_USER:$SERVICE_USER" "$MODELS_FILE"
+    chmod 640 "$MODELS_FILE"
+    deploy_set_env_value "$CONFIG_FILE" MODELS_CONFIG_PATH "$MODELS_FILE"
+    warn "Registre copié sans suppression vers $MODELS_FILE pour permettre les mutations admin atomiques."
+else
+    MODELS_FILE="$configured_models_file"
+    if [[ "$MODELS_FILE" != "$DATA_DIR/"* ]]; then
+        warn "Registre personnalisé conservé : vérifiez que llmservice peut écrire dans $(dirname "$MODELS_FILE")."
+    fi
+fi
+}
 
-    "$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
+install_gateway_service_unit() {
+    local mode="$1"
+    if [[ "$mode" == "cluster" ]]; then
+        cp "$SCRIPT_DIR/deploy/llm-gateway-cluster.service" /etc/systemd/system/llm-gateway.service
+    else
+        cp "$SCRIPT_DIR/deploy/llm-gateway.service" /etc/systemd/system/llm-gateway.service
+    fi
+}
+
+restore_previous_service_unit() {
+    local fallback_mode="$1"
+    if [[ -f "${UNIT_SNAPSHOT:-}" ]]; then
+        cp "$UNIT_SNAPSHOT" /etc/systemd/system/llm-gateway.service
+        chmod 644 /etc/systemd/system/llm-gateway.service
+    else
+        install_gateway_service_unit "$fallback_mode"
+    fi
+}
+
+restore_code_snapshot() {
+    local snapshot="$1"
+    cp "$snapshot"/*.py "$INSTALL_DIR/"
+    cp "$snapshot/requirements.txt" "$INSTALL_DIR/"
+    rm -rf "$INSTALL_DIR/cluster" "$INSTALL_DIR/static"
+    [[ ! -d "$snapshot/cluster" ]] || cp -a "$snapshot/cluster" "$INSTALL_DIR/cluster"
+    [[ ! -d "$snapshot/static" ]] || cp -a "$snapshot/static" "$INSTALL_DIR/static"
+    rm -rf "$INSTALL_DIR/__pycache__" "$INSTALL_DIR/cluster/__pycache__"
+    chown root:"$SERVICE_USER" "$INSTALL_DIR"/*.py "$INSTALL_DIR/requirements.txt"
+    [[ ! -d "$INSTALL_DIR/cluster" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/cluster"
+    [[ ! -d "$INSTALL_DIR/static" ]] || chown -R root:"$SERVICE_USER" "$INSTALL_DIR/static"
+    chmod 640 "$INSTALL_DIR"/*.py
+    chmod 644 "$INSTALL_DIR/requirements.txt"
+}
+
+VENV_SWITCHED=false
+PREVIOUS_VENV_TARGET=""
+TRANSACTION_ARMED=false
+CODE_MUTATED=false
+MODE_ACTIVATED=false
+SERVICE_RESTART_STARTED=false
+
+activate_staged_venv() {
+    if [[ -L "$INSTALL_DIR/venv" ]]; then
+        PREVIOUS_VENV_TARGET="$(readlink -f "$INSTALL_DIR/venv")"
+        rm -f "$INSTALL_DIR/venv"
+    else
+        PREVIOUS_VENV_TARGET="$INSTALL_DIR/venv-pre-update-$(date +%Y%m%d-%H%M%S)"
+        mv "$INSTALL_DIR/venv" "$PREVIOUS_VENV_TARGET"
+    fi
+    # Armer le rollback dès que l'ancien chemin a été retiré. Si la création du
+    # nouveau symlink échoue, le trap peut ainsi restaurer l'ancien venv.
+    VENV_SWITCHED=true
+    ln -s "$STAGED_VENV" "$INSTALL_DIR/venv"
+}
+
+rollback_venv() {
+    [[ "$VENV_SWITCHED" == true ]] || return 0
+    rm -f "$INSTALL_DIR/venv"
+    ln -s "$PREVIOUS_VENV_TARGET" "$INSTALL_DIR/venv"
+    VENV_SWITCHED=false
+}
+
+rollback_failed_transaction() {
+    local exit_code="$1"
+    [[ "$TRANSACTION_ARMED" == true ]] || return "$exit_code"
+
+    trap - ERR
+    set +e
+    warn "Erreur avant validation finale : rollback transactionnel automatique."
+    deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "${PREVIOUS_MODE:-local}"
+    rollback_venv
+    if [[ "$CODE_MUTATED" == true ]]; then
+        restore_code_snapshot "$CODE_SNAPSHOT"
+    fi
+    restore_previous_service_unit "${PREVIOUS_MODE:-local}"
+    systemctl daemon-reload
+    if [[ "$SERVICE_RESTART_STARTED" == true ]]; then
+        systemctl start llm-gateway
+    fi
+    warn "Code, venv, mode et unité précédents restaurés. Snapshot : $CODE_SNAPSHOT"
+    exit "$exit_code"
 }
 
 echo ""
@@ -93,7 +247,10 @@ section "1/5  Mise à jour du dépôt git"
 cd "$REPO_DIR"
 
 BEFORE=$(git rev-parse HEAD)
-git pull
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+    error "Checkout Git modifié : committez ou stash-ez les changements avant la mise à jour."
+fi
+git pull --ff-only
 AFTER=$(git rev-parse HEAD)
 
 if [[ "$BEFORE" == "$AFTER" ]]; then
@@ -104,9 +261,51 @@ else
     git log --oneline "$BEFORE".."$AFTER"
 fi
 
+# Snapshot du code réellement déployé. Le rollback ne modifie jamais le
+# checkout Git de l'opérateur et ne le laisse pas en detached HEAD.
+CODE_SNAPSHOT="$BACKUP_DIR/code-pre-update-$(date +%Y%m%d-%H%M%S)-${BEFORE:0:8}"
+mkdir -p "$CODE_SNAPSHOT"
+cp "$INSTALL_DIR"/*.py "$CODE_SNAPSHOT/"
+cp "$INSTALL_DIR/requirements.txt" "$CODE_SNAPSHOT/"
+[[ ! -d "$INSTALL_DIR/cluster" ]] || cp -a "$INSTALL_DIR/cluster" "$CODE_SNAPSHOT/cluster"
+[[ ! -d "$INSTALL_DIR/static" ]] || cp -a "$INSTALL_DIR/static" "$CODE_SNAPSHOT/static"
+UNIT_SNAPSHOT="$CODE_SNAPSHOT/llm-gateway.service"
+[[ ! -f /etc/systemd/system/llm-gateway.service ]] || cp -a /etc/systemd/system/llm-gateway.service "$UNIT_SNAPSHOT"
+chmod -R go-rwx "$CODE_SNAPSHOT"
+info "Snapshot de rollback du code : $CODE_SNAPSHOT"
+TRANSACTION_ARMED=true
+trap 'rollback_failed_transaction $?' ERR
+
+section "Préparation transactionnelle des dépendances Python"
+STAGED_VENV="$INSTALL_DIR/venv-release-${AFTER:0:12}-$(date +%Y%m%d%H%M%S)"
+"$INSTALL_DIR/venv/bin/python" -m venv "$STAGED_VENV"
+"$STAGED_VENV/bin/pip" install --upgrade pip --quiet
+"$STAGED_VENV/bin/pip" install -r "$SCRIPT_DIR/requirements.txt" --quiet
+"$STAGED_VENV/bin/pip" check
+info "Venv neuf validé : $STAGED_VENV (l'ancien reste actif jusqu'au redémarrage)."
+if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
+    deploy_apply_mode \
+        cluster "$CONFIG_FILE" "$CONFIG_DIR" \
+        "$SCRIPT_DIR/deploy/nodes.yaml.example"
+    NODES_FILE="$(deploy_env_value "$CONFIG_FILE" CLUSTER_NODES_PATH)"
+    chown root:"$SERVICE_USER" "$NODES_FILE"
+    if ! "$STAGED_VENV/bin/python" -c \
+        'import sys; from pathlib import Path; sys.path.insert(0, sys.argv[2]); from cluster.nodes_config import load_nodes_config; cfg = load_nodes_config(Path(sys.argv[1])); print(f"Topologie valide: {len(cfg.nodes)} nœud(s)")' \
+        "$NODES_FILE" "$SCRIPT_DIR"; then
+        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
+        error "Topologie cluster invalide. Le mode $PREVIOUS_MODE est conservé; corrigez $NODES_FILE puis relancez."
+    fi
+    if [[ "$PREVIOUS_MODE" != "cluster" ]]; then
+        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
+    fi
+    info "Topologie cluster validée avant toute synchronisation du code."
+fi
+prepare_model_registry
+
 # ── 2. Synchronisation du code Python ─────────────────────────────────────────
 
 section "2/5  Synchronisation du code source"
+CODE_MUTATED=true
 cp "$SCRIPT_DIR"/*.py "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
 
@@ -141,10 +340,19 @@ fi
 
 # ── 4. Mise à jour des dépendances Python ────────────────────────────────────
 
-section "4/5  Mise à jour des dépendances Python"
-"$INSTALL_DIR/venv/bin/pip" install --upgrade pip --quiet
-"$INSTALL_DIR/venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt" --quiet
-info "Dépendances à jour."
+section "4/5  Dépendances Python validées"
+info "Le venv staged a passé pip check; permutation au redémarrage."
+
+apply_selected_mode() {
+section "Activation du mode $EFFECTIVE_MODE"
+deploy_apply_mode \
+    "$EFFECTIVE_MODE" "$CONFIG_FILE" "$CONFIG_DIR" \
+    "$SCRIPT_DIR/deploy/nodes.yaml.example"
+chmod 640 "$CONFIG_FILE"
+chown root:"$SERVICE_USER" "$CONFIG_FILE"
+
+info "Mode $EFFECTIVE_MODE activé."
+}
 
 # ── 4b. Mise à jour nginx (optionnel) ────────────────────────────────────────
 
@@ -248,15 +456,19 @@ fi
 # ── 5. Mise à jour du service systemd + redémarrage ──────────────────────────
 
 section "5/5  Redémarrage du service"
-cp "$SCRIPT_DIR/deploy/llm-gateway.service" /etc/systemd/system/
+apply_selected_mode
+MODE_ACTIVATED=true
+install_gateway_service_unit "$EFFECTIVE_MODE"
 systemctl daemon-reload
 
 # Arrêt propre (laisse le temps à llama-server de se terminer)
 info "Arrêt du service (max 30s)…"
+SERVICE_RESTART_STARTED=true
 systemctl stop llm-gateway || true
+activate_staged_venv
 
 info "Démarrage du service…"
-systemctl start llm-gateway
+systemctl start llm-gateway || warn "systemctl start a échoué; la readiness déclenchera le rollback."
 
 # ── Attente du health check ───────────────────────────────────────────────────
 
@@ -265,7 +477,7 @@ HEALTHY=false
 for i in $(seq 1 20); do
     sleep 2
     echo -n "."
-    if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+    if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
         HEALTHY=true
         break
     fi
@@ -273,61 +485,68 @@ done
 echo ""
 
 if [[ "$HEALTHY" == true ]]; then
-    HEALTH=$(curl -s http://127.0.0.1:8000/health)
-    info "Service opérationnel : $HEALTH"
+    HEALTH=$(curl -s http://127.0.0.1:8000/ready)
+    info "Service prêt : $HEALTH"
 else
+    TRANSACTION_ARMED=false
+    trap - ERR
     # ── Rollback automatique ──────────────────────────────────────────────────
-    # Le service n'est pas devenu healthy après les tentatives. On revient à la
-    # version d'avant (BEFORE) SEULEMENT si le code a réellement changé. On ne
-    # restaure PAS la DB automatiquement (la sauvegarde 4c reste disponible pour
-    # une restauration manuelle si nécessaire) : le schéma peut avoir évolué et
-    # écraser la base sans arbitrage humain serait plus risqué qu'utile.
+    # Le service n'est pas devenu ready. Code, venv, unité et mode reviennent au
+    # snapshot précédent; la DB n'est jamais restaurée sans arbitrage humain.
     warn "Le service ne répond pas après $((20 * 2))s."
 
-    if [[ "$BEFORE" == "$AFTER" ]]; then
-        warn "Aucun changement de code à annuler (HEAD inchangé)."
-        warn "Diagnostiquez : sudo journalctl -u llm-gateway -f --since now"
-    else
-        section "ROLLBACK  Retour à la version précédente (${BEFORE:0:8})"
-        if git -C "$REPO_DIR" checkout --quiet "$BEFORE"; then
-            info "Dépôt ramené à ${BEFORE:0:8}. Re-déploiement du code précédent…"
-            sync_code
-            cp "$SCRIPT_DIR/deploy/llm-gateway.service" /etc/systemd/system/
-            systemctl daemon-reload
-            systemctl stop llm-gateway || true
-            systemctl start llm-gateway
-
-            echo -n "  Attente du démarrage (rollback)"
-            ROLLBACK_OK=false
-            for i in $(seq 1 20); do
-                sleep 2
-                echo -n "."
-                if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
-                    ROLLBACK_OK=true
-                    break
-                fi
-            done
-            echo ""
-
-            if [[ "$ROLLBACK_OK" == true ]]; then
-                warn "Rollback réussi : le service est reparti sur ${BEFORE:0:8}."
-                warn "La mise à jour vers ${AFTER:0:8} a ÉCHOUÉ — investiguez avant de réessayer."
-                warn "Note : le dépôt est en 'detached HEAD' sur ${BEFORE:0:8}."
-                warn "  Pour repartir de la branche : git -C \"$REPO_DIR\" checkout main"
-                [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update disponible : $BACKUP_FILE"
-            else
-                error "Rollback ÉCHOUÉ : le service ne démarre ni en neuf ni en ancien. Intervention manuelle requise. Logs : sudo journalctl -u llm-gateway -n 100 --no-pager"
+    if [[ "$PREVIOUS_MODE" != "$EFFECTIVE_MODE" ]]; then
+        section "ROLLBACK  Mode $EFFECTIVE_MODE → $PREVIOUS_MODE"
+        deploy_set_env_value "$CONFIG_FILE" CLUSTER_MODE "$PREVIOUS_MODE"
+        rollback_venv
+        restore_code_snapshot "$CODE_SNAPSHOT"
+        restore_previous_service_unit "$PREVIOUS_MODE"
+        systemctl daemon-reload
+        systemctl stop llm-gateway || true
+        systemctl start llm-gateway || true
+        for i in $(seq 1 20); do
+            sleep 2
+            if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+                error "Migration de mode échouée; le mode $PREVIOUS_MODE a été restauré et le service est sain."
             fi
-        else
-            error "git checkout $BEFORE a échoué (dépôt sale ?). Rollback manuel requis. Logs : sudo journalctl -u llm-gateway -f"
+        done
+        error "Migration de mode et rollback ont échoué. Intervention requise : journalctl -u llm-gateway -n 100"
+    fi
+
+    section "ROLLBACK  Restauration du snapshot déployé"
+    rollback_venv
+    restore_code_snapshot "$CODE_SNAPSHOT"
+    restore_previous_service_unit "$EFFECTIVE_MODE"
+    systemctl daemon-reload
+    systemctl stop llm-gateway || true
+    systemctl start llm-gateway || true
+
+    ROLLBACK_OK=false
+    for i in $(seq 1 20); do
+        sleep 2
+        if curl -sf http://127.0.0.1:8000/ready > /dev/null 2>&1; then
+            ROLLBACK_OK=true
+            break
         fi
+    done
+
+    if [[ "$ROLLBACK_OK" == true ]]; then
+        warn "Rollback réussi depuis $CODE_SNAPSHOT; le checkout Git est resté intact."
+        warn "La version ${AFTER:0:8} n'est pas déployée; investiguez avant de réessayer."
+        [[ -n "$BACKUP_FILE" ]] && warn "Sauvegarde DB pré-update : $BACKUP_FILE"
+        exit 1
+    else
+        error "Rollback ÉCHOUÉ. Intervention requise : sudo journalctl -u llm-gateway -n 100 --no-pager"
     fi
 fi
 
+TRANSACTION_ARMED=false
+trap - ERR
+
 # ── Vérification des secrets ──────────────────────────────────────────────────
 # Les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou CHANGE_ME_*.
-if grep -qE '^(ADMIN_SECRET|INTERNAL_API_KEY|AGENT_SECRET)=(CHANGE_ME|[[:space:]]*$)' /etc/llm-gateway/env 2>/dev/null; then
-    warn "Des secrets non configurés (CHANGE_ME_* ou vides) subsistent dans /etc/llm-gateway/env."
+if grep -qE '^(ADMIN_SECRET|INTERNAL_API_KEY|AGENT_SECRET)=(CHANGE_ME|[[:space:]]*$)' "$CONFIG_FILE" 2>/dev/null; then
+    warn "Des secrets non configurés (CHANGE_ME_* ou vides) subsistent dans $CONFIG_FILE."
     warn "Les routes /admin restent DÉSACTIVÉES (503) tant qu'ADMIN_SECRET n'est pas défini."
     warn "Générer : python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
 fi
@@ -340,9 +559,16 @@ echo -e "${GREEN}  Mise à jour terminée  ($(date '+%Y-%m-%d %H:%M:%S'))${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════════════${NC}"
 echo ""
 echo "  Version déployée : $(git -C "$REPO_DIR" log -1 --format='%h  %s  (%cr)')"
+echo "  Mode déployé    : $EFFECTIVE_MODE"
 echo ""
 echo "  Commandes utiles :"
 echo "    sudo journalctl -u llm-gateway -f          # logs en temps réel"
 echo "    sudo systemctl status llm-gateway          # état du service"
 echo "    curl http://127.0.0.1:8000/health          # santé de l'API"
+echo "    curl http://127.0.0.1:8000/ready           # gate de readiness production"
+if [[ "$EFFECTIVE_MODE" == "cluster" ]]; then
+    echo ""
+    echo "  IMPORTANT : update.sh ne met pas les nœuds à jour à distance."
+    echo "  Exécutez node_agent/deploy/update-agent.sh sur chaque agent."
+fi
 echo ""

@@ -13,8 +13,8 @@ Exceptions :
   - NodeUnreachableError : le nœud ne répond pas (timeout, DNS, conn refused).
     Le ClusterManager le mettra `offline` au prochain heartbeat.
   - NodeProtocolError   : le nœud répond mais l'échange est invalide
-    (4xx/5xx, JSON malformé, schéma non conforme). Le nœud reste `online`,
-    on remonte l'erreur au caller.
+    (4xx/5xx, JSON malformé, schéma non conforme). Les heartbeats appliquent
+    le même seuil offline que pour une panne réseau.
 """
 from __future__ import annotations
 
@@ -162,13 +162,24 @@ class RemoteNodeClient:
                 f"Nœud '{self.node_id}' : port llama-server invalide "
                 f"({resp.port!r})"
             )
-        trusted_url = f"http://{hostname}:{resp.port}"
+        # urlparse().hostname retire les crochets IPv6. Ils sont obligatoires
+        # quand on reconstruit une URL avec un port.
+        url_host = f"[{hostname}]" if ":" in hostname else hostname
+        trusted_url = f"http://{url_host}:{resp.port}"
 
         # Signal de falsification / mauvaise config : l'agent a renvoyé un hôte
         # différent de celui du nœud. On loggue mais on utilise TOUJOURS l'URL
         # de confiance reconstruite.
         reported_host = urlparse(resp.llama_url).hostname if resp.llama_url else None
-        if reported_host and reported_host != hostname:
+        # 0.0.0.0 / :: sont les binds attendus d'un llama-server exposé sur
+        # les interfaces du nœud ; ce ne sont ni des destinations routables ni
+        # un signal de falsification. L'URL utilisée reste toujours reconstruite.
+        wildcard_hosts = {"0.0.0.0", "::"}
+        if (
+            reported_host
+            and reported_host not in wildcard_hosts
+            and reported_host != hostname
+        ):
             log.warning(
                 "Nœud '%s' : llama_url renvoyé (hôte=%s) diffère de l'hôte du "
                 "nœud (%s) — URL de confiance utilisée à la place",
@@ -199,7 +210,7 @@ class RemoteNodeClient:
             if timeout is not None:
                 kwargs["timeout"] = timeout
             resp = await self._client.get(path, **kwargs)
-        except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+        except httpx.RequestError as exc:
             raise NodeUnreachableError(
                 f"Nœud '{self.node_id}' injoignable ({path}) : {exc.__class__.__name__}"
             ) from exc
@@ -213,7 +224,7 @@ class RemoteNodeClient:
             if timeout is not None:
                 kwargs["timeout"] = timeout
             resp = await self._client.post(path, json=json, **kwargs)
-        except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+        except httpx.RequestError as exc:
             raise NodeUnreachableError(
                 f"Nœud '{self.node_id}' injoignable ({path}) : {exc.__class__.__name__}"
             ) from exc

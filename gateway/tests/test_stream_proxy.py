@@ -43,6 +43,7 @@ class FakeManager:
         self.model = FakeModel(mid)
         self.pin_calls = 0
         self.unpin_calls = 0
+        self.backend_failure_calls = 0
 
     def pin(self) -> None:
         self.pin_calls += 1
@@ -55,6 +56,9 @@ class FakeManager:
 
     def auth_headers(self) -> dict[str, str]:
         return {"Authorization": "Bearer test-internal"}
+
+    async def report_backend_failure(self) -> None:
+        self.backend_failure_calls += 1
 
 
 USER = {"user_id": "u1", "key_id": "k1"}
@@ -153,6 +157,24 @@ async def test_stream_upstream_error_yields_sse_error_and_unpins(restore_http_cl
     assert "data: [DONE]" in text, "le stream d'erreur doit se terminer par [DONE]"
     assert manager.pin_calls == 1
     assert manager.unpin_calls == 1, "unpin doit être appelé malgré l'exception upstream"
+    assert manager.backend_failure_calls == 1
+
+
+@pytest.mark.anyio
+async def test_non_stream_upstream_error_reports_backend_failure(restore_http_client):
+    """Le chemin non-stream invalide lui aussi immédiatement le placement cluster."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connexion refusée", request=request)
+
+    _inject_client(httpx.MockTransport(handler))
+    manager = FakeManager()
+
+    response = await proxy._non_stream_proxy(
+        "/v1/chat/completions", {}, USER, "req-2b", 0.0, manager
+    )
+
+    assert response.status_code == 502
+    assert manager.backend_failure_calls == 1
 
 
 # ── 3. Chunk JSON malformé ignoré, flux non interrompu ────────────────────────

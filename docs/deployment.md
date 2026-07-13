@@ -1,8 +1,9 @@
-# Guide de déploiement — Cluster EVA Inference Gateway
+# Guide de déploiement — EVARuntime local et multi-nœuds
 
-Ce document décrit l'installation complète du gateway sur le serveur hébergeant
-le GPU NVIDIA L40S 48GB. Il s'adresse à l'administrateur système responsable
-de la mise en production.
+Ce document couvre deux parcours distincts : le produit **local mono-nœud**,
+sûr et choisi par défaut, et l'**orchestrateur cluster**, explicitement opt-in.
+Le premier lance `llama-server` sur l'hôte gateway; le second ne requiert aucun
+GPU local et pilote des node-agents installés séparément.
 
 ---
 
@@ -37,15 +38,16 @@ de la mise en production.
 |-----------|-----------------|-------|
 | Ubuntu | 22.04 LTS | 24.04 aussi supporté |
 | Python | 3.11+ | `python3 --version` |
-| CUDA toolkit | 12.x | Pour llama.cpp GPU |
-| Pilotes NVIDIA | 535+ | `nvidia-smi` doit fonctionner |
+| CUDA toolkit | 12.x | Mode local et chaque node-agent; inutile sur l'orchestrateur cluster |
+| Pilotes NVIDIA | 535+ | `nvidia-smi` sur les hôtes d'inférence, pas sur l'orchestrateur |
 | nginx | 1.18+ | `apt install nginx` |
-| Espace disque | 100 GB+ | Modèle 70B Q4_K_M ≈ 42 GB, 8B Q4_K_M ≈ 5 GB |
+| Espace disque | 100 GB+ sur nœud GPU | L'orchestrateur ne stocke que code, DB et registre |
 
 ### Vérifications initiales
 
 ```bash
-# Vérifier que le GPU est reconnu
+# Sur le serveur local ou CHAQUE node-agent (pas sur l'orchestrateur cluster)
+# vérifier que le GPU est reconnu
 nvidia-smi
 
 # Résultat attendu :
@@ -109,6 +111,10 @@ llama-server --version
 Le gateway supporte plusieurs modèles simultanément. Chaque modèle est un fichier
 `.gguf` indépendant. Télécharger ceux que vous souhaitez proposer, puis les déclarer
 dans le [registre des modèles](#6-registre-des-modèles-modelsyaml).
+
+En mode local, exécuter ces commandes sur le gateway. En mode cluster, les
+exécuter sur chaque nœud GPU éligible (ou monter un stockage partagé) et conserver
+strictement les mêmes chemins absolus; l'orchestrateur ne télécharge aucun GGUF.
 
 ```bash
 # Installer huggingface-cli
@@ -185,13 +191,32 @@ Le `mmproj_path` est déclaré dans `models.yaml` — voir section 6 pour la str
 
 ## 4. Installation du gateway
 
+### Choisir le parcours
+
+| Mode | Quand l'utiliser | Hôte gateway | Nœuds GPU |
+|------|-------------------|--------------|-----------|
+| `local` | un serveur GPU autonome | gateway + nginx + SQLite + `llama-server` | aucun agent |
+| `cluster` | plusieurs serveurs GPU | orchestrateur + nginx + SQLite, sans accès GPU | un `node_agent` par serveur |
+
+Le mode local est le seul défaut implicite d'une installation neuve. En
+production, toujours écrire le mode dans la commande et commencer par le plan
+non destructif :
+
 ```bash
 # Cloner le projet
-git clone <url-depot-interne> /tmp/llm-gateway-src
+git clone https://github.com/Tutanka01/EVARuntime.git /tmp/llm-gateway-src
 
-# Lancer le script d'installation (en root)
-sudo bash /tmp/llm-gateway-src/gateway/deploy/install.sh
+# Parcours A — mono-nœud
+bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode local --dry-run
+sudo bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode local
+
+# Parcours B — orchestrateur multi-nœuds
+bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode cluster --dry-run
+sudo bash /tmp/llm-gateway-src/gateway/deploy/install.sh --mode cluster
 ```
+
+`--cluster` reste accepté comme alias de compatibilité. `--dry-run` ne requiert
+pas root et n'exécute ni écriture, ni `pip`, ni `git`, ni `systemctl`.
 
 Le script effectue automatiquement :
 
@@ -201,7 +226,8 @@ Le script effectue automatiquement :
 4. Copie du code source et création du virtualenv Python
 5. Installation des dépendances Python
 6. **Génération automatique des secrets** (`INTERNAL_API_KEY`, `ADMIN_SECRET`) dans `/etc/llm-gateway/env`
-7. Copie du fichier `models.yaml` initial dans `/etc/llm-gateway/models.yaml`
+7. Copie du registre dans `/var/lib/llm-gateway/models.yaml` (writable par le
+   service pour les mutations admin atomiques; les secrets restent sous `/etc`)
 8. Enregistrement du service systemd et activation
 9. Initialisation de la base de données SQLite
 
@@ -209,6 +235,12 @@ Le script effectue automatiquement :
 
 > **Important :** Noter l'`ADMIN_SECRET` affiché à la fin du script.
 > Il ne sera plus visible ensuite (stocké dans `/etc/llm-gateway/env`).
+
+L'installateur conserve tout fichier `env`, `models.yaml` ou `nodes.yaml`
+existant. Il déduplique uniquement les clés de mode qu'il gère et ne régénère
+jamais un secret déjà configuré. Une ancienne installation dont le registre
+est sous `/etc/llm-gateway/models.yaml` est copiée sans suppression vers
+`/var/lib/llm-gateway/models.yaml`; le reste de `env` demeure inchangé.
 
 ---
 
@@ -228,7 +260,7 @@ sudo nano /etc/llm-gateway/env
 ```bash
 # ── Registre des modèles ──────────────────────────────────────────────────────
 # Chemin vers le fichier YAML listant tous les modèles disponibles
-MODELS_CONFIG_PATH=/etc/llm-gateway/models.yaml
+MODELS_CONFIG_PATH=/var/lib/llm-gateway/models.yaml
 
 # ── Budget VRAM (L40S 48 GB) ──────────────────────────────────────────────────
 # Ajuster si vous utilisez un GPU différent
@@ -284,10 +316,10 @@ ADMIN_SECRET=<généré>
 ## 6. Registre des modèles (models.yaml)
 
 Le fichier `models.yaml` est la **source de vérité** pour tous les modèles disponibles.
-Il est installé dans `/etc/llm-gateway/models.yaml`.
+Il est installé dans `/var/lib/llm-gateway/models.yaml`.
 
 ```bash
-sudo nano /etc/llm-gateway/models.yaml
+sudoedit /var/lib/llm-gateway/models.yaml
 ```
 
 ### Structure
@@ -401,7 +433,7 @@ Comportement :
 ls -lh /models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
 
 # 2. Éditer le registre
-sudo nano /etc/llm-gateway/models.yaml
+sudoedit /var/lib/llm-gateway/models.yaml
 # → passer enabled: false à enabled: true pour le modèle voulu
 
 # 3. Redémarrer le gateway pour recharger le registre
@@ -416,7 +448,7 @@ huggingface-cli download bartowski/Qwen2.5-32B-Instruct-GGUF \
   --include "*Q4_K_M*" --local-dir /models/
 
 # 2. Ajouter une entrée dans models.yaml (respecter la structure ci-dessus)
-sudo nano /etc/llm-gateway/models.yaml
+sudoedit /var/lib/llm-gateway/models.yaml
 
 # 3. Redémarrer
 sudo systemctl restart llm-gateway
@@ -688,24 +720,36 @@ curl -s "$GW/admin/metrics/llama" \
 ### Mettre à jour le code de la gateway
 
 ```bash
-# Sur le serveur GPU, dans le répertoire du dépôt cloné
+# Conserve automatiquement le mode installé
+bash gateway/deploy/update.sh --dry-run
 sudo bash gateway/deploy/update.sh
+
+# Équivalents explicites
+sudo bash gateway/deploy/update.sh --mode local
+sudo bash gateway/deploy/update.sh --mode cluster
 ```
+
+En cluster, cette commande met à jour **l'orchestrateur uniquement**. Exécuter
+ensuite `node_agent/deploy/update-agent.sh` sur chaque nœud GPU; aucun code n'est
+poussé à distance par l'orchestrateur.
 
 Ce que fait le script :
 
-1. `git pull` dans le dépôt (capture le commit `BEFORE` pour un éventuel rollback)
+1. Refuse un checkout sale puis exécute `git pull --ff-only`
 2. Synchronise les fichiers Python et `requirements.txt` vers `/opt/llm-gateway/`
 3. Synchronise le répertoire `static/` (dashboard HTML…)
-4. Met à jour les dépendances pip si `requirements.txt` a changé
+4. Construit un **nouveau venv**, installe les dépendances et exige `pip check`;
+   l'ancien venv reste intact jusqu'au redémarrage
 5. **Sauvegarde la base SQLite** avant redémarrage (voir ci-dessous)
-6. Copie le fichier systemd et recharge `daemon-reload`
-7. Redémarre le service proprement et attend le health check
-8. **Rollback automatique** si le service ne redevient pas healthy (voir ci-dessous)
+6. Choisit l'unité systemd GPU (`local`) ou sans GPU (`cluster`)
+7. Redémarre le service et exige la readiness `/ready`, pas seulement `/health`
+8. **Rollback automatique** du code déployé, du venv, du mode et de l'unité
 
-> **Note :** Le script ne touche jamais à `/etc/llm-gateway/env` (secrets),
-> à `/etc/llm-gateway/models.yaml` (registre), ni aux modèles GGUF. La base de
-> données n'est jamais écrasée automatiquement — elle est seulement **sauvegardée**.
+> **Conservation :** les secrets, `nodes.yaml`, le contenu du registre, la DB et
+> les GGUF ne sont jamais remplacés. Le script ne modifie dans `env` que les clés
+> nécessaires au mode explicitement confirmé. Il peut copier l'ancien registre
+> `/etc/llm-gateway/models.yaml` vers `/var/lib/llm-gateway/models.yaml` pour
+> corriger les permissions d'écriture atomique; l'original reste en place.
 
 #### Sauvegarde automatique avant mise à jour
 
@@ -721,21 +765,13 @@ absent, l'étape est ignorée avec un avertissement (la mise à jour continue).
 
 #### Rollback automatique
 
-Si, après les tentatives de health check, le service ne répond toujours pas sur
-`http://127.0.0.1:8000/health` :
-
-- si le code n'a **pas** changé (`BEFORE == AFTER`), le script se contente
-  d'inviter à consulter les logs ;
-- sinon, il exécute un **rollback** : `git checkout <BEFORE>`, re-synchronise le
-  code précédent, réinstalle les dépendances, recopie l'unité systemd et redémarre.
-  Il attend de nouveau le health check.
-
-Après un rollback réussi, le dépôt est en **detached HEAD** sur la version
-précédente. Pour repartir de la branche :
-
-```bash
-git -C <repo> checkout main
-```
+Avant toute synchronisation, le script copie le code réellement déployé dans
+`/var/lib/llm-gateway/backups/code-pre-update-*`. Si `/ready` ne devient pas
+200, il restaure ce snapshot et l'ancien venv. Une migration restaure aussi
+`CLUSTER_MODE` et l'unité systemd précédents. Le checkout Git n'est jamais
+modifié par le rollback et ne finit donc pas en `detached HEAD`. Un rollback
+réussi fait quand même sortir `update.sh` en erreur afin que l'automatisation
+ne confonde pas restauration et déploiement réussi.
 
 Le rollback **ne restaure pas** la base de données automatiquement : le schéma
 peut avoir évolué et écraser la base sans arbitrage humain serait plus risqué
@@ -791,7 +827,7 @@ huggingface-cli download bartowski/Qwen2.5-32B-Instruct-GGUF \
   --include "*Q4_K_M*" --local-dir /models/
 
 # 2. Ajouter l'entrée dans le registre
-sudo nano /etc/llm-gateway/models.yaml
+sudoedit /var/lib/llm-gateway/models.yaml
 
 # 3. Redémarrer
 sudo systemctl restart llm-gateway
@@ -954,15 +990,24 @@ Deux flux séparés :
 - Ports ouverts sur chaque nœud :
   - `9443` (TCP) — agent, accessible uniquement depuis l'orchestrateur
   - `8081-8085` (TCP) — llama-server, accessible uniquement depuis l'orchestrateur
-- Recommandé : règle firewall `ufw allow from <IP_orchestrateur> to any port 9443`
+- L'orchestrateur expose seulement `443` publiquement via nginx; son port
+  FastAPI `8000` reste sur `127.0.0.1`.
+- Autoriser **les deux flux** depuis l'IP orchestrateur et rien d'autre :
+
+```bash
+sudo ufw allow from <IP_orchestrateur> to any port 9443 proto tcp
+sudo ufw allow from <IP_orchestrateur> to any port 8081:8085 proto tcp
+```
 
 ### Installation — orchestrateur
 
 ```bash
 # Sur la machine orchestrateur :
-sudo bash gateway/deploy/install.sh --cluster
-# → génère AGENT_SECRET, crée /etc/llm-gateway/nodes.yaml depuis l'exemple
-# → active CLUSTER_MODE=cluster dans /etc/llm-gateway/env
+bash gateway/deploy/install.sh --mode cluster --dry-run
+sudo bash gateway/deploy/install.sh --mode cluster
+# → unité systemd orchestrateur sans GPU ni /models local
+# → crée AGENT_SECRET une seule fois s'il est absent
+# → crée nodes.yaml uniquement s'il est absent
 
 # Éditer la topologie des nœuds
 sudo nano /etc/llm-gateway/nodes.yaml
@@ -973,20 +1018,39 @@ sudo nano /etc/llm-gateway/nodes.yaml
 Voir [build-llama-cpp-dgx-spark.md](build-llama-cpp-dgx-spark.md) pour compiler llama-server.
 
 ```bash
+# Depuis l'orchestrateur, transférer le secret via stdin (jamais en argv/log) :
+sudo awk -F= '$1 == "AGENT_SECRET" {sub(/^[^=]*=/, ""); print; exit}' \
+  /etc/llm-gateway/env | \
+  ssh root@dgx-spark-a 'umask 077; cat > /root/evaruntime-agent-secret'
+
 # Sur chaque DGX Spark (répéter pour dgx-spark-a et dgx-spark-b) :
-git clone <repo> /opt/llm-gateway-src
+git clone https://github.com/Tutanka01/EVARuntime.git /opt/llm-gateway-src
 cd /opt/llm-gateway-src
 
-sudo bash node_agent/deploy/install-agent.sh --node-id dgx-spark-a --port 9443
+sudo bash node_agent/deploy/install-agent.sh \
+  --node-id dgx-spark-a \
+  --agent-secret-file /root/evaruntime-agent-secret \
+  --orchestrator-cidr <IP_orchestrateur>/32
 # → crée /etc/llm-gateway-agent/env, génère le certificat TLS, installe le service
 
-# Définir AGENT_SECRET (MÊME valeur que l'orchestrateur)
-sudo nano /etc/llm-gateway-agent/env
-# → AGENT_SECRET=<valeur générée par install.sh --cluster sur l'orchestrateur>
+sudo rm /root/evaruntime-agent-secret  # après validation de l'installation
 
 sudo systemctl start llm-gateway-agent
 sudo journalctl -fu llm-gateway-agent
 ```
+
+Le plan de données doit être joignable depuis l'orchestrateur : chaque agent
+doit lancer `llama-server` sur son adresse réseau interne (pas `127.0.0.1`) et
+le firewall doit limiter `8081-8085` à l'IP orchestrateur.
+
+### Registre et fichiers de modèles partagés
+
+Le registre `/var/lib/llm-gateway/models.yaml` vit sur l'orchestrateur, mais les
+GGUF ne sont pas transférés par EVARuntime. Pour tout modèle susceptible d'être
+placé sur plusieurs nœuds, copier le GGUF, son `mmproj` éventuel et les mêmes
+permissions **au même chemin absolu sur chacun de ces nœuds**. Un stockage
+partagé monté au même chemin convient aussi, après validation de son débit et de
+son comportement en panne. Valider le SHA-256 avant d'activer le modèle.
 
 > **Fail-closed :** un `AGENT_SECRET` vide ou laissé à sa valeur d'exemple
 > (`CHANGE_ME_*`) fait refuser toutes les requêtes par l'agent (503), et la
@@ -1043,15 +1107,68 @@ curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
   manuel via `POST /admin/models/{id}/load` ou à la prochaine requête utilisateur.
 - **Tous les nœuds offline** : les requêtes d'inférence reçoivent une 503 explicite.
 
+### Mise à jour orchestrateur et agents
+
+```bash
+# 1. Orchestrateur uniquement
+sudo bash gateway/deploy/update.sh --mode cluster
+
+# 2. Sur CHAQUE nœud, séparément
+sudo bash node_agent/deploy/update-agent.sh
+
+# 3. Gate production après retour des nœuds
+curl -fsS http://127.0.0.1:8000/ready
+```
+
+Mettre les agents à jour un par un et attendre leur retour `online` avant de
+continuer maintient la capacité si le cluster possède au moins un autre nœud
+capable d'héberger les modèles. L'orchestrateur ne fait aucune mise à jour SSH
+ou distante implicite.
+
+### Migration explicite local ↔ cluster
+
+Une migration n'est jamais déduite d'un simple rerun. Elle exige `--mode` et
+`--allow-mode-change`.
+
+**Local vers cluster :**
+
+1. Installer les node-agents, synchroniser GGUF/mmproj et partager
+   `AGENT_SECRET`.
+2. Préparer `nodes.yaml`, le bundle CA et les règles `9443`/`8081-8085`.
+3. Décharger/drainer les requêtes locales pendant une fenêtre de maintenance.
+4. Exécuter :
+
+```bash
+bash gateway/deploy/update.sh --mode cluster --dry-run
+sudo bash gateway/deploy/update.sh --mode cluster --allow-mode-change
+curl -fsS http://127.0.0.1:8000/ready
+```
+
+Si `nodes.yaml` ou son bundle CA est invalide, le script restaure le mode local
+avant le redémarrage. Si la readiness échoue après bascule, il restaure code,
+venv, `CLUSTER_MODE` et unité systemd locaux.
+
+**Cluster vers local :** préinstaller d'abord un `llama-server` CUDA fonctionnel
+sur l'orchestrateur, placer les GGUF sous les chemins du registre, dimensionner
+la VRAM locale et valider `nvidia-smi`. Puis :
+
+```bash
+bash gateway/deploy/update.sh --mode local --dry-run
+sudo bash gateway/deploy/update.sh --mode local --allow-mode-change
+curl -fsS http://127.0.0.1:8000/ready
+```
+
+La bascule ne supprime jamais `nodes.yaml`, `AGENT_SECRET` ni les services agents;
+ils restent disponibles pour un retour contrôlé. Après validation locale,
+arrêter les agents devenus inutiles selon la politique d'exploitation.
+
 ### Vérification de la rétrocompatibilité (déploiement UPPA existant)
 
 ```bash
-# Sur l'installation UPPA actuelle (L40S mono-nœud) :
-git pull
-bash gateway/deploy/update.sh    # même script qu'avant
-systemctl restart llm-gateway
-# Aucune modification de configuration nécessaire.
-# CLUSTER_MODE=local reste le défaut — comportement inchangé.
+# Sur une installation mono-nœud existante :
+bash gateway/deploy/update.sh --dry-run
+sudo bash gateway/deploy/update.sh
+# Le mode local est auto-détecté et conservé; aucun flag de migration requis.
 ```
 
 ---

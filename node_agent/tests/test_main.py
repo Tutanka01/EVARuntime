@@ -51,28 +51,52 @@ class FakeServerManager:
     """
 
     FAIL_LOAD: set[str] = set()
+    LOAD_GATES: dict[str, asyncio.Event] = {}
+    UNLOAD_GATES: dict[str, asyncio.Event] = {}
+    ENSURE_CALLS: dict[str, int] = {}
+    INSTANCES: list["FakeServerManager"] = []
 
-    def __init__(self, model, port, on_unload=None, on_capacity_change=None) -> None:
+    def __init__(
+        self,
+        model,
+        port,
+        on_unload=None,
+        on_capacity_change=None,
+        idle_unload_enabled=True,
+    ) -> None:
         self.model = model
         self._port = port
         self.port = port
         self._on_unload = on_unload
         self._on_capacity_change = on_capacity_change
+        self.idle_unload_enabled = idle_unload_enabled
         self.state = ModelState.UNLOADED
         self._process = None
         self.uptime_seconds = None
         self.idle_seconds = 0.0
         self._last_request_time = 0.0
         self.active_requests = 0
+        FakeServerManager.INSTANCES.append(self)
 
     async def ensure_loaded(self) -> None:
+        FakeServerManager.ENSURE_CALLS[self.model.id] = (
+            FakeServerManager.ENSURE_CALLS.get(self.model.id, 0) + 1
+        )
         if self.model.id in FakeServerManager.FAIL_LOAD:
             raise RuntimeError("échec simulé de chargement")
+        self.state = ModelState.LOADING
+        gate = FakeServerManager.LOAD_GATES.get(self.model.id)
+        if gate is not None:
+            await gate.wait()
         self.state = ModelState.READY
 
     async def unload(self, reason: str = "manuel") -> None:
         if self.state in (ModelState.UNLOADED,):
             return
+        self.state = ModelState.UNLOADING
+        gate = FakeServerManager.UNLOAD_GATES.get(self.model.id)
+        if gate is not None:
+            await gate.wait()
         self.state = ModelState.UNLOADED
         if self._on_unload:
             self._on_unload(self.model.id)
@@ -82,8 +106,16 @@ class FakeServerManager:
 def _reset_fake_manager_failures():
     """Isole les scénarios d'échec entre tests (état de classe partagé)."""
     FakeServerManager.FAIL_LOAD = set()
+    FakeServerManager.LOAD_GATES = {}
+    FakeServerManager.UNLOAD_GATES = {}
+    FakeServerManager.ENSURE_CALLS = {}
+    FakeServerManager.INSTANCES = []
     yield
     FakeServerManager.FAIL_LOAD = set()
+    FakeServerManager.LOAD_GATES = {}
+    FakeServerManager.UNLOAD_GATES = {}
+    FakeServerManager.ENSURE_CALLS = {}
+    FakeServerManager.INSTANCES = []
 
 
 @pytest.fixture
@@ -94,6 +126,7 @@ def fake_state(monkeypatch) -> "main._AgentState":
     ServerManager (qui, lui, lancerait un vrai sous-processus).
     """
     monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+    monkeypatch.setattr(main, "_validate_model_files", lambda model: None)
     return main._AgentState()
 
 
@@ -105,18 +138,18 @@ class TestAuthentication:
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)
         assert main.settings.agent_secret_is_placeholder() is True
 
-        with TestClient(main.app) as client:
-            resp = client.get(
-                "/agent/health",
-                headers={"Authorization": "Bearer whatever-random-token"},
-            )
-        assert resp.status_code == 503
+        creds = type("Credentials", (), {"credentials": "whatever-random-token"})()
+        with pytest.raises(HTTPException) as exc_info:
+            main.require_agent_secret(creds)
+        assert exc_info.value.status_code == 503
 
     def test_placeholder_secret_rejects_even_without_header(self, monkeypatch):
         """Sans en-tête Authorization du tout : HTTPBearer(auto_error=True) refuse
         en 401 avant même d'atteindre require_agent_secret (comportement FastAPI
         documenté, pas un bug de l'agent) — jamais un 200 silencieux."""
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+        monkeypatch.setattr(main.settings, "agent_secret", "a" * 32)
+        monkeypatch.setattr(main.settings, "internal_api_key", "b" * 32)
         with TestClient(main.app) as client:
             resp = client.get("/agent/health")
         assert resp.status_code == 401
@@ -124,7 +157,8 @@ class TestAuthentication:
     def test_configured_secret_wrong_bearer_401(self, monkeypatch):
         """Secret fort configuré + mauvais token → 401 (pas 503, pas d'auth silencieuse)."""
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)
-        monkeypatch.setattr(main.settings, "agent_secret", "s3cret-fort-de-test")
+        monkeypatch.setattr(main.settings, "agent_secret", "s3cret-fort-de-test-assez-long-123")
+        monkeypatch.setattr(main.settings, "internal_api_key", "b" * 32)
         assert main.settings.agent_secret_is_placeholder() is False
 
         with TestClient(main.app) as client:
@@ -137,12 +171,13 @@ class TestAuthentication:
     def test_configured_secret_correct_bearer_200(self, monkeypatch):
         """Secret fort + bon token → 200 et un NodeHealth cohérent avec la config."""
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)
-        monkeypatch.setattr(main.settings, "agent_secret", "s3cret-fort-de-test")
+        monkeypatch.setattr(main.settings, "agent_secret", "s3cret-fort-de-test-assez-long-123")
+        monkeypatch.setattr(main.settings, "internal_api_key", "b" * 32)
 
         with TestClient(main.app) as client:
             resp = client.get(
                 "/agent/health",
-                headers={"Authorization": "Bearer s3cret-fort-de-test"},
+                headers={"Authorization": "Bearer s3cret-fort-de-test-assez-long-123"},
             )
         assert resp.status_code == 200
         body = resp.json()
@@ -278,6 +313,124 @@ class TestAgentStateLoadUnload:
         assert len(fake_state._port_pool) == ports_before + 1
         assert "a-decharger" not in fake_state._managers
 
+    def test_concurrent_loads_share_one_manager_and_wait_until_ready(self, fake_state):
+        model_id = "concurrent-load"
+
+        async def scenario():
+            gate = asyncio.Event()
+            FakeServerManager.LOAD_GATES[model_id] = gate
+            first_task = asyncio.create_task(fake_state.load(make_model_dict(model_id)))
+            while (
+                model_id not in fake_state._managers
+                or fake_state._managers[model_id].state != ModelState.LOADING
+            ):
+                await asyncio.sleep(0)
+
+            second_task = asyncio.create_task(fake_state.load(make_model_dict(model_id)))
+            await asyncio.sleep(0.01)
+            assert not first_task.done()
+            assert not second_task.done()
+            gate.set()
+            return await asyncio.gather(first_task, second_task)
+
+        first, second = asyncio.run(scenario())
+
+        assert first.already_loaded is False
+        assert second.already_loaded is True
+        assert first.port == second.port
+        assert FakeServerManager.ENSURE_CALLS[model_id] == 1
+        assert len(FakeServerManager.INSTANCES) == 1
+        assert len(fake_state._managers) == 1
+        assert len(fake_state._port_pool) == main.settings.max_loaded_models - 1
+
+    def test_load_waits_for_concurrent_unload_without_port_corruption(self, fake_state):
+        model_id = "unload-load-race"
+
+        async def scenario():
+            first = await fake_state.load(make_model_dict(model_id))
+            old_manager = fake_state._managers[model_id]
+            gate = asyncio.Event()
+            FakeServerManager.UNLOAD_GATES[model_id] = gate
+
+            unload_task = asyncio.create_task(fake_state.unload(model_id))
+            while old_manager.state != ModelState.UNLOADING:
+                await asyncio.sleep(0)
+
+            reload_task = asyncio.create_task(fake_state.load(make_model_dict(model_id)))
+            await asyncio.sleep(0.01)
+            assert not reload_task.done()
+            assert fake_state._managers[model_id] is old_manager
+            assert len(fake_state._allocated_ports) == 1
+
+            gate.set()
+            unload_response = await unload_task
+            reload_response = await reload_task
+            return first, old_manager, unload_response, reload_response
+
+        first, old_manager, unloaded, reloaded = asyncio.run(scenario())
+
+        assert unloaded.unloaded is True
+        assert reloaded.already_loaded is False
+        assert reloaded.port == first.port
+        assert fake_state._managers[model_id] is not old_manager
+        assert len(FakeServerManager.INSTANCES) == 2
+        assert len(fake_state._allocated_ports) == 1
+        assert reloaded.port not in fake_state._port_pool
+        assert len(fake_state._port_pool) == main.settings.max_loaded_models - 1
+        assert len(fake_state._port_pool) == len(set(fake_state._port_pool))
+
+
+class TestModelFilesFailFast:
+    def test_missing_gguf_is_422_before_port_reservation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+        state = main._AgentState()
+        model = make_model_dict("missing-gguf")
+        model["path"] = str(tmp_path / "missing.gguf")
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(state.load(model))
+
+        assert exc_info.value.status_code == 422
+        assert "introuvable" in exc_info.value.detail
+        assert len(state._port_pool) == main.settings.max_loaded_models
+
+    def test_unreadable_gguf_is_422_before_manager_creation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+        state = main._AgentState()
+        gguf = tmp_path / "unreadable.gguf"
+        gguf.write_bytes(b"test")
+        monkeypatch.setattr(main.os, "access", lambda path, mode: False)
+        model = make_model_dict("unreadable-gguf")
+        model["path"] = str(gguf)
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(state.load(model))
+
+        assert exc_info.value.status_code == 422
+        assert "non lisible" in exc_info.value.detail
+        assert FakeServerManager.INSTANCES == []
+
+    def test_missing_mmproj_is_422_before_port_reservation(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+        state = main._AgentState()
+        gguf = tmp_path / "vision.gguf"
+        gguf.write_bytes(b"model")
+        model = make_model_dict("missing-mmproj")
+        model.update(
+            {
+                "path": str(gguf),
+                "capabilities": ["text_generation", "vision"],
+                "mmproj_path": str(tmp_path / "missing-mmproj.gguf"),
+            }
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(state.load(model))
+
+        assert exc_info.value.status_code == 422
+        assert "projecteur multimodal" in exc_info.value.detail
+        assert len(state._port_pool) == main.settings.max_loaded_models
+
 
 class TestAgentMetrics:
     """Endpoint additif /agent/metrics + méthode _AgentState.agent_metrics()."""
@@ -290,6 +443,8 @@ class TestAgentMetrics:
     def test_metrics_endpoint_requires_secret(self, monkeypatch):
         """Sans en-tête Authorization → 401 (HTTPBearer auto_error)."""
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+        monkeypatch.setattr(main.settings, "agent_secret", "a" * 32)
+        monkeypatch.setattr(main.settings, "internal_api_key", "b" * 32)
         with TestClient(main.app) as client:
             resp = client.get("/agent/metrics")
         assert resp.status_code == 401
@@ -297,11 +452,12 @@ class TestAgentMetrics:
     def test_metrics_endpoint_ok_empty_with_secret(self, monkeypatch):
         """Secret fort + bon token, aucun modèle chargé → 200 {}."""
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)
-        monkeypatch.setattr(main.settings, "agent_secret", "s3cret-fort-de-test")
+        monkeypatch.setattr(main.settings, "agent_secret", "s3cret-fort-de-test-assez-long-123")
+        monkeypatch.setattr(main.settings, "internal_api_key", "b" * 32)
         with TestClient(main.app) as client:
             resp = client.get(
                 "/agent/metrics",
-                headers={"Authorization": "Bearer s3cret-fort-de-test"},
+                headers={"Authorization": "Bearer s3cret-fort-de-test-assez-long-123"},
             )
         assert resp.status_code == 200
         assert resp.json() == {}
@@ -320,3 +476,13 @@ class TestLoadResponseUrl:
 
         expected_port = resp.port
         assert resp.llama_url == f"http://{main.settings.llama_server_host}:{expected_port}"
+
+    def test_agent_disables_blind_idle_unload(self, fake_state):
+        asyncio.run(fake_state.load(make_model_dict("cluster-lifecycle")))
+        assert fake_state._managers["cluster-lifecycle"].idle_unload_enabled is False
+
+    def test_llama_url_brackets_ipv6_bind_host(self, fake_state, monkeypatch):
+        monkeypatch.setattr(main.settings, "llama_server_host", "::")
+        resp = asyncio.run(fake_state.load(make_model_dict("ipv6-url")))
+
+        assert resp.llama_url == f"http://[::]:{resp.port}"

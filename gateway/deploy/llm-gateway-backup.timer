@@ -1,6 +1,6 @@
 [Unit]
 Description=Déclencheur quotidien de la sauvegarde SQLite de la LLM Gateway
-Documentation=https://github.com/uppa/llm-gateway
+Documentation=https://github.com/Tutanka01/EVARuntime
 
 [Timer]
 # Tous les jours à 03h15 (heure locale). Heure creuse : peu de trafic d'inférence.

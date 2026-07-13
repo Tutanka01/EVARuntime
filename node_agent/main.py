@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import secrets
 import sys
 import tempfile
@@ -47,7 +48,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from config import settings  # → node_agent/config.py
 from llama_version import enforce_llama_min_build
 from model_registry import IntegrityError, ModelRegistry
-from server_manager import ModelState, ServerManager
+from server_manager import ModelState, ServerManager, format_url_host
 from cluster.node_protocol import (
     LoadRequest,
     LoadResponse,
@@ -98,10 +99,32 @@ def _make_validator_registry() -> ModelRegistry:
     tmp.write("models: []\n")
     tmp.flush()
     tmp.close()
-    return ModelRegistry(
-        config_path=Path(tmp.name),
-        allowed_model_dirs=settings.allowed_model_dirs or None,
-    )
+    tmp_path = Path(tmp.name)
+    try:
+        return ModelRegistry(
+            config_path=tmp_path,
+            allowed_model_dirs=settings.allowed_model_dirs_list() or None,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _validate_model_files(model) -> None:
+    """Fail-fast sur les artefacts présents sur CE nœud, avant toute réservation."""
+    files = [("GGUF", model.path)]
+    if model.mmproj_path is not None:
+        files.append(("projecteur multimodal", model.mmproj_path))
+    for label, path in files:
+        if not path.is_file():
+            raise HTTPException(
+                status_code=422,
+                detail=f"Fichier {label} introuvable sur le nœud : {path}",
+            )
+        if not os.access(path, os.R_OK):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Fichier {label} non lisible par le node-agent : {path}",
+            )
 
 
 # ── État de l'agent ───────────────────────────────────────────────────────────
@@ -116,6 +139,9 @@ class _AgentState:
         self._validator = _make_validator_registry()
         self._managers: dict[str, ServerManager] = {}
         self._allocated_ports: dict[str, int] = {}
+        # Sérialise load/unload pour un même modèle sans bloquer les chargements
+        # indépendants sur les autres ports/nœuds.
+        self._model_locks: dict[str, asyncio.Lock] = {}
         self._port_pool: list[int] = list(range(
             settings.base_llama_port,
             settings.base_llama_port + settings.max_loaded_models,
@@ -132,6 +158,10 @@ class _AgentState:
     def _available_vram(self) -> float:
         return settings.effective_vram_budget_gb() - self._used_vram()
 
+    @staticmethod
+    def _reported_llama_url(port: int) -> str:
+        return f"http://{format_url_host(settings.llama_server_host)}:{port}"
+
     async def load(self, model_dict: dict) -> LoadResponse:
         """Charge un modèle depuis sa définition YAML. Idempotent."""
         # Valider via le même parseur que la gateway — mêmes règles de sécurité.
@@ -139,6 +169,8 @@ class _AgentState:
             model = self._validator._parse_entry(model_dict)
         except (ValueError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=f"Définition de modèle invalide : {exc}") from exc
+
+        _validate_model_files(model)
 
         # Garde-fou supply-chain (opt-in) : si le modèle déclare un `sha256`, on
         # vérifie l'intégrité du GGUF AVANT de lancer le sous-processus. Coût :
@@ -153,79 +185,125 @@ class _AgentState:
                     detail=f"Vérification d'intégrité échouée : {exc}",
                 ) from exc
 
+        model_lock = self._model_locks.setdefault(model.id, asyncio.Lock())
+        async with model_lock:
+            return await self._load_serialized(model)
+
+    async def _load_serialized(self, model) -> LoadResponse:
+        """Charge sous verrou par modèle; n'expose jamais une URL encore LOADING."""
+        already_loaded = False
         async with self._lock:
             existing = self._managers.get(model.id)
-            if existing and existing.state in (ModelState.READY, ModelState.LOADING):
+            if existing and existing.state == ModelState.READY:
                 port = self._allocated_ports[model.id]
                 return LoadResponse(
                     model_id=model.id,
-                    llama_url=f"http://{settings.llama_server_host}:{port}",
+                    llama_url=self._reported_llama_url(port),
                     internal_api_key=settings.internal_api_key,
                     port=port,
                     pid=existing._process.pid if existing._process else None,
                     already_loaded=True,
                 )
 
-            if not self._port_pool:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"Pool de ports épuisé ({settings.max_loaded_models} max). "
-                        "Déchargez un modèle avant d'en charger un autre."
-                    ),
-                )
-            if self._available_vram() < model.vram_gb:
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"VRAM insuffisante : besoin {model.vram_gb:.1f} GB, "
-                        f"disponible {self._available_vram():.1f} GB."
-                    ),
-                )
+            if existing and existing.state == ModelState.LOADING:
+                # Cas défensif (p.ex. état restauré par un backend custom) : le
+                # verrou empêche les nouveaux chemins normaux d'arriver ici, mais
+                # on attend tout de même READY au lieu de router prématurément.
+                mgr = existing
+                port = self._allocated_ports[model.id]
+                already_loaded = True
+            else:
+                if existing and existing.state == ModelState.UNLOADING:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Le modèle '{model.id}' est en cours de déchargement; réessayez.",
+                    )
+                if existing:
+                    self._release_manager(model.id, existing)
 
-            port = self._port_pool.pop(0)
-            self._allocated_ports[model.id] = port
-            mgr = ServerManager(model=model, port=port, on_unload=self._on_unloaded)
-            self._managers[model.id] = mgr
+                if not self._port_pool:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"Pool de ports épuisé ({settings.max_loaded_models} max). "
+                            "Déchargez un modèle avant d'en charger un autre."
+                        ),
+                    )
+                if self._available_vram() < model.vram_gb:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"VRAM insuffisante : besoin {model.vram_gb:.1f} GB, "
+                            f"disponible {self._available_vram():.1f} GB."
+                        ),
+                    )
+
+                port = self._port_pool.pop(0)
+                self._allocated_ports[model.id] = port
+                manager_ref: ServerManager | None = None
+
+                def on_unload(mid: str) -> None:
+                    self._on_unloaded(mid, manager_ref)
+
+                mgr = ServerManager(
+                    model=model,
+                    port=port,
+                    on_unload=on_unload,
+                    # Le data-plane contourne l'agent : ses compteurs pin/unpin ne
+                    # voient pas les requêtes distantes. Garder le watchdog de crash,
+                    # mais interdire toute éviction idle aveugle.
+                    idle_unload_enabled=False,
+                )
+                manager_ref = mgr
+                self._managers[model.id] = mgr
 
         try:
             await mgr.ensure_loaded()
         except Exception as exc:
             async with self._lock:
-                self._managers.pop(model.id, None)
-                freed_port = self._allocated_ports.pop(model.id, None)
-                if freed_port is not None:
-                    self._port_pool.append(freed_port)
+                self._release_manager(model.id, mgr)
             raise HTTPException(status_code=500, detail=f"Échec du chargement : {exc}") from exc
 
         return LoadResponse(
             model_id=model.id,
-            llama_url=f"http://{settings.llama_server_host}:{port}",
+            llama_url=self._reported_llama_url(port),
             internal_api_key=settings.internal_api_key,
             port=port,
             pid=mgr._process.pid if mgr._process else None,
-            already_loaded=False,
+            already_loaded=already_loaded,
         )
 
     async def unload(self, model_id: str) -> UnloadResponse:
-        async with self._lock:
-            mgr = self._managers.get(model_id)
-        if mgr is None:
-            return UnloadResponse(model_id=model_id, unloaded=False, message="Modèle non chargé.")
-        vram = mgr.model.vram_gb
-        await mgr.unload(reason="orchestrateur request")
-        return UnloadResponse(model_id=model_id, unloaded=True, freed_vram_gb=vram)
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            async with self._lock:
+                mgr = self._managers.get(model_id)
+            if mgr is None:
+                return UnloadResponse(model_id=model_id, unloaded=False, message="Modèle non chargé.")
+            vram = mgr.model.vram_gb
+            await mgr.unload(reason="orchestrateur request")
+            async with self._lock:
+                # Le vrai ServerManager appelle déjà le callback; ce fallback
+                # couvre un backend custom/idempotent sans callback.
+                self._release_manager(model_id, mgr)
+            return UnloadResponse(model_id=model_id, unloaded=True, freed_vram_gb=vram)
 
     async def unload_all(self) -> None:
         for mid in list(self._managers):
-            mgr = self._managers.get(mid)
-            if mgr:
-                await mgr.unload(reason="shutdown")
+            await self.unload(mid)
 
-    def _on_unloaded(self, model_id: str) -> None:
+    def _on_unloaded(self, model_id: str, expected: ServerManager | None) -> None:
+        self._release_manager(model_id, expected)
+
+    def _release_manager(self, model_id: str, expected: ServerManager | None) -> None:
+        """Libère uniquement le manager attendu; callback ancien = no-op sûr."""
+        current = self._managers.get(model_id)
+        if expected is None or current is not expected:
+            return
         port = self._allocated_ports.pop(model_id, None)
-        if port is not None:
+        if port is not None and port not in self._port_pool:
             self._port_pool.append(port)
+            self._port_pool.sort()
         self._managers.pop(model_id, None)
 
     def health(self) -> NodeHealth:
@@ -330,11 +408,9 @@ async def lifespan(app: FastAPI):
         "=== Node Agent démarrage — node_id=%s, port=%d ===",
         settings.node_id, settings.agent_port,
     )
-    if settings.agent_secret_is_placeholder():
-        log.critical(
-            "AGENT_SECRET non configuré (vide ou CHANGE_ME_*) — toutes les "
-            "requêtes seront refusées (503) tant qu'un secret fort n'est pas défini."
-        )
+    # L'agent et ses llama-server écoutent le réseau : contrairement au mode
+    # local, démarrer avec une clé d'exemple créerait une exposition immédiate.
+    settings.validate_runtime_security()
     log.info(
         "Budget VRAM : %.1f GB total → %.1f GB net",
         settings.total_vram_gb, settings.effective_vram_budget_gb(),

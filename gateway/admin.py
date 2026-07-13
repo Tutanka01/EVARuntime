@@ -68,6 +68,24 @@ def _warn_kv_cache(model_id: str, vram_gb: float, lp: LlamaParamsSchema) -> None
         )
 
 
+def _max_model_capacity_gb() -> float | None:
+    """Capacité effective maximale d'un seul hôte d'inférence connu."""
+    if settings.cluster_mode != "cluster":
+        return settings.effective_vram_budget_gb()
+
+    cluster_status = getattr(model_manager, "cluster_status", None)
+    if cluster_status is None:
+        return None
+    capacities = [
+        float(node["used_vram_gb"]) + float(node["available_vram_gb"])
+        for node in cluster_status()
+        if node.get("online")
+        and node.get("used_vram_gb") is not None
+        and node.get("available_vram_gb") is not None
+    ]
+    return max(capacities, default=None)
+
+
 # ── Statut système multi-modèles ──────────────────────────────────────────────
 
 @router.get("/status", response_model=GatewayStatus)
@@ -99,21 +117,27 @@ async def register_model(
     Validations de sécurité :
     - path doit être absolu et pointer vers un fichier .gguf
     - path doit être sous un répertoire autorisé (si ALLOWED_MODEL_DIRS est configuré)
-    - Le fichier .gguf doit exister sur le serveur
-    - vram_gb doit être raisonnable (≤ budget VRAM net)
+    - En local, le fichier .gguf doit exister sur la gateway
+    - En cluster, son existence est validée par chaque node-agent au chargement
+    - vram_gb doit tenir sur au moins un hôte d'inférence connu
     - Le modèle n'est PAS chargé automatiquement après enregistrement
     """
-    # Vérification du fichier (existence sur disque)
+    # En cluster les GGUF vivent sur les nœuds, pas nécessairement sur
+    # l'orchestrateur. Le node-agent valide existence, lisibilité et intégrité
+    # avant de réserver un port ou de lancer llama-server.
     model_path = Path(body.path)
-    if not model_path.exists():
+    if settings.cluster_mode == "local" and not model_path.exists():
         raise HTTPException(
             status_code=422,
             detail=f"Fichier introuvable sur le serveur : {body.path}",
         )
 
-    # Vérification budget VRAM (avertissement si vram_gb dépasse le budget net)
-    budget = settings.effective_vram_budget_gb()
-    if body.vram_gb > budget:
+    # En cluster, comparer au plus grand budget EFFECTIF d'un seul nœud (pas à
+    # la somme du cluster : un modèle ne peut pas être fractionné). Si aucun
+    # heartbeat n'est encore disponible, autoriser l'enregistrement de la
+    # métadonnée; le scheduler refusera explicitement un chargement impossible.
+    budget = _max_model_capacity_gb()
+    if budget is not None and body.vram_gb > budget:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -176,6 +200,17 @@ async def update_model(
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=422, detail="Aucun champ à mettre à jour.")
+
+    if "vram_gb" in updates:
+        budget = _max_model_capacity_gb()
+        if budget is not None and float(updates["vram_gb"]) > budget:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"vram_gb ({float(updates['vram_gb']):.1f} GB) dépasse le "
+                    f"budget maximal d'un hôte d'inférence ({budget:.1f} GB)."
+                ),
+            )
 
     try:
         model = model_manager.registry.update(model_id, **updates)
@@ -277,9 +312,16 @@ async def unload_model(
 
 @router.post("/unload")
 async def unload_all(_: None = Depends(require_admin)) -> dict:
-    """Décharge tous les modèles chargés et libère toute la VRAM."""
-    await model_manager.shutdown()
-    return {"message": "Tous les modèles déchargés. GPU entièrement libéré."}
+    """Décharge tous les modèles sans arrêter le gestionnaire d'inférence."""
+    try:
+        await model_manager.unload_all_models()
+    except RuntimeError as exc:
+        # 409 si l'opération entre en conflit avec un stream actif; 503 si un
+        # agent n'a pas confirmé le déchargement. Dans les deux cas, le cluster
+        # conserve son inventaire au lieu d'annoncer à tort de la VRAM libérée.
+        status_code = 409 if "requêtes actives" in str(exc) else 503
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {"message": "Tous les modèles déchargés. VRAM entièrement libérée."}
 
 
 # ── Cluster multi-nœuds ───────────────────────────────────────────────────────

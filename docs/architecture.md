@@ -71,9 +71,11 @@ aux administrateurs souhaitant comprendre ou modifier le système.
 
 ### Source de vérité
 
-Le fichier `models.yaml` est la source de vérité unique pour tous les modèles
+Le fichier `/var/lib/llm-gateway/models.yaml` est la source de vérité unique pour tous les modèles
 disponibles sur la gateway. Il est lu au démarrage et peut être modifié en
-direct via l'API admin (écriture atomique : temp + rename).
+direct via l'API admin (écriture atomique : temp + rename). Il vit sous
+`/var/lib`, writable par `llmservice`, tandis que secrets et topologie restent
+sous `/etc/llm-gateway`, non writable par le service.
 
 ```yaml
 models:
@@ -770,6 +772,25 @@ GROUP BY u.id, l.model ORDER BY tokens DESC LIMIT 10;"
 
 > Activé par `CLUSTER_MODE=cluster`. Le mode `local` (défaut) est inchangé.
 
+### Frontière entre les deux produits
+
+La même API et le même registre alimentent deux backends exclusifs, choisis au
+démarrage. Le déploiement matérialise cette frontière avec deux profils systemd :
+
+| Invariant | `local` | `cluster` |
+|-----------|---------|-----------|
+| `llama-server` | sous-processus du gateway | sous-processus des agents seulement |
+| GPU sur l'hôte gateway | requis, devices NVIDIA autorisés | non requis, `PrivateDevices=true` |
+| `/models` sur le gateway | requis | inutile |
+| Plan de contrôle | in-process | HTTPS `:9443` vers les agents |
+| Plan de données | loopback `:8081-8085` | LAN `:8081-8085`, limité à l'orchestrateur |
+
+`install.sh` choisit `local` par défaut uniquement pour une installation
+neuve. `update.sh` relit et conserve le mode existant. Une transition demande
+`--mode` et `--allow-mode-change`; le rollback restaure simultanément code,
+venv, mode et unité. Les agents ont un cycle de déploiement séparé : aucune
+mise à jour orchestrateur ne pousse du code sur les nœuds.
+
 ### Vue d'ensemble
 
 ```
@@ -812,6 +833,10 @@ GROUP BY u.id, l.model ORDER BY tokens DESC LIMIT 10;"
 |------|-------------|-----------|--------|
 | Contrôle | orchestrateur ↔ agent | HTTPS + Bearer | Faible (load/unload/health) |
 | Données | orchestrateur ↔ llama-server | HTTP LAN | Élevé (tokens SSE) |
+
+Le registre est central mais les artefacts ne le sont pas : `path` et
+`mmproj_path` doivent résoudre vers des fichiers identiques, aux mêmes chemins
+absolus, sur chaque nœud éligible. Le scheduler ne transfère pas les GGUF.
 
 ### Scheduler (placement automatique)
 

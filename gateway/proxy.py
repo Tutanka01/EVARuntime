@@ -32,6 +32,7 @@ Point critique SSE :
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -114,6 +115,30 @@ def get_http_client() -> httpx.AsyncClient:
     if _http_client is None:
         _http_client = _build_http_client()
     return _http_client
+
+
+async def _report_backend_failure(manager: ServerManager) -> None:
+    """
+    Informe le gestionnaire d'un échec du data-plane, s'il sait le traiter.
+
+    ``ServerManager`` (mode local) n'expose volontairement pas ce hook. Le
+    handle cluster l'utilise pour invalider immédiatement un placement devenu
+    injoignable, sans attendre le prochain heartbeat. Le reporting reste
+    best-effort : une erreur de bookkeeping ne doit jamais masquer l'erreur
+    d'inférence d'origine renvoyée au client.
+    """
+    callback = getattr(manager, "report_backend_failure", None)
+    if callback is None:
+        return
+    try:
+        result = callback()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        log.exception(
+            "Impossible de signaler l'échec du backend '%s'.",
+            manager.model.id,
+        )
 
 
 def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
@@ -263,8 +288,10 @@ async def _non_stream_proxy(
             headers=manager.auth_headers(),
         )
     except httpx.TimeoutException:
+        await _report_backend_failure(manager)
         return _openai_error(504, "Timeout : le modèle n'a pas répondu à temps.", "server_error")
     except httpx.RequestError as exc:
+        await _report_backend_failure(manager)
         log.error("Erreur de connexion à llama-server '%s' : %s", manager.model.id, exc)
         return _openai_error(502, "Impossible de joindre le backend d'inférence.", "server_error")
 
@@ -432,10 +459,12 @@ async def _stream_proxy(
                     yield (line + "\n\n").encode()
 
     except httpx.TimeoutException:
+        await _report_backend_failure(manager)
         err = _sse_error("Timeout d'inférence dépassé.")
         yield err.encode()
         status_code = 504
     except httpx.RequestError as exc:
+        await _report_backend_failure(manager)
         log.error("Erreur stream llama-server '%s' : %s", manager.model.id, exc)
         err = _sse_error("Erreur de connexion au backend d'inférence.")
         yield err.encode()

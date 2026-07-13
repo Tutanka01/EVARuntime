@@ -24,6 +24,7 @@ import re
 
 import pytest
 import yaml
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import admin
@@ -84,6 +85,23 @@ def _gguf_entry(tmp_path, **overrides) -> dict:
     return entry
 
 
+def test_register_model_cluster_accepts_remote_gguf_path(
+    client, admin_headers, temp_registry, monkeypatch,
+):
+    """L'orchestrateur ne doit pas exiger une copie locale des GGUF distants."""
+    monkeypatch.setattr(settings, "cluster_mode", "cluster")
+    payload = {
+        "id": "remote-model",
+        "path": "/models/remote-only.gguf",
+        "vram_gb": 5.0,
+    }
+
+    response = client.post("/admin/models", json=payload, headers=admin_headers)
+
+    assert response.status_code == 201, response.text
+    assert temp_registry.get("remote-model") is not None
+
+
 # ── 1. Toutes les routes mutantes exigent le bon secret admin ────────────────
 
 # (méthode, chemin, corps JSON) — un échantillon représentatif de TOUTES les
@@ -102,6 +120,45 @@ MUTATING_ROUTES = [
     ("POST", "/admin/users/does-not-exist/keys", {"name": "k"}),
     ("DELETE", "/admin/keys/llmgw-doesnotexist", None),
 ]
+
+
+@pytest.mark.anyio
+async def test_unload_all_keeps_model_manager_running(monkeypatch):
+    """L'action admin décharge les modèles sans appeler le shutdown du runtime."""
+    class FakeManager:
+        def __init__(self) -> None:
+            self.unload_calls = 0
+            self.shutdown_calls = 0
+
+        async def unload_all_models(self) -> None:
+            self.unload_calls += 1
+
+        async def shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    manager = FakeManager()
+    monkeypatch.setattr(admin, "model_manager", manager)
+
+    response = await admin.unload_all(None)
+
+    assert manager.unload_calls == 1
+    assert manager.shutdown_calls == 0
+    assert "VRAM" in response["message"]
+
+
+@pytest.mark.anyio
+async def test_unload_all_reports_partial_cluster_failure(monkeypatch):
+    class FailingManager:
+        async def unload_all_models(self) -> None:
+            raise RuntimeError("Unload-all incomplet — node-b: timeout")
+
+    monkeypatch.setattr(admin, "model_manager", FailingManager())
+
+    with pytest.raises(HTTPException) as caught:
+        await admin.unload_all(None)
+
+    assert caught.value.status_code == 503
+    assert "incomplet" in caught.value.detail
 
 
 @pytest.mark.parametrize("method,path,body", MUTATING_ROUTES)

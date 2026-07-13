@@ -226,6 +226,22 @@ class TestRemoteClientTrustedLlamaUrl:
         assert "attacker.example" not in resp.llama_url
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "reported_url", ["http://0.0.0.0:8081", "http://[::]:8081"]
+    )
+    async def test_wildcard_bind_is_rebound_without_mismatch_warning(
+        self, caplog, reported_url
+    ):
+        client = make_client(self._load_handler(reported_url))
+        try:
+            resp = await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+
+        assert resp.llama_url == "http://node.test:8081"
+        assert not any("diffère" in record.message for record in caplog.records)
+
+    @pytest.mark.anyio
     async def test_already_loaded_url_is_also_rebound(self):
         # already_loaded=True passe par le même load_model → même correction.
         client = make_client(
@@ -237,6 +253,37 @@ class TestRemoteClientTrustedLlamaUrl:
             await client.close()
         assert resp.already_loaded is True
         assert resp.llama_url == "http://node.test:8082"
+
+    @pytest.mark.anyio
+    async def test_ipv6_node_host_is_bracketed_in_reconstructed_url(self):
+        client = RemoteNodeClient(
+            node_id="ipv6-node",
+            base_url="https://[fd00::1234]:9443",
+            agent_secret="secret",
+            verify=False,
+        )
+
+        def handler(request):
+            return httpx.Response(
+                200,
+                json={
+                    "model_id": "m1",
+                    "llama_url": "http://[fd00::1234]:8081",
+                    "internal_api_key": "key",
+                    "port": 8081,
+                },
+            )
+
+        client._client = httpx.AsyncClient(
+            base_url="https://[fd00::1234]:9443",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            response = await client.load_model({"id": "m1"})
+        finally:
+            await client.close()
+
+        assert response.llama_url == "http://[fd00::1234]:8081"
 
     @pytest.mark.anyio
     async def test_port_out_of_range_zero_raises_protocol_error(self):
@@ -359,6 +406,18 @@ class TestRemoteClientNetworkErrors:
         try:
             with pytest.raises(NodeUnreachableError):
                 await client.load_model({"id": "x"})
+        finally:
+            await client.close()
+
+    @pytest.mark.anyio
+    async def test_remote_protocol_error_raises_unreachable(self):
+        def handler(request):
+            raise httpx.RemoteProtocolError("peer disconnected")
+
+        client = make_client(handler)
+        try:
+            with pytest.raises(NodeUnreachableError, match="RemoteProtocolError"):
+                await client.health()
         finally:
             await client.close()
 

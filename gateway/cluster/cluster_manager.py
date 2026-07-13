@@ -17,10 +17,10 @@ Interface publique (même forme que LocalModelManager) :
   registry                         → ModelRegistry
 
 Concurrence :
-  asyncio.Lock global sur les mutations de l'état du cluster (chargement,
-  éviction, mise-à-jour heartbeat). Le heartbeat tourne dans une tâche
-  background ; les requêtes d'inférence ne prennent jamais le lock — seul
-  le cluster manager le prend lors du placement.
+  - asyncio.Lock global uniquement pour les snapshots/mutations en mémoire ;
+  - un lock par nœud sérialise load/unload ;
+  - un lock par modèle déduplique les chargements concurrents ;
+  - aucun I/O réseau long n'est effectué sous le lock global.
 """
 from __future__ import annotations
 
@@ -33,13 +33,13 @@ from urllib.parse import urlparse
 from model_registry import ModelDefinition, ModelRegistry
 
 from .node_client import NodeClient, NodeUnreachableError, NodeProtocolError
-from .node_protocol import NodeHealth
+from .node_protocol import ModelStateOnNode, NodeHealth
 from .scheduler import (
+    EvictionPlan,
     LoadedModelSnapshot,
     ModelToPlace,
     NodeSnapshot,
     NoPlacementError,
-    build_eviction_plan,
     pick_node,
 )
 
@@ -56,6 +56,9 @@ class _LoadedInfo:
     vram_gb: float
     _last_request: float = field(default_factory=time.monotonic)
     _active_requests: int = 0
+    # Empêche le fast-path de distribuer un nouveau handle pendant une
+    # éviction déjà décidée.
+    evicting: bool = False
 
     def touch(self) -> None:
         self._last_request = time.monotonic()
@@ -80,8 +83,16 @@ class _NodeState:
     last_health: NodeHealth | None = None
     # model_id → info sur ce modèle sur CE nœud
     loaded: dict[str, _LoadedInfo] = field(default_factory=dict)
+    # Les mutations distantes (load/unload) sont sérialisées par nœud sans
+    # immobiliser le lock global du cluster pendant les I/O.
+    operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Un échec du data-plane exclut temporairement ce couple modèle/nœud.
+    suspect_models: set[str] = field(default_factory=set)
+    # Empêche une réponse status() lente d'annuler une invalidation plus
+    # récente du data-plane ou du heartbeat.
+    inventory_revision: int = 0
 
-    def snapshot(self, health_failures_threshold: int) -> NodeSnapshot:
+    def snapshot(self) -> NodeSnapshot:
         """Construit un NodeSnapshot à partir de l'état courant."""
         if self.last_health is None:
             return NodeSnapshot(
@@ -89,6 +100,7 @@ class _NodeState:
                 online=False,
                 total_vram_gb=0.0,
                 used_vram_gb=0.0,
+                reported_available_vram_gb=0.0,
                 free_ports=0,
             )
         h = self.last_health
@@ -107,6 +119,7 @@ class _NodeState:
             draining=False,
             total_vram_gb=h.total_vram_gb,
             used_vram_gb=h.used_vram_gb,
+            reported_available_vram_gb=h.available_vram_gb,
             free_ports=h.free_ports,
             loaded_models=loaded_snapshots,
         )
@@ -126,9 +139,15 @@ class ClusterModelHandle:
       handle.model.id          (→ ModelDefinition)
     """
 
-    def __init__(self, info: _LoadedInfo, model_def: ModelDefinition) -> None:
+    def __init__(
+        self,
+        info: _LoadedInfo,
+        model_def: ModelDefinition,
+        manager: "ClusterManager",
+    ) -> None:
         self._info = info
         self.model = model_def
+        self._manager = manager
 
     def pin(self) -> None:
         self._info._active_requests += 1
@@ -153,6 +172,17 @@ class ClusterModelHandle:
     @property
     def active_requests(self) -> int:
         return self._info.active_requests
+
+    async def report_backend_failure(self) -> None:
+        """
+        Signale un échec de connexion au llama-server.
+
+        L'invalidation est idempotente et compare l'identité de `_LoadedInfo` :
+        un vieux handle ne peut donc pas supprimer un placement plus récent.
+        Le prochain ensure_model_loaded() basculera sur un autre nœud sans
+        attendre les trois heartbeats du plan de contrôle.
+        """
+        await self._manager._report_backend_failure(self._info)
 
 
 # ── ClusterManager ─────────────────────────────────────────────────────────────
@@ -185,6 +215,11 @@ class ClusterManager:
 
         # Lock sur toutes les mutations de _nodes / _placement
         self._lock = asyncio.Lock()
+
+        # Un seul chargement/replacement concurrent par modèle. Les locks par
+        # nœud protègent, eux, la capacité et l'ordre unload -> load.
+        self._model_locks: dict[str, asyncio.Lock] = {}
+        self._unloading_all = False
 
         self._monitor_task: asyncio.Task | None = None
 
@@ -224,46 +259,106 @@ class ClusterManager:
         vraie clé + l'URL de confiance lors de la première requête sur ce modèle.
         La réconciliation elle-même ne déclenche AUCUN rechargement.
         """
-        async with self._lock:
-            for state in self._nodes.values():
-                if not state.online:
-                    continue
-                try:
-                    node_status = await state.client.status()
-                except (NodeUnreachableError, NodeProtocolError) as exc:
-                    log.warning(
-                        "Réconciliation : status() injoignable sur '%s' : %s — nœud sauté.",
-                        state.node_id, exc,
-                    )
-                    continue
-                except Exception as exc:  # défensif : ne jamais bloquer le boot
-                    log.warning(
-                        "Réconciliation : erreur inattendue sur '%s' : %s — nœud sauté.",
-                        state.node_id, exc,
-                    )
-                    continue
+        await asyncio.gather(
+            *(
+                self._reconcile_node_status(state)
+                for state in self._nodes.values()
+                if state.online
+            )
+        )
 
-                for m in node_status.models:
-                    # On ne réconcilie que les modèles réellement servables.
-                    if m.state != "ready":
-                        continue
-                    llama_url = self._reconciled_llama_url(state, m.port)
-                    if llama_url is None:
-                        continue
-                    info = _LoadedInfo(
-                        node_id=state.node_id,
-                        llama_url=llama_url,
-                        # Clé inconnue via status() → sentinelle vide = "à rafraîchir".
-                        internal_api_key="",
-                        vram_gb=m.vram_gb,
-                    )
-                    state.loaded[m.id] = info
-                    self._placement[m.id] = state.node_id
-                    log.info(
-                        "Réconciliation : modèle '%s' déjà chargé sur '%s' "
-                        "(%.1f GB) — placement restauré sans rechargement.",
-                        m.id, state.node_id, m.vram_gb,
-                    )
+    async def _reconcile_node_status(self, state: _NodeState) -> None:
+        """Lit status() hors lock global puis applique un inventaire atomique."""
+        try:
+            async with state.operation_lock:
+                async with self._lock:
+                    revision = state.inventory_revision
+                node_status = await state.client.status()
+                async with self._lock:
+                    if (
+                        not state.online
+                        or revision != state.inventory_revision
+                    ):
+                        return
+                    state.last_health = node_status.health
+                    self._apply_node_inventory(state, node_status.models)
+                    state.inventory_revision += 1
+        except (NodeUnreachableError, NodeProtocolError) as exc:
+            log.warning(
+                "Réconciliation : status() injoignable sur '%s' : %s — nœud sauté.",
+                state.node_id, exc,
+            )
+            return
+        except Exception as exc:  # défensif : ne jamais bloquer le boot/monitor
+            log.warning(
+                "Réconciliation : erreur inattendue sur '%s' : %s — nœud sauté.",
+                state.node_id, exc,
+            )
+            return
+
+    def _apply_node_inventory(
+        self, state: _NodeState, models: list[ModelStateOnNode]
+    ) -> None:
+        """
+        Réconcilie l'inventaire détaillé d'un nœud sous `_lock`.
+
+        Les doublons sont conservés dans `state.loaded` : leur VRAM reste donc
+        visible et ils sont évictables. Un doublon ne remplace toutefois pas un
+        placement primaire sain sur un autre nœud.
+        """
+        ready: dict[str, tuple[object, str]] = {}
+        for model in models:
+            if model.state != "ready":
+                continue
+            llama_url = self._reconciled_llama_url(state, model.port)
+            if llama_url is not None:
+                ready[model.id] = (model, llama_url)
+
+        for model_id in set(state.loaded) - set(ready):
+            info = state.loaded.pop(model_id)
+            if self._placement.get(model_id) == state.node_id:
+                self._placement.pop(model_id, None)
+            log.warning(
+                "Réconciliation : '%s' a disparu de '%s'%s.",
+                model_id,
+                state.node_id,
+                " pendant une requête active" if info.active_requests else "",
+            )
+
+        for model_id, (model, llama_url) in ready.items():
+            info = state.loaded.get(model_id)
+            if info is None:
+                info = _LoadedInfo(
+                    node_id=state.node_id,
+                    llama_url=llama_url,
+                    internal_api_key="",
+                    vram_gb=model.vram_gb,
+                )
+                state.loaded[model_id] = info
+            else:
+                # Préserver clé, compteurs actifs et LRU d'une entrée connue.
+                info.llama_url = llama_url
+                info.vram_gb = model.vram_gb
+
+            current_node_id = self._placement.get(model_id)
+            current_state = self._nodes.get(current_node_id) if current_node_id else None
+            current_is_healthy = bool(
+                current_state
+                and current_state.online
+                and model_id in current_state.loaded
+                and model_id not in current_state.suspect_models
+            )
+            if (
+                self._registry.get(model_id) is not None
+                and model_id not in state.suspect_models
+                and not current_is_healthy
+            ):
+                self._placement[model_id] = state.node_id
+
+        # Un status READY du control-plane ne prouve pas que le port data-plane
+        # est routable (pare-feu, route, bind). Conserver ces suspects ; un
+        # modèle absent peut en revanche être rechargé sans ambiguïté.
+        state.suspect_models.intersection_update(ready)
 
     @staticmethod
     def _reconciled_llama_url(state: _NodeState, port: int | None) -> str | None:
@@ -285,10 +380,17 @@ class ClusterManager:
         # cas on retombe sur le format host:port utilisé par le backend local.
         if not hostname:
             hostname = state.node_id
-        return f"http://{hostname}:{port}"
+        url_host = f"[{hostname}]" if ":" in hostname else hostname
+        return f"http://{url_host}:{port}"
 
-    async def shutdown(self) -> None:
-        """Arrête le heartbeat et décharge tous les modèles sur tous les nœuds."""
+    async def shutdown(self, *, unload_nodes: bool = False) -> None:
+        """
+        Arrête le heartbeat et ferme les clients.
+
+        Par défaut les llama-server distants restent chauds : un redémarrage
+        gracieux de l'orchestrateur ne doit pas vider tout le cluster. Le mode
+        destructif reste disponible explicitement pour les tests/opérations.
+        """
         if self._monitor_task and not self._monitor_task.done():
             self._monitor_task.cancel()
             try:
@@ -296,13 +398,99 @@ class ClusterManager:
             except asyncio.CancelledError:
                 pass
 
+        if unload_nodes:
+            try:
+                await self.unload_all_models()
+            except RuntimeError as exc:
+                log.warning("Shutdown : unload destructif incomplet : %s", exc)
+
         for node in self._nodes.values():
             try:
-                await node.client.unload_all()
-            except Exception as exc:
-                log.warning("Shutdown : échec unload_all sur '%s' : %s", node.node_id, exc)
-            finally:
                 await node.client.close()
+            except Exception as exc:
+                log.warning("Shutdown : échec close sur '%s' : %s", node.node_id, exc)
+
+    async def unload_all_models(self) -> None:
+        """
+        Décharge explicitement le cluster sans fermer les clients ni le monitor.
+
+        Cette API est destinée à l'action admin destructive. Elle refuse une
+        purge partielle si une requête est encore active.
+        """
+        async with self._lock:
+            if self._unloading_all:
+                raise RuntimeError("Un déchargement global est déjà en cours.")
+            active = [
+                f"{model_id}@{state.node_id}"
+                for state in self._nodes.values()
+                for model_id, info in state.loaded.items()
+                if info.active_requests > 0
+            ]
+            if active:
+                raise RuntimeError(
+                    "Impossible de tout décharger : requêtes actives sur "
+                    + ", ".join(active)
+                )
+            self._unloading_all = True
+
+        try:
+            results = await asyncio.gather(
+                *(self._unload_node_all(state) for state in self._nodes.values())
+            )
+        finally:
+            async with self._lock:
+                self._unloading_all = False
+        failures = [result for result in results if result is not None]
+        if failures:
+            raise RuntimeError(
+                "Unload-all incomplet — " + "; ".join(failures)
+            )
+
+    async def _unload_node_all(self, state: _NodeState) -> str | None:
+        async with state.operation_lock:
+            try:
+                await state.client.unload_all()
+            except Exception as exc:
+                log.warning(
+                    "Unload-all : échec sur '%s' : %s — inventaire conservé.",
+                    state.node_id,
+                    exc,
+                )
+                async with self._lock:
+                    self._record_failure_locked(state, exc)
+                return f"{state.node_id}: {exc}"
+
+            try:
+                health = await state.client.health()
+            except Exception:
+                health = None
+
+            async with self._lock:
+                removed = list(state.loaded)
+                tracked_vram = sum(info.vram_gb for info in state.loaded.values())
+                for model_id in removed:
+                    if self._placement.get(model_id) == state.node_id:
+                        self._placement.pop(model_id, None)
+                state.loaded.clear()
+                state.suspect_models.clear()
+                if health is not None:
+                    state.last_health = health
+                elif state.last_health is not None:
+                    old = state.last_health
+                    state.last_health = old.model_copy(
+                        update={
+                            "used_vram_gb": max(0.0, old.used_vram_gb - tracked_vram),
+                            "available_vram_gb": old.available_vram_gb + tracked_vram,
+                            "loaded_model_ids": [
+                                model_id
+                                for model_id in old.loaded_model_ids
+                                if model_id not in removed
+                            ],
+                            "free_ports": old.free_ports + len(removed),
+                        }
+                    )
+                state.inventory_revision += 1
+            return None
 
     # ── Point d'entrée principal (proxy.py) ───────────────────────────────────
 
@@ -312,7 +500,8 @@ class ClusterManager:
 
         1. Valide que le modèle est dans le registre et activé.
         2. Fast path si déjà chargé.
-        3. Sous lock : placement via scheduler, éviction si nécessaire, chargement.
+        3. Sous locks courts : placement via scheduler et mutations d'état.
+           Les load/unload réseau restent hors du lock global.
         4. Retourne un ClusterModelHandle compatible proxy.py.
         """
         model = self._registry.get(model_id)
@@ -326,147 +515,315 @@ class ClusterManager:
                 f"Activez-le via PATCH /admin/models/{model_id}."
             )
 
-        # Fast path — sous lock (mutation possible : invalidation d'un placement)
-        async with self._lock:
-            node_id = self._placement.get(model_id)
-            if node_id and node_id in self._nodes:
-                node_state = self._nodes[node_id]
-                info = node_state.loaded.get(model_id)
-                if info:
-                    # Failover rapide : ne JAMAIS servir un handle vers un nœud
-                    # offline (crash entre deux heartbeats). On invalide l'entrée
-                    # et on retombe sur un placement frais qui choisira un autre
-                    # nœud online.
-                    if not node_state.online:
-                        node_state.loaded.pop(model_id, None)
-                        self._placement.pop(model_id, None)
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            refresh_state: _NodeState | None = None
+            async with self._lock:
+                if self._unloading_all:
+                    raise RuntimeError("Déchargement global en cours, réessayer.")
+                node_id = self._placement.get(model_id)
+                node_state = self._nodes.get(node_id) if node_id else None
+                info = node_state.loaded.get(model_id) if node_state else None
+                if info and node_state:
+                    if not node_state.online or model_id in node_state.suspect_models:
+                        # On retire uniquement la route primaire : l'inventaire
+                        # reste suivi pour compter/faire évincer la VRAM si le
+                        # nœud revient avec une copie ancienne ou dupliquée.
+                        if self._placement.get(model_id) == node_state.node_id:
+                            self._placement.pop(model_id, None)
                         log.warning(
-                            "Placement de '%s' invalidé : nœud '%s' offline — "
-                            "replacement en cours.",
-                            model_id, node_id,
+                            "Placement de '%s' invalidé sur '%s' — replacement.",
+                            model_id,
+                            node_state.node_id,
                         )
+                    elif info.evicting:
+                        # Cas rarissime : l'éviction a été décidée juste
+                        # avant cette requête. Le lock de modèle de l'éviction
+                        # empêche normalement ce chemin ; refuser un handle
+                        # instable reste plus sûr qu'un 502 en plein stream.
+                        self._placement.pop(model_id, None)
                     elif not info.internal_api_key:
-                        # Entrée réconciliée au démarrage : la clé interne est
-                        # inconnue via status(). On la rafraîchit via un
-                        # load_model() idempotent (already_loaded côté agent) sur
-                        # le MÊME nœud, sans rechargement réel du modèle.
-                        return await self._refresh_reconciled(node_state, model)
+                        refresh_state = node_state
                     else:
                         info.touch()
-                        return ClusterModelHandle(info, model)
+                        return ClusterModelHandle(info, model, self)
 
-            # Placement fresh
+            if refresh_state is not None:
+                refreshed = await self._refresh_reconciled(refresh_state, model)
+                if refreshed is not None:
+                    return refreshed
+
             return await self._place_and_load(model)
 
     async def _place_and_load(self, model: ModelDefinition) -> ClusterModelHandle:
-        """Placement + chargement — DOIT être appelé sous self._lock."""
-        nodes_snapshot = [
-            state.snapshot(self._failures_threshold)
-            for state in self._nodes.values()
-        ]
+        """Placement + chargement avec failover, sans I/O sous le lock global."""
+        failed_nodes: set[str] = set()
+        failures: list[str] = []
+        suspect_exclusions: set[str] = set()
 
-        model_to_place = ModelToPlace(id=model.id, vram_gb=model.vram_gb)
-        try:
-            chosen_snapshot, eviction_plan = pick_node(model_to_place, nodes_snapshot)
-        except NoPlacementError as exc:
-            raise RuntimeError(str(exc)) from exc
-
-        chosen_state = self._nodes[chosen_snapshot.node_id]
-
-        # Appliquer le plan d'éviction
-        for mid_to_evict in eviction_plan.models_to_evict:
-            await self._do_unload(chosen_state, mid_to_evict)
-
-        # Charger le modèle sur le nœud choisi
-        try:
-            resp = await chosen_state.client.load_model(model.to_dict())
-        except (NodeUnreachableError, NodeProtocolError) as exc:
-            # Marquer le nœud comme suspicieux mais ne pas le passer offline ici
-            # — le heartbeat s'en chargera. Remonter l'erreur au caller.
-            raise RuntimeError(
-                f"Échec du chargement de '{model.id}' sur '{chosen_state.node_id}' : {exc}"
-            ) from exc
-
-        info = _LoadedInfo(
-            node_id=chosen_state.node_id,
-            llama_url=resp.llama_url,
-            internal_api_key=resp.internal_api_key,
-            vram_gb=model.vram_gb,
-        )
-        chosen_state.loaded[model.id] = info
-        self._placement[model.id] = chosen_state.node_id
-
-        # Mettre à jour used_vram dans le NodeHealth local pour que le prochain
-        # snapshot soit correct AVANT le prochain heartbeat.
-        if chosen_state.last_health is not None:
-            h = chosen_state.last_health
-            chosen_state.last_health = h.model_copy(
-                update={
-                    "used_vram_gb": h.used_vram_gb + model.vram_gb,
-                    "available_vram_gb": max(0.0, h.available_vram_gb - model.vram_gb),
-                    "loaded_model_ids": h.loaded_model_ids + [model.id],
-                    "free_ports": max(0, h.free_ports - 1),
-                }
+        async with self._lock:
+            suspects = {
+                state.node_id
+                for state in self._nodes.values()
+                if model.id in state.suspect_models
+            }
+            healthy_alternative = any(
+                state.online and state.node_id not in suspects
+                for state in self._nodes.values()
             )
+            if healthy_alternative:
+                suspect_exclusions.update(suspects)
+                failed_nodes.update(suspect_exclusions)
 
-        log.info(
-            "Modèle '%s' chargé sur nœud '%s' (%.1f GB VRAM, url=%s)",
-            model.id, chosen_state.node_id, model.vram_gb, resp.llama_url,
+        while True:
+            async with self._lock:
+                try:
+                    chosen_snapshot, _ = self._pick_locked(model, failed_nodes)
+                except NoPlacementError as exc:
+                    if suspect_exclusions:
+                        # Les nœuds sains ont la priorité, mais un suspect ne
+                        # doit pas être banni si les alternatives n'ont pas la
+                        # capacité. Le load idempotent sert alors de tentative
+                        # explicite de récupération.
+                        failed_nodes.difference_update(suspect_exclusions)
+                        suspect_exclusions.clear()
+                        continue
+                    if failures:
+                        detail = "; ".join(failures)
+                        raise RuntimeError(
+                            f"Échec du chargement de '{model.id}' sur tous les "
+                            f"nœuds candidats : {detail}"
+                        ) from exc
+                    raise RuntimeError(str(exc)) from exc
+                chosen_state = self._nodes[chosen_snapshot.node_id]
+
+            # Ne jamais attendre le lock d'un nœud en conservant le lock global.
+            async with chosen_state.operation_lock:
+                async with self._lock:
+                    # La capacité peut avoir changé pendant l'attente : recalcul
+                    # atomique. Si le best-fit a changé, on libère ce nœud et
+                    # recommence plutôt que d'appliquer un plan obsolète.
+                    try:
+                        current_choice, eviction_plan = self._pick_locked(
+                            model, failed_nodes
+                        )
+                    except NoPlacementError as exc:
+                        if suspect_exclusions:
+                            failed_nodes.difference_update(suspect_exclusions)
+                            suspect_exclusions.clear()
+                            continue
+                        if failures:
+                            raise RuntimeError("; ".join(failures)) from exc
+                        raise RuntimeError(str(exc)) from exc
+                    if current_choice.node_id != chosen_state.node_id:
+                        continue
+
+                    evictions: list[tuple[str, _LoadedInfo]] = []
+                    stale_plan = False
+                    for model_id in eviction_plan.models_to_evict:
+                        info = chosen_state.loaded.get(model_id)
+                        if info is None or info.active_requests > 0 or info.evicting:
+                            stale_plan = True
+                            break
+                        info.evicting = True
+                        evictions.append((model_id, info))
+                    if stale_plan:
+                        for _, info in evictions:
+                            info.evicting = False
+                        continue
+
+                eviction_failed = False
+                for model_id, info in evictions:
+                    if not await self._do_unload(chosen_state, model_id, info):
+                        eviction_failed = True
+                        break
+                if eviction_failed:
+                    async with self._lock:
+                        for _, info in evictions:
+                            info.evicting = False
+                    failed_nodes.add(chosen_state.node_id)
+                    failures.append(
+                        f"{chosen_state.node_id}: éviction non confirmée"
+                    )
+                    continue
+
+                try:
+                    resp = await chosen_state.client.load_model(model.to_dict())
+                    if resp.model_id != model.id:
+                        raise NodeProtocolError(
+                            f"réponse load incohérente : demandé '{model.id}', "
+                            f"reçu '{resp.model_id}'"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    async with self._lock:
+                        self._record_failure_locked(chosen_state, exc)
+                    failed_nodes.add(chosen_state.node_id)
+                    failures.append(f"{chosen_state.node_id}: {exc}")
+                    log.warning(
+                        "Chargement de '%s' échoué sur '%s' (%s) — failover.",
+                        model.id,
+                        chosen_state.node_id,
+                        exc,
+                    )
+                    continue
+
+                info = _LoadedInfo(
+                    node_id=chosen_state.node_id,
+                    llama_url=resp.llama_url,
+                    internal_api_key=resp.internal_api_key,
+                    vram_gb=model.vram_gb,
+                )
+                async with self._lock:
+                    if self._unloading_all:
+                        raise RuntimeError(
+                            "Déchargement global en cours, chargement annulé."
+                        )
+                    chosen_state.loaded[model.id] = info
+                    chosen_state.suspect_models.discard(model.id)
+                    self._placement[model.id] = chosen_state.node_id
+                    self._account_load_locked(
+                        chosen_state, model, already_loaded=resp.already_loaded
+                    )
+                    chosen_state.inventory_revision += 1
+
+                log.info(
+                    "Modèle '%s' chargé sur nœud '%s' (%.1f GB VRAM, url=%s)",
+                    model.id, chosen_state.node_id, model.vram_gb, resp.llama_url,
+                )
+                return ClusterModelHandle(info, model, self)
+
+    def _pick_locked(
+        self, model: ModelDefinition, excluded_nodes: set[str]
+    ) -> tuple[NodeSnapshot, EvictionPlan]:
+        if self._unloading_all:
+            raise RuntimeError("Déchargement global en cours, réessayer.")
+        snapshots = [
+            state.snapshot()
+            for state in self._nodes.values()
+            if state.node_id not in excluded_nodes
+        ]
+        return pick_node(
+            ModelToPlace(id=model.id, vram_gb=model.vram_gb), snapshots
         )
-        return ClusterModelHandle(info, model)
+
+    def _account_load_locked(
+        self,
+        node_state: _NodeState,
+        model: ModelDefinition,
+        *,
+        already_loaded: bool,
+    ) -> None:
+        if node_state.last_health is None:
+            return
+        health = node_state.last_health
+        loaded_ids = list(dict.fromkeys([*health.loaded_model_ids, model.id]))
+        used_delta = 0.0 if already_loaded else model.vram_gb
+        port_delta = 0 if already_loaded else 1
+        node_state.last_health = health.model_copy(
+            update={
+                "used_vram_gb": health.used_vram_gb + used_delta,
+                "available_vram_gb": max(
+                    0.0, health.available_vram_gb - used_delta
+                ),
+                "loaded_model_ids": loaded_ids,
+                "free_ports": max(0, health.free_ports - port_delta),
+            }
+        )
 
     async def _refresh_reconciled(
         self, node_state: _NodeState, model: ModelDefinition
-    ) -> ClusterModelHandle:
+    ) -> ClusterModelHandle | None:
         """
         Rafraîchit une entrée réconciliée (internal_api_key vide) sur SON nœud.
-        Appelé sous _lock. load_model est idempotent côté agent (already_loaded)
+        load_model est idempotent côté agent (already_loaded)
         donc le modèle n'est PAS réellement rechargé — on récupère juste la vraie
         clé interne + l'URL de confiance. En cas d'échec, on invalide l'entrée et
         on retombe sur un placement frais sur un autre nœud.
         """
-        try:
-            resp = await node_state.client.load_model(model.to_dict())
-        except (NodeUnreachableError, NodeProtocolError) as exc:
-            log.warning(
-                "Rafraîchissement de '%s' sur '%s' échoué (%s) — replacement.",
-                model.id, node_state.node_id, exc,
-            )
-            node_state.loaded.pop(model.id, None)
-            self._placement.pop(model.id, None)
-            return await self._place_and_load(model)
+        async with node_state.operation_lock:
+            try:
+                resp = await node_state.client.load_model(model.to_dict())
+                if resp.model_id != model.id:
+                    raise NodeProtocolError(
+                        f"réponse load incohérente pour '{model.id}'"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                async with self._lock:
+                    self._record_failure_locked(node_state, exc)
+                    if self._placement.get(model.id) == node_state.node_id:
+                        self._placement.pop(model.id, None)
+                log.warning(
+                    "Rafraîchissement de '%s' sur '%s' échoué (%s) — replacement.",
+                    model.id, node_state.node_id, exc,
+                )
+                return None
 
-        info = node_state.loaded.get(model.id)
-        if info is None:
-            info = _LoadedInfo(
-                node_id=node_state.node_id,
-                llama_url=resp.llama_url,
-                internal_api_key=resp.internal_api_key,
-                vram_gb=model.vram_gb,
-            )
-            node_state.loaded[model.id] = info
-        else:
-            info.llama_url = resp.llama_url
-            info.internal_api_key = resp.internal_api_key
-        self._placement[model.id] = node_state.node_id
-        info.touch()
-        return ClusterModelHandle(info, model)
+            async with self._lock:
+                if self._unloading_all:
+                    raise RuntimeError(
+                        "Déchargement global en cours, rafraîchissement annulé."
+                    )
+                info = node_state.loaded.get(model.id)
+                if info is None:
+                    info = _LoadedInfo(
+                        node_id=node_state.node_id,
+                        llama_url=resp.llama_url,
+                        internal_api_key=resp.internal_api_key,
+                        vram_gb=model.vram_gb,
+                    )
+                    node_state.loaded[model.id] = info
+                else:
+                    info.llama_url = resp.llama_url
+                    info.internal_api_key = resp.internal_api_key
+                node_state.suspect_models.discard(model.id)
+                self._placement[model.id] = node_state.node_id
+                node_state.inventory_revision += 1
+                info.touch()
+                return ClusterModelHandle(info, model, self)
 
     # ── Déchargement ──────────────────────────────────────────────────────────
 
     async def unload_model(self, model_id: str) -> None:
         """Force le déchargement d'un modèle (action admin)."""
-        async with self._lock:
-            node_id = self._placement.get(model_id)
-            if node_id is None:
-                return  # Déjà déchargé
-            node_state = self._nodes.get(node_id)
+        model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
+        async with model_lock:
+            async with self._lock:
+                node_id = self._placement.get(model_id)
+                node_state = self._nodes.get(node_id) if node_id else None
             if node_state is None:
                 return
-            await self._do_unload(node_state, model_id)
 
-    async def _do_unload(self, node_state: _NodeState, model_id: str) -> None:
-        """Décharge un modèle sur un nœud précis. Appelé sous _lock."""
+            async with node_state.operation_lock:
+                async with self._lock:
+                    info = node_state.loaded.get(model_id)
+                    if info is None:
+                        if self._placement.get(model_id) == node_state.node_id:
+                            self._placement.pop(model_id, None)
+                        return
+                    if info.active_requests > 0:
+                        raise RuntimeError(
+                            f"Le modèle '{model_id}' traite encore "
+                            f"{info.active_requests} requête(s) et ne peut pas être déchargé."
+                        )
+                    info.evicting = True
+                await self._do_unload(node_state, model_id, info)
+
+    async def _do_unload(
+        self,
+        node_state: _NodeState,
+        model_id: str,
+        expected_info: _LoadedInfo,
+    ) -> bool:
+        """
+        Décharge un modèle, sans lock global pendant l'I/O.
+
+        Le caller sérialise avec `node_state.operation_lock`. Retourne True
+        uniquement si la disparition est confirmée par unload ou health.
+        """
         try:
             resp = await node_state.client.unload_model(model_id)
         except (NodeUnreachableError, NodeProtocolError) as exc:
@@ -480,32 +837,66 @@ class ClusterManager:
                 "Impossible de décharger '%s' de '%s' : %s — re-synchronisation health().",
                 model_id, node_state.node_id, exc,
             )
-            await self._resync_after_failed_unload(node_state, model_id)
-            return
+            return await self._resync_after_failed_unload(
+                node_state, model_id, expected_info
+            )
+        except asyncio.CancelledError:
+            async with self._lock:
+                expected_info.evicting = False
+            raise
+        except Exception as exc:
+            log.warning(
+                "Impossible de décharger '%s' de '%s' : erreur inattendue %s.",
+                model_id,
+                node_state.node_id,
+                exc,
+            )
+            async with self._lock:
+                expected_info.evicting = False
+                self._record_failure_locked(node_state, exc)
+            return False
 
         log.info(
             "Modèle '%s' déchargé de '%s' (libéré %.1f GB VRAM)",
             model_id, node_state.node_id, resp.freed_vram_gb,
         )
 
-        # Succès confirmé : purge de l'état local + comptabilité VRAM.
-        info = node_state.loaded.pop(model_id, None)
-        self._placement.pop(model_id, None)
+        async with self._lock:
+            # Ne jamais purger une entrée plus récente créée par une autre
+            # réconciliation (comparaison d'identité).
+            if node_state.loaded.get(model_id) is expected_info:
+                node_state.loaded.pop(model_id, None)
+            expected_info.evicting = False
+            if self._placement.get(model_id) == node_state.node_id:
+                self._placement.pop(model_id, None)
 
-        if info and node_state.last_health is not None:
-            h = node_state.last_health
-            node_state.last_health = h.model_copy(
-                update={
-                    "used_vram_gb": max(0.0, h.used_vram_gb - info.vram_gb),
-                    "available_vram_gb": h.available_vram_gb + info.vram_gb,
-                    "loaded_model_ids": [m for m in h.loaded_model_ids if m != model_id],
-                    "free_ports": h.free_ports + 1,
-                }
-            )
+            if node_state.last_health is not None:
+                health = node_state.last_health
+                node_state.last_health = health.model_copy(
+                    update={
+                        "used_vram_gb": max(
+                            0.0, health.used_vram_gb - expected_info.vram_gb
+                        ),
+                        "available_vram_gb": (
+                            health.available_vram_gb + expected_info.vram_gb
+                        ),
+                        "loaded_model_ids": [
+                            item
+                            for item in health.loaded_model_ids
+                            if item != model_id
+                        ],
+                        "free_ports": health.free_ports + 1,
+                    }
+                )
+            node_state.inventory_revision += 1
+        return True
 
     async def _resync_after_failed_unload(
-        self, node_state: _NodeState, model_id: str
-    ) -> None:
+        self,
+        node_state: _NodeState,
+        model_id: str,
+        expected_info: _LoadedInfo,
+    ) -> bool:
         """
         Après un unload_model en échec, re-synchronise l'état local via health().
         On ne purge l'entrée locale QUE si le nœud confirme que le modèle n'est
@@ -523,23 +914,33 @@ class ClusterManager:
                 "Re-sync '%s' sur '%s' : health() KO (%s) — entrée conservée (VRAM occupée).",
                 model_id, node_state.node_id, exc,
             )
-            return
+            async with self._lock:
+                expected_info.evicting = False
+                self._record_failure_locked(node_state, exc)
+            return False
 
-        node_state.last_health = health
-        if model_id not in health.loaded_model_ids:
-            # Le nœud confirme que le modèle est parti : purge sûre.
-            node_state.loaded.pop(model_id, None)
-            self._placement.pop(model_id, None)
-            log.info(
-                "Re-sync '%s' sur '%s' : modèle absent côté nœud — état local purgé.",
-                model_id, node_state.node_id,
-            )
-        else:
-            log.warning(
-                "Re-sync '%s' sur '%s' : modèle TOUJOURS chargé côté nœud — "
-                "entrée conservée (VRAM occupée).",
-                model_id, node_state.node_id,
-            )
+        async with self._lock:
+            node_state.last_health = health
+            expected_info.evicting = False
+            if model_id not in health.loaded_model_ids:
+                # Le nœud confirme que le modèle est parti : purge sûre.
+                if node_state.loaded.get(model_id) is expected_info:
+                    node_state.loaded.pop(model_id, None)
+                if self._placement.get(model_id) == node_state.node_id:
+                    self._placement.pop(model_id, None)
+                node_state.inventory_revision += 1
+                log.info(
+                    "Re-sync '%s' sur '%s' : modèle absent côté nœud — état local purgé.",
+                    model_id, node_state.node_id,
+                )
+                return True
+
+        log.warning(
+            "Re-sync '%s' sur '%s' : modèle TOUJOURS chargé côté nœud — "
+            "entrée conservée (VRAM occupée).",
+            model_id, node_state.node_id,
+        )
+        return False
 
     # ── Heartbeat ─────────────────────────────────────────────────────────────
 
@@ -561,18 +962,15 @@ class ClusterManager:
         try:
             health = await state.client.health()
         except NodeUnreachableError as exc:
-            state.consecutive_failures += 1
-            if state.online and state.consecutive_failures >= self._failures_threshold:
-                state.online = False
-                log.warning(
-                    "Nœud '%s' marqué OFFLINE après %d échecs consécutifs (%s). "
-                    "Les modèles chargés sur ce nœud sont indisponibles.",
-                    state.node_id, state.consecutive_failures, exc,
-                )
+            async with self._lock:
+                self._record_failure_locked(state, exc)
             return
         except NodeProtocolError as exc:
             log.warning("Nœud '%s' heartbeat KO (protocol) : %s", state.node_id, exc)
-            state.consecutive_failures += 1
+            async with self._lock:
+                # Une réponse malformée/5xx persistante est aussi une panne :
+                # elle doit appliquer exactement le même seuil qu'un timeout.
+                self._record_failure_locked(state, exc)
             return
         except Exception as exc:
             # Toute autre exception (bug client, erreur inattendue) doit COMPTER
@@ -583,24 +981,95 @@ class ClusterManager:
                 "Nœud '%s' heartbeat : exception inattendue (%s) : %s",
                 state.node_id, exc.__class__.__name__, exc,
             )
-            state.consecutive_failures += 1
-            if state.online and state.consecutive_failures >= self._failures_threshold:
-                state.online = False
-                log.warning(
-                    "Nœud '%s' marqué OFFLINE après %d échecs consécutifs.",
-                    state.node_id, state.consecutive_failures,
-                )
+            async with self._lock:
+                self._record_failure_locked(state, exc)
             return
 
         # Succès
-        if not state.online:
+        needs_status = False
+        async with self._lock:
+            was_offline = not state.online
+            previous_failures = state.consecutive_failures
+            state.online = True
+            state.consecutive_failures = 0
+            state.last_health = health
+
+            # Ne pas interpréter l'inventaire transitoire pendant un load/unload
+            # sérialisé. Le prochain heartbeat fera la convergence.
+            if not state.operation_lock.locked():
+                reported = set(health.loaded_model_ids)
+                local = set(state.loaded)
+                for model_id in local - reported:
+                    info = state.loaded.pop(model_id)
+                    if self._placement.get(model_id) == state.node_id:
+                        self._placement.pop(model_id, None)
+                    log.warning(
+                        "Heartbeat : '%s' a disparu de '%s'%s — placement invalidé.",
+                        model_id,
+                        state.node_id,
+                        " pendant une requête active" if info.active_requests else "",
+                    )
+                    state.inventory_revision += 1
+                needs_status = bool(
+                    was_offline
+                    or (reported - set(state.loaded))
+                    or (state.suspect_models & reported)
+                )
+
+        if was_offline:
             log.info(
                 "Nœud '%s' revient ONLINE (était offline depuis %d échecs).",
-                state.node_id, state.consecutive_failures,
+                state.node_id,
+                previous_failures,
             )
-        state.online = True
-        state.consecutive_failures = 0
-        state.last_health = health
+        if needs_status:
+            await self._reconcile_node_status(state)
+
+    def _record_failure_locked(self, state: _NodeState, exc: Exception) -> None:
+        """Comptabilise uniformément toute panne de plan de contrôle."""
+        state.consecutive_failures += 1
+        if state.online and state.consecutive_failures >= self._failures_threshold:
+            state.online = False
+            log.warning(
+                "Nœud '%s' marqué OFFLINE après %d échecs consécutifs (%s). "
+                "Les modèles chargés sur ce nœud sont indisponibles.",
+                state.node_id,
+                state.consecutive_failures,
+                exc,
+            )
+
+    async def _report_backend_failure(self, info: _LoadedInfo) -> None:
+        """Invalide prudemment un placement data-plane encore courant."""
+        async with self._lock:
+            state = self._nodes.get(info.node_id)
+            if state is None:
+                return
+            model_id = self._model_id_for_info(state, info)
+            if model_id is None or state.loaded.get(model_id) is not info:
+                return
+            if self._placement.get(model_id) != state.node_id:
+                return
+            self._placement.pop(model_id, None)
+            state.suspect_models.add(model_id)
+            state.inventory_revision += 1
+            log.warning(
+                "Data-plane : placement de '%s' sur '%s' invalidé immédiatement.",
+                model_id,
+                state.node_id,
+            )
+
+    @staticmethod
+    def _model_id_for_info(
+        state: _NodeState, expected_info: _LoadedInfo
+    ) -> str | None:
+        return next(
+            (
+                model_id
+                for model_id, info in state.loaded.items()
+                if info is expected_info
+            ),
+            None,
+        )
 
     # ── Statut (admin) ────────────────────────────────────────────────────────
 
@@ -675,22 +1144,29 @@ class ClusterManager:
         """
         Retourne l'état agrégé pour /admin/status — même format que LocalModelManager.
         """
-        # Reconstruction du VRAM global (agrégé sur tous les nœuds)
-        total_gb = sum(
-            s.last_health.total_vram_gb for s in self._nodes.values()
-            if s.last_health
-        )
+        # Seuls les nœuds ONLINE contribuent à la readiness/capacité. Le
+        # total effectif est used + available annoncé (après overhead/marge),
+        # pas la VRAM physique brute.
         used_gb = sum(
             s.last_health.used_vram_gb for s in self._nodes.values()
-            if s.last_health
+            if s.online and s.last_health
         )
+        available_gb = sum(
+            s.last_health.available_vram_gb for s in self._nodes.values()
+            if s.online and s.last_health
+        )
+        total_gb = used_gb + available_gb
 
         models_status = []
         for model in self._registry.list_all():
             node_id = self._placement.get(model.id)
             if node_id and node_id in self._nodes:
                 state = self._nodes[node_id]
-                info = state.loaded.get(model.id)
+                info = (
+                    state.loaded.get(model.id)
+                    if state.online and model.id not in state.suspect_models
+                    else None
+                )
             else:
                 info = None
                 node_id = None
@@ -737,7 +1213,7 @@ class ClusterManager:
             "vram_budget": {
                 "total_gb": round(total_gb, 2),
                 "used_gb": round(used_gb, 2),
-                "available_gb": round(max(0.0, total_gb - used_gb), 2),
+                "available_gb": round(max(0.0, available_gb), 2),
                 "nodes": len(self._nodes),
                 "nodes_online": sum(1 for s in self._nodes.values() if s.online),
             },

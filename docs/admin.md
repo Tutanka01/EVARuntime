@@ -1,4 +1,4 @@
-# Guide administrateur — Cluster EVA Inference Gateway
+# Guide administrateur — EVARuntime
 
 Ce document s'adresse à l'administrateur du gateway : gestion des utilisateurs,
 des clés API, du registre des modèles, surveillance du système et reporting d'usage.
@@ -23,6 +23,23 @@ Trois interfaces sont disponibles :
 ---
 
 ## 1. Accès administrateur
+
+### Identifier le parcours déployé
+
+```bash
+sudo awk -F= '$1 == "CLUSTER_MODE" {print $2}' /etc/llm-gateway/env
+systemctl cat llm-gateway | grep '^Description='
+curl -fsS http://127.0.0.1:8000/ready | python3 -m json.tool
+```
+
+- `local` : le service utilise le profil systemd GPU et lance `llama-server`
+  sur cet hôte.
+- `cluster` : le service utilise le profil orchestrateur sans GPU; les agents,
+  leurs ports et leurs mises à jour sont administrés sur chaque nœud.
+
+Ne modifiez pas `CLUSTER_MODE` avec `sed` pour migrer. Utilisez
+`gateway/deploy/update.sh --mode <cible> --allow-mode-change`, qui valide le
+profil, choisit l'unité correspondante et sait restaurer le mode précédent.
 
 ### Via CLI (sur le serveur)
 
@@ -598,11 +615,16 @@ nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
 ### Décharger tous les modèles
 
 ```bash
-# Décharger tous les modèles chargés (libère toute la VRAM)
+# Décharger tous les modèles chargés sans arrêter la gateway
 curl -s -X POST "$GW/admin/unload" \
   -H "Authorization: Bearer $ADMIN_SECRET"
-# → {"message": "Tous les modèles déchargés. GPU libéré."}
+# → {"message": "Tous les modèles déchargés. VRAM entièrement libérée."}
 ```
+
+En cluster, l'orchestrateur conserve ses clients et son heartbeat après cette
+action : il peut recharger un modèle à la requête suivante. La route répond 409
+si une génération est encore active, ou 503 si un agent n'a pas confirmé le
+déchargement; elle n'annonce jamais une libération partielle comme réussie.
 
 ### Activer / désactiver un modèle du registre
 
@@ -828,7 +850,8 @@ curl -s -X DELETE "$GW/admin/models/qwen2.5-32b-instruct" \
 ### Redémarrer le service
 
 ```bash
-# Arrêt propre : décharge tous les modèles avant d'arrêter
+# En local : arrêt propre et déchargement des modèles.
+# En cluster : arrêt de l'orchestrateur, modèles distants conservés chauds.
 sudo systemctl restart llm-gateway
 
 # Vérifier le redémarrage
@@ -1047,7 +1070,7 @@ echo "Nouveau ADMIN_SECRET : $NEW_SECRET"
 sqlite3 /var/lib/llm-gateway/gateway.db ".backup '/backup/gateway-$(date +%Y%m%d).db'"
 
 # Sauvegarder aussi le registre des modèles
-cp /etc/llm-gateway/models.yaml "/backup/models-$(date +%Y%m%d).yaml"
+cp /var/lib/llm-gateway/models.yaml "/backup/models-$(date +%Y%m%d).yaml"
 
 # Sauvegarde automatique quotidienne (cron)
 echo "0 3 * * * llmservice sqlite3 /var/lib/llm-gateway/gateway.db \

@@ -461,21 +461,24 @@ class LocalModelManager:
             return
         await manager.unload(reason="admin request")
 
-    async def shutdown(self) -> None:
-        # Arrêter la tâche de réconciliation VRAM en premier (best-effort).
-        await self._stop_vram_reconcile()
-
+    async def unload_all_models(self) -> None:
+        """Décharge tous les modèles sans arrêter les tâches de la gateway."""
         # Drain borné : attendre que les requêtes actives (modèles pinnés) se
         # terminent avant de tuer leurs llama-server. RETOUR IMMÉDIAT si aucun
-        # modèle n'est pinné (cas des tests → aucun ralentissement du lifespan).
+        # modèle n'est pinné.
         await self._drain_pinned(settings.shutdown_drain_timeout_seconds)
 
         model_ids = list(self._managers.keys())
-        log.info("Shutdown : déchargement de %d modèle(s)…", len(model_ids))
+        log.info("Déchargement global : %d modèle(s)…", len(model_ids))
         for model_id in model_ids:
             manager = self._managers.get(model_id)
             if manager:
-                await manager.unload(reason="shutdown")
+                await manager.unload(reason="admin unload all")
+
+    async def shutdown(self) -> None:
+        # Arrêter la tâche de réconciliation VRAM en premier (best-effort).
+        await self._stop_vram_reconcile()
+        await self.unload_all_models()
 
     async def _drain_pinned(self, timeout: float) -> None:
         """
@@ -734,10 +737,11 @@ def _build_manager():
     # ── Mode cluster ──────────────────────────────────────────────────────────
     log.info("Mode CLUSTER_MODE=cluster — gateway multi-nœuds.")
 
-    if settings.agent_secret_is_placeholder():
+    if settings.agent_secret_is_placeholder() or len(settings.agent_secret) < 32:
         raise RuntimeError(
-            "CLUSTER_MODE=cluster mais AGENT_SECRET est vide ou laissé à sa "
-            "valeur d'exemple. Définissez un secret fort partagé avec tous les "
+            "CLUSTER_MODE=cluster mais AGENT_SECRET est vide, trop court ou "
+            "laissé à sa valeur d'exemple. Définissez un secret d'au moins "
+            "32 caractères partagé avec tous les "
             "agents : python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
         )
 
