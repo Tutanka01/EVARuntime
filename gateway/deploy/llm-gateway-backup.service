@@ -1,6 +1,6 @@
 [Unit]
 Description=Sauvegarde de la base SQLite de la LLM Gateway UPPA
-Documentation=https://github.com/uppa/llm-gateway
+Documentation=https://github.com/Tutanka01/EVARuntime
 # Ne pas lancer si le disque n'est pas monté / réseau requis : la DB est locale.
 After=local-fs.target
 

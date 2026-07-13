@@ -1,6 +1,6 @@
 [Unit]
 Description=LLM Inference Gateway UPPA (FastAPI)
-Documentation=https://github.com/uppa/llm-gateway
+Documentation=https://github.com/Tutanka01/EVARuntime
 After=network.target
 Wants=network.target
 

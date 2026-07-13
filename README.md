@@ -80,20 +80,48 @@ docs/                    Architecture, API, admin and deployment guides
 
 Prerequisites:
 
-- Linux server with an NVIDIA GPU.
-- `llama.cpp` built with CUDA support.
-- One or more local GGUF models.
+- Local mode: a Linux server with NVIDIA GPU, CUDA `llama.cpp` and local GGUFs.
+- Cluster mode: a Linux orchestrator (GPU optional) plus separately installed
+  GPU node-agents with CUDA `llama.cpp` and identical model paths.
 - Python 3.11+.
 
-Install the main gateway:
+EVARuntime has two explicit deployment paths. The single-node product remains
+the safe default; the multi-node control plane is an optional second product:
+
+| Path | Gateway host | GPU execution | Command |
+| --- | --- | --- | --- |
+| Local (default) | Gateway + `llama-server` | On the gateway host | `install.sh --mode local` |
+| Cluster (opt-in) | Orchestrator only | On separately installed node-agents | `install.sh --mode cluster` |
+
+Install the local single-node gateway:
 
 ```bash
-git clone https://github.com/your-org/EVARuntime.git
+git clone https://github.com/Tutanka01/EVARuntime.git
 cd EVARuntime
-sudo bash gateway/deploy/install.sh
+sudo bash gateway/deploy/install.sh --mode local
 ```
 
-The installer creates the service user, Python virtual environment, systemd unit, nginx site and runtime configuration. Review the generated environment file before exposing the service.
+Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
+multi-node orchestrator, inspect the plan first, then install explicitly:
+
+```bash
+bash gateway/deploy/install.sh --mode cluster --dry-run
+sudo bash gateway/deploy/install.sh --mode cluster
+```
+
+The installer never replaces an existing `env`, `models.yaml`, `nodes.yaml` or
+secret. A local↔cluster migration requires both an explicit target mode and
+`--allow-mode-change`. Updates preserve the installed mode when `--mode` is
+omitted:
+
+```bash
+sudo bash gateway/deploy/update.sh                 # auto-detect and preserve
+sudo bash gateway/deploy/update.sh --mode cluster  # explicit cluster update
+```
+
+Cluster agents are installed and updated on each GPU node; the orchestrator
+does not update them remotely. See the [deployment guide](docs/deployment.md)
+for TLS, ports, shared model paths, migration and rollback.
 
 ## API Example
 

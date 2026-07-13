@@ -61,6 +61,47 @@ logging.config.dictConfig({
 log = logging.getLogger(__name__)
 
 
+# ── Validation du runtime d'inférence ─────────────────────────────────────────
+
+async def _validate_inference_runtime(enabled_models) -> None:
+    """
+    Valide les artefacts qui exécutent réellement l'inférence sur CET hôte.
+
+    En mode local, la gateway possède le binaire llama-server et les GGUF : elle
+    applique donc les garde-fous de version et d'intégrité avant d'accepter du
+    trafic. En mode cluster, l'orchestrateur ne doit pas exiger que ces fichiers
+    existent localement : chaque node-agent applique les mêmes contrôles au
+    chargement, sur le nœud qui possède effectivement le binaire et les modèles.
+    """
+    if settings.cluster_mode == "cluster":
+        log.info(
+            "Mode cluster : validation llama-server/GGUF déléguée aux node-agents."
+        )
+        return
+
+    ok = await enforce_llama_min_build(
+        settings.llama_server_bin, settings.llama_server_min_build
+    )
+    if not ok:
+        raise RuntimeError(
+            "llama-server ne satisfait pas LLAMA_SERVER_MIN_BUILD — "
+            "démarrage refusé (binaire potentiellement vulnérable)."
+        )
+
+    for model in enabled_models:
+        if model.sha256 is None:
+            continue
+        try:
+            model.verify_integrity()
+            log.info("Intégrité SHA-256 vérifiée : %s", model.id)
+        except IntegrityError as exc:
+            log.critical("Intégrité GGUF compromise : %s", exc)
+            raise RuntimeError(
+                f"Vérification d'intégrité échouée pour '{model.id}' — "
+                "démarrage refusé."
+            ) from exc
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -74,7 +115,7 @@ async def lifespan(app: FastAPI):
             "ADMIN_SECRET non configuré (vide ou CHANGE_ME_*) — les routes /admin "
             "sont DÉSACTIVÉES tant qu'un secret fort n'est pas défini."
         )
-    if settings.internal_api_key_is_placeholder():
+    if settings.cluster_mode == "local" and settings.internal_api_key_is_placeholder():
         log.critical(
             "INTERNAL_API_KEY non configurée (vide ou CHANGE_ME_*) — la clé "
             "gateway ↔ llama-server est prévisible. Définissez un secret fort."
@@ -95,51 +136,37 @@ async def lifespan(app: FastAPI):
             status, model.id, model.vram_gb, model.path,
         )
 
-    budget = settings.effective_vram_budget_gb()
-    log.info(
-        "Budget VRAM : %.1f GB total — %.1f GB overhead — %.0f%% marge → %.1f GB net disponible",
-        settings.total_vram_gb,
-        settings.vram_overhead_gb,
-        settings.vram_safety_margin * 100,
-        budget,
-    )
-    log.info(
-        "Pool de ports : %d-%d (%d modèles max simultanés)",
-        settings.base_llama_port,
-        settings.base_llama_port + settings.max_loaded_models - 1,
-        settings.max_loaded_models,
-    )
-    log.info("Idle timeout  : %ds", settings.idle_timeout_seconds)
+    if settings.cluster_mode == "local":
+        budget = settings.effective_vram_budget_gb()
+        log.info(
+            "Budget VRAM : %.1f GB total — %.1f GB overhead — %.0f%% marge "
+            "→ %.1f GB net disponible",
+            settings.total_vram_gb,
+            settings.vram_overhead_gb,
+            settings.vram_safety_margin * 100,
+            budget,
+        )
+        log.info(
+            "Pool de ports : %d-%d (%d modèles max simultanés)",
+            settings.base_llama_port,
+            settings.base_llama_port + settings.max_loaded_models - 1,
+            settings.max_loaded_models,
+        )
+        log.info("Idle timeout  : %ds", settings.idle_timeout_seconds)
+    else:
+        log.info(
+            "Capacité cluster : budgets VRAM et ports lus dynamiquement depuis "
+            "les node-agents; les paramètres GPU locaux sont ignorés."
+        )
 
     # ── Garde-fou supply-chain : version du binaire llama-server ──────────────
     # NON FATAL par défaut : en test/CI il n'y a aucun binaire llama-server réel,
     # donc la sonde se contente d'un avertissement et le démarrage continue. Le
     # seul cas de refus est un enforcement EXPLICITE (LLAMA_SERVER_MIN_BUILD > 0)
     # avec un build lu strictement inférieur au minimum patché.
-    ok = await enforce_llama_min_build(
-        settings.llama_server_bin, settings.llama_server_min_build
-    )
-    if not ok:
-        raise RuntimeError(
-            "llama-server ne satisfait pas LLAMA_SERVER_MIN_BUILD — "
-            "démarrage refusé (binaire potentiellement vulnérable)."
-        )
-
-    # ── Garde-fou supply-chain : intégrité SHA-256 des GGUF (opt-in) ──────────
-    # Inerte tant qu'aucun modèle ne déclare `sha256` (cas des modèles de test).
-    # Un mismatch sur un modèle activé est traité comme critique : on refuse de
-    # démarrer plutôt que de servir un GGUF potentiellement substitué/corrompu.
-    for model in enabled_models:
-        if model.sha256 is None:
-            continue
-        try:
-            model.verify_integrity()
-            log.info("Intégrité SHA-256 vérifiée : %s", model.id)
-        except IntegrityError as exc:
-            log.critical("Intégrité GGUF compromise : %s", exc)
-            raise RuntimeError(
-                f"Vérification d'intégrité échouée pour '{model.id}' — démarrage refusé."
-            ) from exc
+    # En local, ces artefacts vivent sur la gateway. En cluster, ils vivent sur
+    # les nœuds et sont validés par le node-agent au moment du chargement.
+    await _validate_inference_runtime(enabled_models)
 
     await db.init_db()
     log.info("Base de données initialisée : %s", settings.db_path)
@@ -171,7 +198,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    log.info("Arrêt de la gateway — déchargement de tous les modèles…")
+    if settings.cluster_mode == "cluster":
+        log.info(
+            "Arrêt de l'orchestrateur — modèles distants préservés pour le "
+            "redémarrage et la réconciliation."
+        )
+    else:
+        log.info("Arrêt de la gateway — déchargement de tous les modèles locaux…")
     await model_manager.shutdown()
     await aclose_http_client()
     log.info("=== LLM Gateway UPPA arrêt propre ===")

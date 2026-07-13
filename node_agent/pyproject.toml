@@ -19,5 +19,3 @@ select = ["E", "F"]
 
 [tool.ruff.lint.per-file-ignores]
 "main.py" = ["E402"]
-# `Literal` importé mais non utilisé, préexistant.
-"config.py" = ["F401"]

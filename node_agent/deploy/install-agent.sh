@@ -1,174 +1,299 @@
 #!/usr/bin/env bash
-# install-agent.sh — Installation du node-agent LLM Gateway sur un DGX Spark
-#
-# Usage :
-#   sudo bash install-agent.sh [--node-id <id>] [--port <port>]
-#
-# Pré-requis :
-#   - Ubuntu 24.04 ARM64 (aarch64)
-#   - Python ≥ 3.11
-#   - llama-server déjà compilé (voir docs/build-llama-cpp-dgx-spark.md)
-#   - AGENT_SECRET partagé avec l'orchestrateur
+# Installation idempotente du node-agent sur un nœud GPU Ubuntu/systemd.
 set -euo pipefail
+IFS=$'\n\t'
 
 NODE_ID="${NODE_ID:-node-a}"
+AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-9443}"
+LLAMA_SERVER_HOST="${LLAMA_SERVER_HOST:-0.0.0.0}"
+BASE_LLAMA_PORT="${BASE_LLAMA_PORT:-8081}"
+MAX_LOADED_MODELS="${MAX_LOADED_MODELS:-5}"
+ORCHESTRATOR_CIDR="${ORCHESTRATOR_CIDR:-}"
+AGENT_SECRET_FILE=""
+
 INSTALL_DIR="/opt/llm-gateway"
 VENV_DIR="$INSTALL_DIR/venv-agent"
 CONF_DIR="/etc/llm-gateway-agent"
+ENV_FILE="$CONF_DIR/env"
 TLS_DIR="$CONF_DIR/tls"
 LOG_DIR="/var/log/llm-gateway-agent"
 SERVICE="llm-gateway-agent"
-USER="llmservice"
+SERVICE_USER="llmservice"
 
-# ── Parse args ────────────────────────────────────────────────────────────────
+info() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+die()  { printf '[ERREUR] %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: sudo bash install-agent.sh [options]
+
+  --node-id ID                 Identifiant présent dans nodes.yaml
+  --host IP                    Bind HTTPS de l'agent (défaut 0.0.0.0)
+  --port PORT                  Port HTTPS de l'agent (défaut 9443)
+  --llama-host IP              Bind data-plane llama-server (défaut 0.0.0.0)
+  --base-llama-port PORT       Premier port data-plane (défaut 8081)
+  --max-loaded-models N        Taille du pool de ports (défaut 5)
+  --orchestrator-cidr CIDR     Source autorisée par UFW (ex. 10.42.0.10/32)
+  --agent-secret-file PATH     Lit le secret partagé depuis un fichier root-only
+
+Sans --agent-secret-file, un secret fort est généré dans /etc/llm-gateway-agent/env.
+Il n'est jamais affiché automatiquement.
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --node-id) NODE_ID="$2"; shift 2 ;;
-        --port)    AGENT_PORT="$2"; shift 2 ;;
-        *)         echo "Usage: $0 [--node-id ID] [--port PORT]"; exit 1 ;;
+        --node-id) NODE_ID="${2:-}"; shift 2 ;;
+        --host) AGENT_HOST="${2:-}"; shift 2 ;;
+        --port) AGENT_PORT="${2:-}"; shift 2 ;;
+        --llama-host) LLAMA_SERVER_HOST="${2:-}"; shift 2 ;;
+        --base-llama-port) BASE_LLAMA_PORT="${2:-}"; shift 2 ;;
+        --max-loaded-models) MAX_LOADED_MODELS="${2:-}"; shift 2 ;;
+        --orchestrator-cidr) ORCHESTRATOR_CIDR="${2:-}"; shift 2 ;;
+        --agent-secret-file) AGENT_SECRET_FILE="${2:-}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "Option inconnue : $1" ;;
     esac
 done
 
-echo "=== Installation du node-agent LLM Gateway ==="
-echo "  Node ID  : $NODE_ID"
-echo "  Port     : $AGENT_PORT"
-echo "  Dossier  : $INSTALL_DIR"
-
-# ── Création de l'utilisateur système ────────────────────────────────────────
-if ! id "$USER" &>/dev/null; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$USER"
-    echo "[+] Utilisateur '$USER' créé."
+[[ $EUID -eq 0 ]] || die "Exécutez ce script avec sudo/root."
+[[ "$NODE_ID" =~ ^[a-z0-9][a-z0-9._-]{0,62}$ ]] || \
+    die "NODE_ID invalide (minuscules/chiffres/._-, 63 caractères max)."
+for value in "$AGENT_PORT" "$BASE_LLAMA_PORT" "$MAX_LOADED_MODELS"; do
+    [[ "$value" =~ ^[0-9]+$ ]] || die "Ports et capacité doivent être des entiers positifs."
+done
+(( AGENT_PORT >= 1 && AGENT_PORT <= 65535 )) || die "AGENT_PORT hors plage."
+(( BASE_LLAMA_PORT >= 1 && BASE_LLAMA_PORT <= 65535 )) || die "BASE_LLAMA_PORT hors plage."
+(( MAX_LOADED_MODELS >= 1 )) || die "MAX_LOADED_MODELS doit être >= 1."
+LAST_LLAMA_PORT=$((BASE_LLAMA_PORT + MAX_LOADED_MODELS - 1))
+(( LAST_LLAMA_PORT <= 65535 )) || die "La plage data-plane dépasse le port 65535."
+if (( AGENT_PORT >= BASE_LLAMA_PORT && AGENT_PORT <= LAST_LLAMA_PORT )); then
+    die "Le port agent chevauche la plage data-plane."
 fi
 
-# ── Dossiers ─────────────────────────────────────────────────────────────────
-install -d -m 755 -o root -g root       "$INSTALL_DIR"
-install -d -m 750 -o root -g "$USER"   "$CONF_DIR" "$TLS_DIR"
-install -d -m 755 -o "$USER" -g "$USER" "$LOG_DIR"
+for command in python3 rsync openssl systemctl; do
+    command -v "$command" >/dev/null || die "Commande requise absente : $command"
+done
+python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' || \
+    die "Python 3.11 ou plus récent est requis."
+if [[ -n "$ORCHESTRATOR_CIDR" ]]; then
+    python3 -c 'import ipaddress,sys; ipaddress.ip_network(sys.argv[1], strict=False)' \
+        "$ORCHESTRATOR_CIDR" || die "CIDR orchestrateur invalide."
+fi
+for host in "$AGENT_HOST" "$LLAMA_SERVER_HOST"; do
+    python3 -c '
+import ipaddress, re, sys
+value = sys.argv[1]
+try:
+    ipaddress.ip_address(value)
+except ValueError:
+    if not re.fullmatch(r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", value):
+        raise SystemExit(1)
+' "$host" || die "Hôte invalide : $host"
+done
 
-# ── Code source ───────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+[[ -f "$REPO_ROOT/node_agent/main.py" && -f "$REPO_ROOT/gateway/server_manager.py" ]] || \
+    die "Dépôt EVARuntime incomplet autour de $SCRIPT_DIR."
 
-rsync -a --delete "$REPO_ROOT/node_agent/" "$INSTALL_DIR/node_agent/"
-rsync -a --delete "$REPO_ROOT/gateway/"    "$INSTALL_DIR/gateway/"
-chown -R "$USER:$USER" "$INSTALL_DIR"
-echo "[+] Code source copié dans $INSTALL_DIR."
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+    info "Utilisateur système $SERVICE_USER créé."
+fi
+GPU_GROUPS=()
+for group in render video; do
+    if getent group "$group" >/dev/null; then
+        usermod -a -G "$group" "$SERVICE_USER"
+        GPU_GROUPS+=("$group")
+    else
+        warn "Groupe GPU '$group' absent; vérifiez les permissions /dev/nvidia* ou /dev/dri/*."
+    fi
+done
+info "Groupes GPU appliqués : ${GPU_GROUPS[*]:-(aucun détecté)}"
 
-# ── Environnement virtuel Python ──────────────────────────────────────────────
-if [[ ! -d "$VENV_DIR" ]]; then
+install -d -m 0755 -o root -g root "$INSTALL_DIR"
+install -d -m 0750 -o root -g "$SERVICE_USER" "$CONF_DIR" "$TLS_DIR"
+install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$LOG_DIR"
+install -d -m 0755 -o root -g root /models
+
+rsync -a --delete --delete-excluded \
+    --exclude '.env' --exclude '.venv' --exclude '__pycache__' \
+    --exclude '.pytest_cache' --exclude '.ruff_cache' --exclude '.DS_Store' \
+    "$REPO_ROOT/node_agent/" "$INSTALL_DIR/node_agent/"
+rsync -a --delete --delete-excluded \
+    --exclude '.env' --exclude '.venv' --exclude '__pycache__' \
+    --exclude '.pytest_cache' --exclude '.ruff_cache' --exclude '.DS_Store' \
+    "$REPO_ROOT/gateway/" "$INSTALL_DIR/gateway/"
+chown -R root:root "$INSTALL_DIR/node_agent" "$INSTALL_DIR/gateway"
+find "$INSTALL_DIR/node_agent" "$INSTALL_DIR/gateway" -type d -exec chmod 0755 {} +
+find "$INSTALL_DIR/node_agent" "$INSTALL_DIR/gateway" -type f -exec chmod 0644 {} +
+chmod 0755 "$INSTALL_DIR/node_agent/deploy/"*.sh
+info "Code installé en lecture seule pour le service."
+
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     python3 -m venv "$VENV_DIR"
-    echo "[+] Venv créé : $VENV_DIR"
 fi
+"$VENV_DIR/bin/python" -m pip install --quiet --upgrade pip
+"$VENV_DIR/bin/python" -m pip install --quiet -r "$INSTALL_DIR/node_agent/requirements.txt"
+chown -R root:root "$VENV_DIR"
 
-"$VENV_DIR/bin/pip" install --quiet --upgrade pip
-"$VENV_DIR/bin/pip" install --quiet \
-    fastapi uvicorn[standard] httpx pydantic pydantic-settings pyyaml uvloop
-echo "[+] Dépendances Python installées."
-
-# ── Certificat TLS auto-signé (si absent) ────────────────────────────────────
-if [[ ! -f "$TLS_DIR/agent.crt" ]]; then
-    openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 \
-        -nodes \
-        -keyout "$TLS_DIR/agent.key" \
-        -out    "$TLS_DIR/agent.crt" \
-        -subj   "/CN=$NODE_ID" \
-        -addext "subjectAltName=DNS:$NODE_ID,DNS:$(hostname -f),IP:$(hostname -I | awk '{print $1}')" \
-        2>/dev/null
-    chmod 640 "$TLS_DIR/agent.key" "$TLS_DIR/agent.crt"
-    chown "$USER:$USER" "$TLS_DIR/agent.key" "$TLS_DIR/agent.crt"
-    echo "[+] Certificat TLS auto-signé généré (valable 10 ans)."
-    echo "    Copiez $TLS_DIR/agent.crt vers l'orchestrateur pour tls_verify."
+if [[ ! -f "$TLS_DIR/agent.crt" || ! -f "$TLS_DIR/agent.key" ]]; then
+    PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    FQDN="$(hostname -f 2>/dev/null || hostname)"
+    SAN="DNS:$NODE_ID,DNS:$FQDN"
+    if [[ -n "$PRIMARY_IP" ]]; then
+        SAN="$SAN,IP:$PRIMARY_IP"
+    fi
+    openssl req -x509 -newkey rsa:4096 -sha256 -days 825 -nodes \
+        -keyout "$TLS_DIR/agent.key" -out "$TLS_DIR/agent.crt" \
+        -subj "/CN=$NODE_ID" -addext "subjectAltName=$SAN" >/dev/null 2>&1
+    info "Certificat TLS auto-signé généré (825 jours)."
 else
-    echo "[i] Certificat TLS existant conservé."
+    info "Certificat TLS existant conservé."
+fi
+chown root:"$SERVICE_USER" "$TLS_DIR/agent.key" "$TLS_DIR/agent.crt"
+chmod 0640 "$TLS_DIR/agent.key"
+chmod 0644 "$TLS_DIR/agent.crt"
+
+generate_secret() {
+    python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
+}
+read_env_value() {
+    local key="$1"
+    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1
+}
+append_env_if_missing() {
+    local key="$1" value="$2"
+    if ! grep -q "^${key}=" "$ENV_FILE"; then
+        printf '%s=%s\n' "$key" "$value" >> "$ENV_FILE"
+    fi
+}
+replace_env_value() {
+    local key="$1" value="$2"
+    sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
+}
+
+PROVIDED_AGENT_SECRET=""
+if [[ -n "$AGENT_SECRET_FILE" ]]; then
+    [[ -f "$AGENT_SECRET_FILE" ]] || die "Fichier de secret introuvable : $AGENT_SECRET_FILE"
+    IFS= read -r PROVIDED_AGENT_SECRET < "$AGENT_SECRET_FILE" || true
+    [[ ${#PROVIDED_AGENT_SECRET} -ge 32 ]] || die "Le secret fourni doit contenir au moins 32 caractères."
+    [[ "$PROVIDED_AGENT_SECRET" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || \
+        die "Le secret fourni contient des caractères incompatibles avec EnvironmentFile."
 fi
 
-# ── Fichier de configuration ──────────────────────────────────────────────────
-ENV_FILE="$CONF_DIR/env"
 if [[ ! -f "$ENV_FILE" ]]; then
-    cat > "$ENV_FILE" <<ENVEOF
-# Configuration du node-agent — EDITER avant de démarrer le service
-
+    AGENT_SECRET_VALUE="${PROVIDED_AGENT_SECRET:-$(generate_secret)}"
+    INTERNAL_API_KEY_VALUE="$(generate_secret)"
+    umask 0027
+    cat > "$ENV_FILE" <<EOF
+# Node-agent EVARuntime — fichier root-only, compatible systemd EnvironmentFile
 NODE_ID=$NODE_ID
+AGENT_HOST=$AGENT_HOST
 AGENT_PORT=$AGENT_PORT
-AGENT_HOST=0.0.0.0
+AGENT_TLS_CERT=$TLS_DIR/agent.crt
+AGENT_TLS_KEY=$TLS_DIR/agent.key
+AGENT_SECRET=$AGENT_SECRET_VALUE
+INTERNAL_API_KEY=$INTERNAL_API_KEY_VALUE
 
-# Secret partagé avec l'orchestrateur — DOIT être identique dans nodes.yaml
-AGENT_SECRET=CHANGE_ME_GENERATE_WITH_python3_-c_"import_secrets;_print(secrets.token_urlsafe(32))"
+LLAMA_SERVER_BIN=/usr/local/bin/llama-server
+LLAMA_SERVER_HOST=$LLAMA_SERVER_HOST
+LLAMA_SERVER_HEALTH_HOST=127.0.0.1
+BASE_LLAMA_PORT=$BASE_LLAMA_PORT
+MAX_LOADED_MODELS=$MAX_LOADED_MODELS
+LLAMA_SERVER_MIN_BUILD=0
+MODEL_LOAD_TIMEOUT_SECONDS=180
+IDLE_CHECK_INTERVAL_SECONDS=10
 
-# Clé interne orchestrateur → llama-server (peut être différente par nœud)
-INTERNAL_API_KEY=CHANGE_ME_INTERNAL_KEY
-
-# Mémoire GPU (GB10 : 120 recommandé sur 128 GB physiques)
 TOTAL_VRAM_GB=120.0
 VRAM_OVERHEAD_GB=4.0
 VRAM_SAFETY_MARGIN=0.03
-
-# Pool de ports llama-server sur ce nœud
-BASE_LLAMA_PORT=8081
-MAX_LOADED_MODELS=5
-
-# Chemin du binaire llama-server compilé pour sm_121
-LLAMA_SERVER_BIN=/usr/local/bin/llama-server
-
-# Épinglage de version llama-server (mitigation supply-chain).
-# 0 = pas d'enforcement (défaut). Recommandé : fixer au premier build patché
-# contre GHSA-8947-pfff-2f3c (OOB write n_discard) + overflows de parsing GGUF.
-# Si > 0 et binaire plus ancien → démarrage refusé ; version illisible → warning.
-LLAMA_SERVER_MIN_BUILD=0
-
-# Répertoires autorisés pour les .gguf (laisser vide = pas de restriction)
 ALLOWED_MODEL_DIRS=/models
-
-# GPU (GB10 = device 0)
 CUDA_VISIBLE_DEVICES=0
-
-# Logs
-LOG_DIR=/var/log/llm-gateway-agent
-ENVEOF
-    chmod 640 "$ENV_FILE"
-    chown "root:$USER" "$ENV_FILE"
-    echo "[+] Fichier $ENV_FILE créé — EDITEZ-LE avant de démarrer."
+LOG_DIR=$LOG_DIR
+EOF
+    info "Configuration créée; deux secrets forts ont été générés."
 else
-    echo "[i] $ENV_FILE existant conservé (mise à jour manuelle requise si nouvelle variable)."
+    info "Configuration existante conservée; ajout des nouvelles clés manquantes."
+    append_env_if_missing AGENT_HOST "$AGENT_HOST"
+    append_env_if_missing AGENT_PORT "$AGENT_PORT"
+    append_env_if_missing AGENT_TLS_CERT "$TLS_DIR/agent.crt"
+    append_env_if_missing AGENT_TLS_KEY "$TLS_DIR/agent.key"
+    append_env_if_missing LLAMA_SERVER_HOST "$LLAMA_SERVER_HOST"
+    append_env_if_missing LLAMA_SERVER_HEALTH_HOST 127.0.0.1
+    append_env_if_missing IDLE_CHECK_INTERVAL_SECONDS 10
+    if [[ -n "$PROVIDED_AGENT_SECRET" ]]; then
+        if grep -q '^AGENT_SECRET=' "$ENV_FILE"; then
+            replace_env_value AGENT_SECRET "$PROVIDED_AGENT_SECRET"
+        else
+            append_env_if_missing AGENT_SECRET "$PROVIDED_AGENT_SECRET"
+        fi
+    fi
+    CURRENT_AGENT_SECRET="$(read_env_value AGENT_SECRET)"
+    if [[ -z "$CURRENT_AGENT_SECRET" || "$CURRENT_AGENT_SECRET" == CHANGE_ME* ]]; then
+        if grep -q '^AGENT_SECRET=' "$ENV_FILE"; then
+            replace_env_value AGENT_SECRET "$(generate_secret)"
+        else
+            append_env_if_missing AGENT_SECRET "$(generate_secret)"
+        fi
+        info "Placeholder AGENT_SECRET remplacé par un secret généré."
+    elif (( ${#CURRENT_AGENT_SECRET} < 32 )); then
+        die "AGENT_SECRET existant trop court; fournissez --agent-secret-file pour le remplacer."
+    fi
+    CURRENT_INTERNAL_KEY="$(read_env_value INTERNAL_API_KEY)"
+    if [[ -z "$CURRENT_INTERNAL_KEY" || "$CURRENT_INTERNAL_KEY" == CHANGE_ME* ]]; then
+        if grep -q '^INTERNAL_API_KEY=' "$ENV_FILE"; then
+            replace_env_value INTERNAL_API_KEY "$(generate_secret)"
+        else
+            append_env_if_missing INTERNAL_API_KEY "$(generate_secret)"
+        fi
+        info "Placeholder INTERNAL_API_KEY remplacé par une clé générée."
+    elif (( ${#CURRENT_INTERNAL_KEY} < 32 )); then
+        die "INTERNAL_API_KEY existante trop courte; corrigez $ENV_FILE."
+    fi
 fi
+chown root:"$SERVICE_USER" "$ENV_FILE"
+chmod 0640 "$ENV_FILE"
 
-# ── Service systemd ───────────────────────────────────────────────────────────
-cp "$INSTALL_DIR/node_agent/deploy/llm-gateway-agent.service" \
-   "/etc/systemd/system/$SERVICE.service"
+install -m 0644 -o root -g root \
+    "$INSTALL_DIR/node_agent/deploy/llm-gateway-agent.service" \
+    "/etc/systemd/system/$SERVICE.service"
 
-# Injecter le port réel dans le service
-sed -i "s/--port 9443/--port $AGENT_PORT/" "/etc/systemd/system/$SERVICE.service"
+"$VENV_DIR/bin/python" "$INSTALL_DIR/node_agent/preflight.py" --env "$ENV_FILE" || \
+    die "Préflight échoué; le service n'a pas été démarré. Corrigez la configuration ci-dessus."
 
 systemctl daemon-reload
-systemctl enable "$SERVICE"
-echo "[+] Service systemd '$SERVICE' enregistré (démarrage automatique activé)."
+systemctl enable "$SERVICE" >/dev/null
 
-# ── Résumé ────────────────────────────────────────────────────────────────────
-cat <<SUMMARY
+if [[ -n "$ORCHESTRATOR_CIDR" ]]; then
+    if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
+        ufw allow proto tcp from "$ORCHESTRATOR_CIDR" to any port "$AGENT_PORT" \
+            comment 'EVARuntime node-agent control' >/dev/null
+        ufw allow proto tcp from "$ORCHESTRATOR_CIDR" to any port "$BASE_LLAMA_PORT:$LAST_LLAMA_PORT" \
+            comment 'EVARuntime llama data-plane' >/dev/null
+        info "UFW limité à $ORCHESTRATOR_CIDR pour control + data-plane."
+    else
+        warn "UFW absent/inactif : appliquez l'équivalent dans votre firewall réseau."
+    fi
+else
+    warn "Aucun --orchestrator-cidr : aucune règle firewall créée."
+    warn "Autorisez uniquement l'orchestrateur vers TCP $AGENT_PORT et $BASE_LLAMA_PORT-$LAST_LLAMA_PORT."
+fi
 
-=== Installation terminée ===
+cat <<EOF
 
-ÉTAPES SUIVANTES :
+Installation node-agent terminée (service activé mais non démarré).
 
-1. Editez $ENV_FILE :
-     - Remplacez AGENT_SECRET par la valeur partagée avec l'orchestrateur
-     - Remplacez INTERNAL_API_KEY par une clé unique
-     - Vérifiez TOTAL_VRAM_GB et LLAMA_SERVER_BIN
+1. Récupérez explicitement le secret pour nodes.yaml, sans le copier dans les logs :
+   sudo sed -n 's/^AGENT_SECRET=//p' $ENV_FILE
+2. Copiez $TLS_DIR/agent.crt vers le trust store de l'orchestrateur.
+3. Vérifiez le firewall puis démarrez :
+   sudo systemctl start $SERVICE
+4. Contrôlez sans afficher le secret :
+   sudo $VENV_DIR/bin/python $INSTALL_DIR/node_agent/preflight.py --env $ENV_FILE --check-health
 
-2. Démarrez le service :
-     sudo systemctl start $SERVICE
-     sudo journalctl -fu $SERVICE   # pour suivre les logs
-
-3. Vérifiez la santé :
-     curl -k -H "Authorization: Bearer <AGENT_SECRET>" \\
-       https://localhost:$AGENT_PORT/agent/health
-
-4. Sur l'orchestrateur, ajoutez ce nœud dans nodes.yaml :
-     nodes:
-       - id: $NODE_ID
-         base_url: https://$(hostname -f):$AGENT_PORT
-
-5. Copiez le certificat TLS si tls_verify pointe vers le bundle :
-     scp $TLS_DIR/agent.crt orchestrateur:/etc/ssl/certs/$NODE_ID.crt
-SUMMARY
+Data-plane attendu : <IP privée du nœud>:$BASE_LLAMA_PORT-$LAST_LLAMA_PORT
+EOF

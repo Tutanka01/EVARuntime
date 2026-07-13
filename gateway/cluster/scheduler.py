@@ -37,11 +37,17 @@ class NodeSnapshot:
     draining: bool = False
     total_vram_gb: float = 0.0
     used_vram_gb: float = 0.0
+    # Capacité EFFECTIVE annoncée par l'agent après ses réserves
+    # (overhead système, marge de sécurité, mémoire non allouable). None
+    # conserve la compatibilité avec les appelants historiques/tests purs.
+    reported_available_vram_gb: float | None = None
     free_ports: int = 0
     loaded_models: tuple[LoadedModelSnapshot, ...] = field(default_factory=tuple)
 
     @property
     def available_vram_gb(self) -> float:
+        if self.reported_available_vram_gb is not None:
+            return max(0.0, self.reported_available_vram_gb)
         return max(0.0, self.total_vram_gb - self.used_vram_gb)
 
     @property
@@ -83,16 +89,22 @@ def max_potential_vram(node: NodeSnapshot) -> float:
     return node.available_vram_gb + evictable_vram
 
 
-def build_eviction_plan(node: NodeSnapshot, vram_needed: float) -> EvictionPlan:
+def build_eviction_plan(
+    node: NodeSnapshot,
+    vram_needed: float,
+    *,
+    require_free_port: bool = False,
+) -> EvictionPlan:
     """
     Calcule la liste minimale de modèles à évincer (par LRU desc) pour libérer
-    `vram_needed` GB sur ce nœud. Lève NoPlacementError si même l'éviction
-    maximale ne suffit pas.
+    `vram_needed` GB sur ce nœud. Si `require_free_port`, évince au moins un
+    modèle afin de libérer un port même quand la VRAM libre suffit déjà.
+    Lève NoPlacementError si l'objectif est impossible.
 
     Stratégie LRU : on évince d'abord les modèles dont idle_seconds est le plus
     grand (les moins récemment utilisés). Pas de pinned (active_requests > 0).
     """
-    if node.available_vram_gb >= vram_needed:
+    if node.available_vram_gb >= vram_needed and not require_free_port:
         return EvictionPlan(node_id=node.node_id, models_to_evict=(), freed_vram_gb=0.0)
 
     if max_potential_vram(node) < vram_needed:
@@ -107,13 +119,18 @@ def build_eviction_plan(node: NodeSnapshot, vram_needed: float) -> EvictionPlan:
         key=lambda m: m.idle_seconds,
         reverse=True,
     )
+    if require_free_port and not evictables:
+        raise NoPlacementError(
+            f"Nœud '{node.node_id}' n'a aucun port libre et aucun modèle "
+            f"non pinné à évincer."
+        )
 
     to_evict: list[str] = []
     freed = 0.0
-    remaining = vram_needed - node.available_vram_gb
+    remaining = max(0.0, vram_needed - node.available_vram_gb)
 
     for model in evictables:
-        if freed >= remaining:
+        if freed >= remaining and (not require_free_port or to_evict):
             break
         to_evict.append(model.id)
         freed += model.vram_gb
@@ -185,7 +202,11 @@ def pick_node(model: ModelToPlace, nodes: list[NodeSnapshot]) -> tuple[NodeSnaps
         # (sauf si l'éviction libère un port — ce qui est le cas : chaque
         # modèle évincé rend son port).
         try:
-            plan = build_eviction_plan(node, model.vram_gb)
+            plan = build_eviction_plan(
+                node,
+                model.vram_gb,
+                require_free_port=node.free_ports < 1,
+            )
         except NoPlacementError:
             continue
 

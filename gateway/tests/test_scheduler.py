@@ -33,6 +33,7 @@ def make_node(
     *,
     total: float = 48.0,
     used: float = 0.0,
+    available: float | None = None,
     free_ports: int = 5,
     online: bool = True,
     draining: bool = False,
@@ -44,6 +45,7 @@ def make_node(
         draining=draining,
         total_vram_gb=total,
         used_vram_gb=used,
+        reported_available_vram_gb=available,
         free_ports=free_ports,
         loaded_models=models,
     )
@@ -98,6 +100,21 @@ class TestPickNodeImmediateFit:
 
         chosen, _ = pick_node(make_model("m", 10.0), [no_port, good])
         assert chosen.node_id == "b"
+
+    def test_advertised_effective_capacity_overrides_physical_subtraction(self):
+        physical_large = make_node(
+            "physical-large", total=120.0, used=0.0, available=10.0
+        )
+        effective_fit = make_node(
+            "effective-fit", total=48.0, used=0.0, available=30.0
+        )
+
+        chosen, _ = pick_node(
+            make_model("m", 20.0), [physical_large, effective_fit]
+        )
+
+        assert physical_large.available_vram_gb == 10.0
+        assert chosen.node_id == "effective-fit"
 
 
 # ── Exclusion offline / drain / pin ─────────────────────────────────────────
@@ -206,6 +223,21 @@ class TestPickNodeWithEviction:
         )
 
         chosen, plan = pick_node(make_model("m", 20.0), [node])
+
+        assert chosen.node_id == "a"
+        assert plan.models_to_evict == ("old",)
+
+    def test_eviction_unlocks_port_even_when_vram_is_already_sufficient(self):
+        node = make_node(
+            "a",
+            total=80.0,
+            used=20.0,
+            available=50.0,
+            free_ports=0,
+            models=(loaded("old", 20.0, idle=300.0),),
+        )
+
+        chosen, plan = pick_node(make_model("m", 10.0), [node])
 
         assert chosen.node_id == "a"
         assert plan.models_to_evict == ("old",)

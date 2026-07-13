@@ -51,12 +51,18 @@ class FakeProcess:
         return self.returncode
 
 
-def make_manager(on_unload=None, on_capacity_change=None, mid="m1") -> ServerManager:
+def make_manager(
+    on_unload=None,
+    on_capacity_change=None,
+    mid="m1",
+    idle_unload_enabled=True,
+) -> ServerManager:
     return ServerManager(
         FakeModelDef(mid),
         port=9001,
         on_unload=on_unload,
         on_capacity_change=on_capacity_change,
+        idle_unload_enabled=idle_unload_enabled,
     )
 
 
@@ -252,3 +258,36 @@ async def test_idle_unload_via_real_monitor(monkeypatch):
     )
     assert mgr._process is None
     assert unloaded == ["m1"], "on_unload doit libérer le port après inactivité"
+
+
+@pytest.mark.anyio
+async def test_idle_unload_disabled_keeps_watchdog_without_idle_eviction(monkeypatch):
+    """Mode agent : pas d'éviction idle aveugle, mais les crashs restent détectés."""
+    unloaded = []
+    mgr = make_manager(
+        on_unload=lambda mid: unloaded.append(mid),
+        idle_unload_enabled=False,
+    )
+    patch_process_and_health(mgr, monkeypatch)
+
+    await mgr.ensure_loaded()
+    await asyncio.sleep(0.1)  # bien au-delà du timeout de la fixture
+
+    assert mgr.state == ModelState.READY
+    assert unloaded == []
+
+    mgr._process.returncode = 1
+    for _ in range(200):
+        if mgr.state == ModelState.UNLOADED:
+            break
+        await asyncio.sleep(0.01)
+
+    assert mgr.state == ModelState.UNLOADED
+    assert unloaded == ["m1"]
+
+
+def test_llama_url_brackets_ipv6_health_host(monkeypatch):
+    monkeypatch.setattr(settings, "llama_server_host", "::1")
+    mgr = make_manager()
+
+    assert mgr.llama_url("/health") == "http://[::1]:9001/health"

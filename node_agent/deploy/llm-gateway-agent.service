@@ -1,34 +1,54 @@
 [Unit]
-Description=LLM Gateway — Node Agent (DGX Spark)
-After=network.target
-Wants=network.target
+Description=EVARuntime Node Agent (GPU inference worker)
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=llmservice
 Group=llmservice
-
 WorkingDirectory=/opt/llm-gateway/node_agent
 EnvironmentFile=/etc/llm-gateway-agent/env
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0027
+
+ExecStartPre=/opt/llm-gateway/venv-agent/bin/python /opt/llm-gateway/node_agent/preflight.py --env /etc/llm-gateway-agent/env
 ExecStart=/opt/llm-gateway/venv-agent/bin/uvicorn main:app \
-    --host 0.0.0.0 \
-    --port 9443 \
+    --host ${AGENT_HOST} \
+    --port ${AGENT_PORT} \
     --workers 1 \
     --loop uvloop \
-    --ssl-keyfile /etc/llm-gateway-agent/tls/agent.key \
-    --ssl-certfile /etc/llm-gateway-agent/tls/agent.crt
+    --ssl-keyfile ${AGENT_TLS_KEY} \
+    --ssl-certfile ${AGENT_TLS_CERT}
 
 Restart=on-failure
-RestartSec=5
+RestartSec=5s
+TimeoutStopSec=30s
+KillMode=control-group
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=llm-gateway-agent
 
-# Sécurité système
+# Durcissement compatible avec CUDA/NVIDIA : le service peut lire les modèles
+# et périphériques GPU, mais ne peut écrire que ses logs et son /tmp privé.
 NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
 ProtectSystem=strict
-ReadWritePaths=/var/log/llm-gateway-agent /tmp
+ReadWritePaths=/var/log/llm-gateway-agent
 PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target

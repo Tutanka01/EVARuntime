@@ -1,0 +1,62 @@
+[Unit]
+Description=EVARuntime Multi-node Orchestrator (FastAPI)
+Documentation=https://github.com/Tutanka01/EVARuntime
+After=network-online.target
+Wants=network-online.target
+
+# Profil dédié au mode cluster : cet hôte orchestre les node-agents et ne
+# lance aucun llama-server local. Il n'a donc besoin ni du GPU ni de /models.
+
+[Service]
+Type=simple
+User=llmservice
+Group=llmservice
+WorkingDirectory=/opt/llm-gateway
+EnvironmentFile=/etc/llm-gateway/env
+
+ExecStart=/opt/llm-gateway/venv/bin/uvicorn \
+    main:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 1 \
+    --loop uvloop \
+    --log-level info \
+    --access-log \
+    --no-use-colors
+
+LimitNOFILE=65536
+LimitNPROC=1024
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llm-gateway /var/log/llm-gateway
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @debug
+DevicePolicy=closed
+MemoryHigh=4G
+MemoryMax=8G
+TasksMax=1024
+
+Restart=on-failure
+RestartSec=5s
+StartLimitInterval=60s
+StartLimitBurst=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=llm-gateway
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

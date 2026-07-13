@@ -74,6 +74,20 @@ jobs:
       - name: Test (pytest)
         run: cd node_agent && python -m pytest tests -v
 
+  deployment-scripts:
+    name: deployment-scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse Bash scripts
+        run: |
+          bash -n gateway/deploy/*.sh
+          bash -n node_agent/deploy/*.sh
+
+      - name: Test local and cluster mode selection
+        run: bash gateway/deploy/test-deploy-modes.sh
+
   dependency-audit:
     name: dependency-audit
     runs-on: ubuntu-latest

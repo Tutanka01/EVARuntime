@@ -37,6 +37,11 @@ from model_registry import ModelDefinition
 log = logging.getLogger(__name__)
 
 
+def format_url_host(host: str) -> str:
+    """Encadre un littéral IPv6 pour produire une URL HTTP valide."""
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 class ModelState(str, Enum):
     UNLOADED  = "unloaded"
     LOADING   = "loading"
@@ -54,6 +59,8 @@ class ServerManager:
         port       : port sur lequel llama-server écoutera
         on_unload  : callback appelé après déchargement complet —
                      permet à ModelManager de libérer le port et nettoyer son état
+        idle_unload_enabled : active l'auto-déchargement après inactivité. Le
+                     watchdog de crash reste actif même si cette option est False.
     """
 
     def __init__(
@@ -62,11 +69,13 @@ class ServerManager:
         port: int,
         on_unload: Callable[[str], None] | None = None,
         on_capacity_change: Callable[[], None] | None = None,
+        idle_unload_enabled: bool = True,
     ) -> None:
         self._model = model
         self._port = port
         self._on_unload = on_unload
         self._on_capacity_change = on_capacity_change
+        self._idle_unload_enabled = idle_unload_enabled
 
         self._process: asyncio.subprocess.Process | None = None
         self._state: ModelState = ModelState.UNLOADED
@@ -149,7 +158,11 @@ class ServerManager:
 
     def llama_url(self, path: str) -> str:
         """URL complète vers llama-server pour ce modèle."""
-        return f"http://{settings.llama_server_host}:{self._port}{path}"
+        # Le node-agent peut binder llama-server sur une interface réseau tout
+        # en utilisant loopback pour ses sondes locales. Le mode mono-nœud ne
+        # définit pas ce réglage spécialisé et conserve llama_server_host.
+        host = getattr(settings, "llama_server_health_host", settings.llama_server_host)
+        return f"http://{format_url_host(host)}:{self._port}{path}"
 
     def auth_headers(self) -> dict[str, str]:
         """Headers d'authentification interne gateway ↔ llama-server."""
@@ -453,8 +466,12 @@ class ServerManager:
 
     async def _idle_monitor(self) -> None:
         """
-        Tâche background : vérifie l'inactivité toutes les N secondes.
-        Décharge le modèle si aucune requête depuis IDLE_TIMEOUT secondes.
+        Watchdog background : détecte toujours les crashs du sous-processus.
+        Si idle_unload_enabled=True, décharge aussi le modèle après inactivité.
+
+        Le node-agent met idle_unload_enabled=False : le trafic d'inférence va
+        directement de l'orchestrateur vers llama-server, donc l'agent ne peut
+        pas déduire l'inactivité depuis ses propres compteurs pin/unpin.
         """
         interval = settings.idle_check_interval_seconds
         timeout  = settings.idle_timeout_seconds
@@ -482,6 +499,12 @@ class ServerManager:
             if self._process is not None and self._process.returncode is not None:
                 await self._mark_crashed()
                 break
+
+            # En cluster, conserver uniquement le watchdog de crash. Une
+            # éviction idle décidée ici serait aveugle au trafic direct et
+            # pourrait tuer un stream en cours.
+            if not self._idle_unload_enabled:
+                continue
 
             # INVARIANT : un modèle avec des requêtes actives ne doit jamais être
             # déchargé. Un stream plus long qu'idle_timeout ne rafraîchit
