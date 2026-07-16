@@ -44,7 +44,9 @@ donne une zone de controle dediee aux usages etudiants.
 
 - La DSI valide la topologie bi-NIC et les ACL.
 - Le vhost interne admin refuse tout client sans certificat mTLS valide.
-- Les secrets `CHANGE_ME_*` sont remplaces avant lancement.
+- Les secrets sont remplaces avant lancement : l'application refuse de demarrer
+  si `UPSTREAM_API_KEY` ou `AUDIT_HMAC_SECRET` correspondent a un defaut connu,
+  commencent par le prefixe `CHANGE_ME`, ou font moins de 32 caracteres.
 - Les noms d'interfaces `eth0`/`eth1` et IP dans `deploy/` sont adaptes.
 - Un test de charge court verifie que les limites nginx et applicatives coupent
   avant saturation GPU.

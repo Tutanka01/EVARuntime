@@ -60,7 +60,9 @@ class Settings(BaseSettings):
     @field_validator("upstream_api_key", "audit_hmac_secret")
     @classmethod
     def validate_not_default_secret(cls, value: str) -> str:
-        if value in _DEFAULT_SECRETS:
+        # Rejet par préfixe : bloque toute valeur placeholder (y compris les
+        # exemples de deploy/env.example), pas seulement les défauts exacts.
+        if value in _DEFAULT_SECRETS or value.startswith("CHANGE_ME"):
             raise ValueError("Secret non remplacé depuis la valeur par défaut — voir deploy/env.example")
         if len(value) < 32:
             raise ValueError("Secret trop court (minimum 32 caractères requis)")

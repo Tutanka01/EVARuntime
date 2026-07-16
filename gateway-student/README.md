@@ -19,7 +19,7 @@ Edge proxy durci qui expose l'inférence LLM EVA au réseau étudiant UPPA, sans
 
 La gateway étudiante :
 - authentifie via `Bearer llmstu-…` (clés dédiées, base SQLite séparée)
-- applique **trois couches de rate limiting** : burst court, RPM, tokens/heure, tokens/jour
+- applique **quatre couches de rate limiting** (burst court, RPM, tokens/heure, tokens/jour) **plus une limite de concurrence** par étudiant
 - valide et **normalise** chaque requête (allowlist-first, strip des paramètres dangereux)
 - relaie exclusivement vers l'URL admin configurée en dur — pas de SSRF possible
 - n'expose aucune route `/admin/*`, aucun endpoint de gestion GPU
@@ -64,7 +64,8 @@ En production, c'est le vhost interne mTLS de la gateway admin.
 | `DB_PATH` | `/var/lib/…/students.db` | Base SQLite étudiante |
 
 > **Important :** l'application refuse de démarrer si `UPSTREAM_API_KEY` ou
-> `AUDIT_HMAC_SECRET` ont leur valeur par défaut `CHANGE_ME_*`.
+> `AUDIT_HMAC_SECRET` correspondent à une valeur par défaut connue **ou** commencent
+> par le préfixe `CHANGE_ME`, ou font moins de 32 caractères.
 
 Voir `deploy/env.example` pour la liste complète.
 
@@ -81,7 +82,7 @@ du plus court au plus long :
 | **RPM** | 60 s glissantes | 10 req | par étudiant en base |
 | **Tokens/heure** | 60 min glissantes | 20 000 tokens | par étudiant en base |
 | **Tokens/jour** | depuis minuit UTC | 100 000 tokens | par étudiant en base |
-| **Concurrence** | instantané | 1 stream | par étudiant en base |
+| **Concurrence** | instantané | 1 requête concurrente | par étudiant en base |
 
 Les 429 incluent les headers `X-RateLimit-Limit`, `X-RateLimit-Remaining`,
 `X-RateLimit-Reset` et `Retry-After` pour un retry intelligent côté client.
@@ -167,8 +168,11 @@ gateway-student/
 │   └── sysctl.conf                     — Hardening kernel
 └── tests/
     ├── conftest.py
-    ├── test_policy.py      — 33 tests sur la normalisation des requêtes
-    └── test_rate_limiter.py — 13 tests async sur burst/RPM/concurrence
+    ├── test_policy.py             — 45 tests sur la normalisation des requêtes
+    ├── test_rate_limiter.py       — 13 tests async sur burst/RPM/concurrence
+    ├── test_upstream.py           — tests du relais upstream (mTLS, erreurs, SSE)
+    ├── test_database_hardening.py — tests de durcissement de la base SQLite
+    └── test_config.py             — tests de validation de la configuration
 ```
 
 ---
