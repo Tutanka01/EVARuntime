@@ -1100,8 +1100,8 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
 | `200` | — | Succès | — |
 | `400` | `invalid_request_error` | JSON malformé ou paramètre invalide | Vérifier le corps de la requête |
 | `401` | `authentication_error` | Clé absente, invalide ou révoquée | Vérifier la clé ; contacter l'admin si révoquée |
-| `403` | `permission_error` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible via `GET /v1/models` |
-| `404` | `not_found_error` | Identifiant de modèle inconnu | Vérifier l'ID du modèle via `GET /v1/models` |
+| `403` | `model_disabled` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible via `GET /v1/models` |
+| `404` | `model_not_found` | Identifiant de modèle inconnu | Vérifier l'ID du modèle via `GET /v1/models` |
 | `429` | `rate_limit_error` | Limite de débit dépassée | Attendre 60 s ; consulter l'en-tête `Retry-After` |
 | `503` | `server_error` | Queue VRAM pleine/expirée, modèle impossible à charger ou backend temporairement indisponible | Respecter `Retry-After` si présent, sinon attendre 30 à 90 s |
 | `504` | `server_error` | Timeout de génération | Réduire `max_tokens` ou simplifier le prompt |
@@ -1116,7 +1116,7 @@ Toutes les erreurs suivent le format OpenAI standard :
 {
   "error": {
     "message": "Modèle 'modele-inconnu' non trouvé dans le registre.",
-    "type": "not_found_error",
+    "type": "model_not_found",
     "code": "404"
   }
 }

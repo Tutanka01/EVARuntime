@@ -13,9 +13,11 @@ paramètres.
 Toutes les routes (sauf `/health`) requièrent un token Bearer :
 
 ```http
-Authorization: Bearer llmstu-<26 caractères>
+Authorization: Bearer llmstu-<~43 caractères aléatoires>
 ```
 
+La clé complète fait environ 50 caractères (`"llmstu-" + token_urlsafe(32)`).
+Seul un préfixe de 15 caractères est stocké et journalisé (jamais la clé brute).
 Les clés ont la forme `llmstu-…` (préfixe distinct des clés admin `llmgw-…`).
 Elles ont une expiration obligatoire. Une clé expirée ou révoquée retourne `401`.
 
@@ -31,7 +33,7 @@ Chaque requête est soumise à **quatre vérifications successives** :
 | RPM | 60 s glissantes | 10 req/min | `X-RateLimit-Window: 60` |
 | Tokens/heure | 60 min glissantes | 20 000 tokens | `Retry-After: 3600` |
 | Tokens/jour | depuis minuit UTC | 100 000 tokens | `Retry-After: <s jusqu'à minuit>` |
-| Streams concurrents | instantané | 1 | `Retry-After: 10` |
+| Requêtes concurrentes | instantané | 1 | `Retry-After: 10` |
 
 Tous les `429` incluent les headers suivants :
 
@@ -237,5 +239,5 @@ Toutes les erreurs suivent le format OpenAI :
 | `415` | `invalid_request_error` | `Content-Type` absent ou différent de `application/json` |
 | `429` | `rate_limit_error` | Burst, RPM, tokens/h, tokens/jour ou concurrence dépassés |
 | `503` | `server_error` | Gateway admin injoignable |
-| `504` | `server_error` | Timeout upstream (>600 s pour un stream) |
+| `504` | `server_error` | Timeout upstream (>600 s de lecture, streaming comme non-streaming) |
 | `500` | `server_error` | Erreur interne inattendue |

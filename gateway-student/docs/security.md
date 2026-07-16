@@ -30,8 +30,9 @@ entre autres :
 - `logit_bias`, `grammar`, `json_schema`, `response_format` en MVP
 
 Les champs conserves sont bornes : `max_tokens` (plafonne a
-`MAX_COMPLETION_TOKENS`), `temperature`, `top_p`, `top_k`, `repeat_penalty`,
-`seed`, `stop`, `tools`. Le champ `user` est **toujours ecrase** par
+`MAX_COMPLETION_TOKENS` ; `n_predict` est accepte comme alias de `max_tokens`),
+`temperature`, `top_p`, `top_k`, `repeat_penalty`, `seed`, `stop`, `tools`,
+`tool_choice`. Le champ `user` est **toujours ecrase** par
 `student:<user_id>`.
 
 ### Contenu texte uniquement (anti-SSRF)

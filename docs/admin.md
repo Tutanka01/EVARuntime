@@ -586,13 +586,14 @@ Par défaut, les modèles chargent à la première requête. Pour les pré-charg
 afin d'éliminer le délai de la première requête :
 
 ```bash
-# Pré-charger le modèle 8B
+# Pré-charger le modèle 8B (appel synchrone : il ne répond qu'une fois le
+# modèle réellement chargé et prêt à servir)
 curl -s -X POST "$GW/admin/models/llama-3.1-8b-instruct/load" \
   -H "Authorization: Bearer $ADMIN_SECRET"
-# → {"message": "Modèle 'llama-3.1-8b-instruct' en cours de chargement."}
+# → {"message": "Modèle 'llama-3.1-8b-instruct' chargé et prêt."}
 
-# Vérifier le statut après quelques secondes
-curl -s "$GW/admin/models/llama-3.1-8b-instruct" \
+# Vérifier l'état live (le modèle apparaît en state "ready")
+curl -s "$GW/admin/models" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
 ```
 
@@ -605,7 +606,7 @@ d'un modèle dont les paramètres ont changé.
 # Décharger le 70B
 curl -s -X POST "$GW/admin/models/llama-3.3-70b-instruct/unload" \
   -H "Authorization: Bearer $ADMIN_SECRET"
-# → {"message": "Modèle 'llama-3.3-70b-instruct' déchargé."}
+# → {"message": "Modèle 'llama-3.3-70b-instruct' déchargé. VRAM libérée."}
 
 # Vérifier la VRAM libérée
 nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits
@@ -657,11 +658,11 @@ llama-server avec les nouveaux paramètres.
 
 > **`llama_params` utilise une sémantique de remplacement complet.** Tous les champs
 > doivent être fournis — il n'y a pas de merge partiel. Récupérez les valeurs actuelles
-> via `GET /admin/models/{id}` avant de faire le PATCH.
+> via `GET /admin/models` (liste) avant de faire le PATCH.
 
 ```bash
-# Récupérer la config actuelle d'un modèle
-curl -s "$GW/admin/models/qwen3.5-9b-q5_k_m" \
+# Récupérer la config actuelle d'un modèle (repérer l'entrée dans la liste)
+curl -s "$GW/admin/models" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
 
 # Corriger un modèle MoE qui saturait la VRAM (ajout de cpu_moe)
@@ -794,40 +795,39 @@ curl -s -X POST "$GW/admin/models" \
 ```
 
 **Validations appliquées lors de l'enregistrement :**
-- L'`id` doit correspondre à `^[a-z0-9][a-z0-9._-]*$`
+- L'`id` doit correspondre à `^[a-z0-9][a-z0-9._-]{0,62}$` (63 caractères max)
 - Le `path` doit être absolu et se terminer par `.gguf`
 - Le fichier `.gguf` doit exister sur disque
 - Si `ALLOWED_MODEL_DIRS` est configuré, le chemin doit être sous ces répertoires
-- `vram_gb` doit être entre 0.5 et le budget VRAM net
-- Si `mmproj_path` est fourni, il est validé de la même façon que `path` (absolu, `.gguf`)
+- `vram_gb` doit être strictement supérieur à 0 et au plus le budget VRAM net
 
-**Pour un modèle vision**, inclure `mmproj_path` dans le corps de la requête :
+> **Modèles vision (`mmproj_path`) :** l'API `POST /admin/models` n'accepte **pas**
+> le champ `mmproj_path` (il est absent du corps de requête et serait ignoré). Pour
+> enregistrer un modèle vision avec son projecteur multimodal, il faut définir
+> `mmproj_path` directement dans `models.yaml` (édition YAML + reload du registre),
+> et **non** via l'API d'enregistrement.
 
-```bash
-curl -s -X POST "$GW/admin/models" \
-  -H "Authorization: Bearer $ADMIN_SECRET" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "id": "llava-7b",
-    "path": "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf",
-    "mmproj_path": "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf",
-    "description": "LLaVA 1.6 Mistral 7B — vision + texte",
-    "vram_gb": 6.0,
-    "enabled": true,
-    "capabilities": ["text_generation", "vision", "streaming"],
-    "llama_params": {
-      "n_gpu_layers": 999,
-      "ctx_size": 8192,
-      "parallel": 4,
-      "batch_size": 2048,
-      "ubatch_size": 512,
-      "cache_type_k": "q8_0",
-      "cache_type_v": "q8_0",
-      "flash_attn": true,
-      "threads": 4,
-      "threads_http": 2
-    }
-  }' | python3 -m json.tool
+**Pour un modèle vision**, ajouter l'entrée dans `models.yaml` avec `mmproj_path` :
+
+```yaml
+  - id: "llava-7b"
+    path: "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf"
+    mmproj_path: "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf"
+    description: "LLaVA 1.6 Mistral 7B — vision + texte"
+    vram_gb: 6.0
+    enabled: true
+    capabilities: ["text_generation", "vision", "streaming"]
+    llama_params:
+      n_gpu_layers: 999
+      ctx_size: 8192
+      parallel: 4
+      batch_size: 2048
+      ubatch_size: 512
+      cache_type_k: "q8_0"
+      cache_type_v: "q8_0"
+      flash_attn: true
+      threads: 4
+      threads_http: 2
 ```
 
 > **Important :** `mmproj_path` est **obligatoire** en pratique si `vision` est dans
@@ -879,6 +879,7 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 | `GET` | `/admin/users` | Lister tous les utilisateurs |
 | `GET` | `/admin/users/{username}` | Détail d'un utilisateur |
 | `PATCH` | `/admin/users/{username}` | Modifier un utilisateur |
+| `DELETE` | `/admin/users/{username}` | Supprimer un utilisateur (**destructif / irréversible**) |
 
 ### Clés API
 
@@ -894,7 +895,6 @@ Toutes les routes `/admin/*` sont restreintes aux IP campus par nginx.
 |---------|-------|-------------|
 | `GET` | `/admin/models` | Lister tous les modèles (registre + état live) |
 | `POST` | `/admin/models` | Enregistrer un nouveau modèle (persiste dans models.yaml) |
-| `GET` | `/admin/models/{model_id}` | Détail d'un modèle (registre + état live) |
 | `PATCH` | `/admin/models/{model_id}` | Modifier un modèle — `enabled`, `vram_gb`, `description`, `llama_params` (hot-reload) |
 | `DELETE` | `/admin/models/{model_id}` | Supprimer un modèle (seulement si non chargé) |
 | `POST` | `/admin/models/{model_id}/load` | Pré-charger un modèle en VRAM |
@@ -991,7 +991,7 @@ curl -s "$GW/admin/status" \
 | `GET` | `/admin/metrics/overview` | — | KPIs globaux, latence (P50/P95/P99), état multi-modèles |
 | `GET` | `/admin/metrics/timeseries` | `period=24h\|7d\|30d` | Série temporelle (requêtes, tokens, erreurs, latence) |
 | `GET` | `/admin/metrics/users` | `period=7d\|30d\|90d` | Statistiques par utilisateur avec quota |
-| `GET` | `/admin/metrics/status-codes` | `period=24h\|7d` | Distribution des codes HTTP |
+| `GET` | `/admin/metrics/status-codes` | `period=24h\|7d\|30d` | Distribution des codes HTTP |
 | `GET` | `/admin/metrics/llama` | — | Métriques llama-server en direct par model_id — retourne `{}` si aucun chargé |
 
 **Exemple — vue d'ensemble KPI :**

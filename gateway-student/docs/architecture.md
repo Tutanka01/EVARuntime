@@ -58,7 +58,8 @@ Endpoints explicitement exclus du MVP :
 
 1. nginx rejette les gros bodies, les connexions lentes et les chemins inconnus.
 2. FastAPI verifie le bearer `llmstu-*`.
-3. Le rate limiter applique RPM, quota journalier et concurrence.
+3. Le rate limiter applique successivement burst, RPM, tokens/heure,
+   tokens/jour, puis la limite de concurrence par etudiant.
 4. `policy.py` normalise le JSON et supprime les champs hors allowlist.
 5. `upstream.py` relaie vers `UPSTREAM_BASE_URL/v1/chat/completions`.
 6. `audit.py` emet une ligne JSON sans contenu sensible.

@@ -326,7 +326,7 @@ sudoedit /var/lib/llm-gateway/models.yaml
 
 ```yaml
 models:
-  - id: "llama-3.3-70b-instruct"          # identifiant unique (regex: ^[a-z0-9][a-z0-9._-]*$)
+  - id: "llama-3.3-70b-instruct"          # identifiant unique (regex: ^[a-z0-9][a-z0-9._-]{0,62}$)
     path: "/models/Llama-3.3-70B-Instruct-Q4_K_M.gguf"   # chemin absolu vers le .gguf
     description: "Llama 3.3 70B Instruct, Q4_K_M — modèle principal UPPA"
     vram_gb: 42.0                          # estimation VRAM totale (poids + KV cache)
@@ -464,7 +464,7 @@ sudo -u llmservice ./venv/bin/python cli.py status
 ### Sécurité du registre
 
 Le registre est validé au démarrage :
-- Les `id` doivent correspondre à `^[a-z0-9][a-z0-9._-]*$` (pas de `/`, `..`, etc.)
+- Les `id` doivent correspondre à `^[a-z0-9][a-z0-9._-]{0,62}$` (pas de `/`, `..`, etc.)
 - Les `path` doivent être absolus et se terminer par `.gguf`
 - Le `mmproj_path`, s'il est fourni, subit les mêmes validations que `path`
 - Si `ALLOWED_MODEL_DIRS` est configuré, les chemins (`path` et `mmproj_path`) doivent être sous ces répertoires
@@ -889,7 +889,7 @@ Causes fréquentes :
 | `Permission denied` sur `/models/` | Droits incorrects | `sudo chown -R root:llmservice /models && chmod -R 750 /models` |
 | `Address already in use` | Port 8000 occupé | `sudo ss -tlnp \| grep 8000` |
 | `ValidationError` | Config invalide dans `.env` | Vérifier `/etc/llm-gateway/env` |
-| `ValueError: model_id invalide` | ID dans models.yaml non conforme | L'ID doit correspondre à `^[a-z0-9][a-z0-9._-]*$` |
+| `ValueError: model_id invalide` | ID dans models.yaml non conforme | L'ID doit correspondre à `^[a-z0-9][a-z0-9._-]{0,62}$` |
 
 ### llama-server ne démarre pas (timeout de chargement)
 

@@ -360,7 +360,7 @@ Format d'un log d'audit :
   "ts": 1714383600.123,
   "request_id": "uuid-v4",
   "student_user_id": 42,
-  "key_prefix": "llmstu-abc12",
+  "key_prefix": "llmstu-abc123xy",
   "client_ip_hash": "8f3a1b2c",
   "model": "llama-3.1-8b-instruct",
   "prompt_chars": 350,
