@@ -54,14 +54,53 @@ une valeur propre à un autre GPU.
    # Uniquement si votre réseau impose un proxy sortant :
    # export http_proxy=http://proxy.example.net:3128
    # export https_proxy=http://proxy.example.net:3128
+   # `sudo -E` à l'étape 4 transmet ces deux variables à pip.
 
    git clone https://github.com/Tutanka01/EVARuntime.git /opt/src/EVARuntime
    ```
 
-   Suivez ensuite [la procédure de compilation CUDA](#2-installation-de-llamacpp).
-   Elle publie le binaire sur `/opt/llama.cpp/current/llama-server`.
+### Étape 3 — compiler `llama.cpp` avant d’installer la gateway
 
-### Étape 3 — installer le socle gateway
+`install.sh` installe la gateway, mais ne télécharge ni ne compile
+`llama-server`. Ne passez pas à l’étape suivante tant que le dernier `test`
+ci-dessous ne réussit pas.
+
+```bash
+export CUDACXX="$(command -v nvcc)"
+test -x "$CUDACXX"
+
+CUDA_ARCHITECTURES="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader \
+  | awk '{gsub(/\./, ""); print}' | sort -u | paste -sd ';' -)"
+test -n "$CUDA_ARCHITECTURES"
+
+git clone https://github.com/ggml-org/llama.cpp.git /opt/src/llama.cpp
+cd /opt/src/llama.cpp
+
+cmake -S . -B build -G Ninja \
+  -DGGML_CUDA=ON \
+  -DCMAKE_CUDA_COMPILER="$CUDACXX" \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DLLAMA_BUILD_UI=OFF \
+  -DLLAMA_USE_PREBUILT_UI=OFF
+cmake --build build --target llama-server --parallel "$(nproc)"
+
+RELEASE="manual-$(git rev-parse --short HEAD)"
+sudo install -d -m 0755 "/opt/llama.cpp/releases/$RELEASE"
+sudo install -m 0755 build/bin/llama-server \
+  "/opt/llama.cpp/releases/$RELEASE/llama-server"
+sudo ln -sfn "releases/$RELEASE" /opt/llama.cpp/.current-new
+sudo mv -Tf /opt/llama.cpp/.current-new /opt/llama.cpp/current
+
+test -x /opt/llama.cpp/current/llama-server
+/opt/llama.cpp/current/llama-server --version
+```
+
+La [section 2](#2-installation-de-llamacpp) détaille les cas de build avancés,
+mais cette étape suffit pour l’installation locale initiale.
+
+### Étape 4 — installer le socle gateway
 
 L'installateur crée le service et ses secrets, mais ne démarre pas encore la
 gateway :
@@ -69,7 +108,7 @@ gateway :
    ```bash
    export EVA_SRC=/opt/src/EVARuntime
    bash "$EVA_SRC/gateway/deploy/install.sh" --mode local --dry-run
-   sudo bash "$EVA_SRC/gateway/deploy/install.sh" --mode local
+   sudo -E bash "$EVA_SRC/gateway/deploy/install.sh" --mode local
 
    sudo systemctl is-enabled llm-gateway
    sudo test -x /opt/llama.cpp/current/llama-server
@@ -77,7 +116,7 @@ gateway :
    sudo test -f /var/lib/llm-gateway/models.yaml
    ```
 
-### Étape 4 — télécharger un petit modèle de recette
+### Étape 5 — télécharger un petit modèle de recette
 
 Déclarez uniquement ce modèle comme activé pour le premier test :
 
@@ -138,7 +177,7 @@ Déclarez uniquement ce modèle comme activé pour le premier test :
          threads_http: 2
    ```
 
-### Étape 5 — démarrer et prouver le premier token
+### Étape 6 — démarrer et prouver le premier token
 
    ```bash
    sudo systemctl start llm-gateway

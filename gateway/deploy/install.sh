@@ -199,6 +199,7 @@ else
         warn "Runtime llama-server encore absent ($LLAMA_BIN)."
         warn "→ Le socle sera installé, mais /ready restera rouge jusqu'à bootstrap-apply."
         warn "→ /health et les routes d'administration resteront disponibles pour l'amorçage."
+        warn "→ Pour le parcours local direct, compiler llama.cpp avant de relancer ce script."
     fi
 fi
 
