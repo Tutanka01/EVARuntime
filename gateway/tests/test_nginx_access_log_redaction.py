@@ -2,12 +2,17 @@
 SEC-016 — le journal d'accès nginx livré ne doit contenir aucun nom d'utilisateur.
 
 Pourquoi un moteur et pas un `grep` : la rédaction repose sur deux `map` et un
-`log_format` déclarés dans `gateway/deploy/nginx.conf`. Vérifier que la chaîne
-« <redacted> » est présente dans le fichier ne prouve rien — ni que les regex
-attrapent les bonnes routes, ni que le format s'en sert, ni qu'il ne réintroduit
-pas l'URI brute par ailleurs. Ces tests LISENT les règles livrées, les évaluent
-sur des requêtes concrètes construites depuis les routes réelles de FastAPI, et
-rendent la ligne de journal qui en résulte.
+`log_format` déclarés dans les confs nginx livrées — `gateway/deploy/nginx.conf`
+(Linux, référence) ET `gateway/deploy-macos/nginx.conf.macOS`, dont la version
+initiale journalisait `$request` brut faute de `log_format` déclaré. Vérifier
+que la chaîne « <redacted> » est présente dans un fichier ne prouve rien — ni
+que les regex attrapent les bonnes routes, ni que le format s'en sert, ni qu'il
+ne réintroduit pas l'URI brute par ailleurs. Ces tests LISENT les règles
+livrées, les évaluent sur des requêtes concrètes construites depuis les routes
+réelles de FastAPI, et rendent la ligne de journal qui en résulte. Le moteur
+tourne sur LES DEUX confs : c'est le garde qui empêche la copie macOS de
+divérer à nouveau (la parité sémantique des deux arbres est aussi vue par
+`tests/test_deploy_trees_parity.py`, PAIRES_SEMANTIQUES).
 
 Le moteur ci-dessous est délibérément petit et couvre le sous-ensemble de nginx
 réellement employé par l'artefact : `map` (clé `default`, clé exacte, clé regex
@@ -51,7 +56,14 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SHIPPED_NGINX_CONF = REPO_ROOT / "gateway" / "deploy" / "nginx.conf"
+# Les DEUX confs nginx livrées : l'arbre Linux (référence) et la copie macOS,
+# appariées par rôle (PAIRES_SEMANTIQUES dans test_deploy_trees_parity.py).
+CONF_LINUX = REPO_ROOT / "gateway" / "deploy" / "nginx.conf"
+CONF_MACOS = REPO_ROOT / "gateway" / "deploy-macos" / "nginx.conf.macOS"
+CONFS_NGINX = [
+    pytest.param(CONF_LINUX, id="linux"),
+    pytest.param(CONF_MACOS, id="macos"),
+]
 DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
 
 # Nom témoin : il doit être introuvable dans toute ligne de journal rendue.
@@ -218,9 +230,10 @@ def cible_redigee(conf: str, cible: str) -> str:
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="module")
-def conf_text() -> str:
-    return SHIPPED_NGINX_CONF.read_text(encoding="utf-8")
+@pytest.fixture(scope="module", params=CONFS_NGINX)
+def conf_text(request) -> str:
+    """La conf nginx analysée : chaque test du module tourne sur les DEUX arbres."""
+    return request.param.read_text(encoding="utf-8")
 
 
 def _routes_de_lapplication() -> set[tuple[str, str]]:
@@ -526,14 +539,23 @@ def _blocs_server(conf_text: str) -> list[str]:
     return blocs
 
 
-def test_les_deux_serveurs_journalisent_avec_le_format_redige(conf_text):
+@pytest.mark.parametrize(
+    ("chemin", "nb_serveurs"),
+    [pytest.param(CONF_LINUX, 2, id="linux"), pytest.param(CONF_MACOS, 1, id="macos")],
+)
+def test_les_serveurs_journalisent_avec_le_format_redige(chemin: Path, nb_serveurs: int):
     """
-    HTTPS ET la redirection HTTP→HTTPS. Le port 80 journalise l'URI demandée
-    exactement comme le 443 : l'oublier laissait `GET /admin/users/<nom>` en clair
-    avant même la redirection.
+    Tout bloc `server` ACTIF doit journaliser avec le format rédigé.
+
+    Linux : le 443 ET la redirection port 80 — une redirection journalise l'URI
+    demandée exactement comme une requête servie, et l'oublier laissait
+    `GET /admin/users/<nom>` en clair avant même de rediriger. macOS : un seul
+    bloc actif, qui proxifie ET redirige conditionnellement (la recette HTTPS
+    est commentée) ; sa première version avait précisément ce `access_log`
+    commenté, et donc le format `combined` par défaut.
     """
-    blocs = _blocs_server(conf_text)
-    assert len(blocs) == 2, f"{len(blocs)} blocs server trouvés"
+    blocs = _blocs_server(chemin.read_text(encoding="utf-8"))
+    assert len(blocs) == nb_serveurs, f"{len(blocs)} blocs server trouvés"
     for bloc in blocs:
         assert re.search(r"access_log\s+\S+\s+eva_redacted\s*;", bloc), bloc
 
@@ -542,11 +564,12 @@ def test_les_sondes_gardent_leur_access_log_off(conf_text):
     """
     `/health` et `/ready` coupent leur journal pour ne pas noyer le fichier sous
     les sondes (choix antérieur, COR-009). SEC-016 ne le défait pas : un
-    `access_log` au niveau `server` est hérité, pas prioritaire.
+    `access_log` au niveau `server` est hérité, pas prioritaire. Le `=` est
+    optionnel dans le motif : macOS expose les deux sondes en location exacte.
     """
     nettoye = _sans_commentaires(conf_text)
-    for motif in (r"location\s+/health\s*\{[^}]*access_log\s+off\s*;",
-                  r"location\s+=\s+/ready\s*\{[^}]*access_log\s+off\s*;"):
+    for motif in (r"location\s+=?\s*/health\s*\{[^}]*access_log\s+off\s*;",
+                  r"location\s+=?\s*/ready\s*\{[^}]*access_log\s+off\s*;"):
         assert re.search(motif, nettoye, re.DOTALL), motif
 
 
@@ -577,39 +600,31 @@ def test_la_redaction_est_documentee():
 
 # ── Validation par nginx lui-même ─────────────────────────────────────────────
 
-def test_nginx_valide_la_configuration_livree(tmp_path, conf_text):
+@pytest.mark.parametrize("chemin_conf", CONFS_NGINX)
+def test_nginx_valide_la_configuration_livree(tmp_path, chemin_conf):
     """
     La seule vérification qui prouve que la syntaxe est acceptée (regex de `map`
-    comprises). `skip` propre quand nginx est absent — c'est le cas de la machine
-    de développement macOS de ce dépôt, mais **pas** des runners CI GitHub, qui
-    livrent nginx et exécutent donc réellement ce test. Les tests structurels
-    ci-dessus restent la garantie permanente ; celui-ci est la seule preuve que
-    nginx accepte ce que nous écrivons.
+    comprises), sur les DEUX confs livrées. `skip` propre quand nginx est absent
+    — c'est le cas de la machine de développement macOS de ce dépôt, mais **pas**
+    des runners CI GitHub, qui livrent nginx et exécutent donc réellement ce
+    test. Les tests structurels ci-dessus restent la garantie permanente ;
+    celui-ci est la seule preuve que nginx accepte ce que nous écrivons.
     """
     binaire = shutil.which("nginx")
     if binaire is None:
         pytest.skip("nginx absent de la machine — validation syntaxique impossible")
 
+    conf_text = chemin_conf.read_text(encoding="utf-8")
     racine = tmp_path / "racine"
     for sous in ("logs", "conf", "tmp"):
         (racine / sous).mkdir(parents=True)
     (racine / "conf" / "mime.types").write_text("types { }\n", encoding="utf-8")
 
-    # Certificat auto-signé : `nginx -t` ouvre réellement les fichiers TLS.
-    cert, cle = racine / "tls.crt", racine / "tls.key"
-    genere = subprocess.run(
-        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-         "-keyout", str(cle), "-out", str(cert), "-days", "1",
-         "-subj", "/CN=llm.eva.univ-pau.fr"],
-        capture_output=True, text=True,
-    )
-    if genere.returncode != 0:
-        pytest.skip(f"openssl indisponible : {genere.stderr.strip()[:200]}")
-
+    # macOS : le préfixe Homebrew CONTIENT "/var/log/nginx/" — remplacer le
+    # préfixe le plus long d'abord, sinon la règle Linux tronque le chemin.
     site = (
         conf_text
-        .replace("/etc/ssl/certs/llm-gateway.crt", str(cert))
-        .replace("/etc/ssl/private/llm-gateway.key", str(cle))
+        .replace("/opt/homebrew/var/log/nginx/", str(racine / "logs") + "/")
         .replace("/var/log/nginx/", str(racine / "logs") + "/")
         # Ports non privilégiés : `nginx -t` n'écoute pas, mais reste cohérent.
         .replace("listen 443 ssl;", "listen 8443 ssl;")
@@ -617,6 +632,25 @@ def test_nginx_valide_la_configuration_livree(tmp_path, conf_text):
         .replace("listen 80;", "listen 8080;")
         .replace("listen [::]:80;", "listen [::]:8080;")
     )
+
+    # Certificat auto-signé : `nginx -t` ouvre réellement les fichiers TLS. La
+    # conf macOS n'a pas de TLS actif (recette commentée) : rien à générer.
+    if re.search(r"^\s*ssl_certificate\s", site, re.MULTILINE):
+        cert, cle = racine / "tls.crt", racine / "tls.key"
+        genere = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+             "-keyout", str(cle), "-out", str(cert), "-days", "1",
+             "-subj", "/CN=llm.eva.univ-pau.fr"],
+            capture_output=True, text=True,
+        )
+        if genere.returncode != 0:
+            pytest.skip(f"openssl indisponible : {genere.stderr.strip()[:200]}")
+        site = (
+            site
+            .replace("/etc/ssl/certs/llm-gateway.crt", str(cert))
+            .replace("/etc/ssl/private/llm-gateway.key", str(cle))
+        )
+
     (racine / "conf" / "site.conf").write_text(site, encoding="utf-8")
     # `pid` et les répertoires temporaires doivent être déportés sous la racine
     # jetable : `nginx -t` ouvre RÉELLEMENT le fichier de pid, et un utilisateur

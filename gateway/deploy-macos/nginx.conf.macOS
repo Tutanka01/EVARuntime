@@ -1,9 +1,50 @@
 # /opt/homebrew/etc/nginx/servers/llm-gateway
 #
-# Configuration nginx pour macOS — reverse-proxy optionnel devant la gateway EVARuntime.
-# Installez avec : brew install nginx
-# Placez ce fichier dans /opt/homebrew/etc/nginx/servers/llm-gateway
-# Rechargez avec : brew services restart nginx
+# Reverse-proxy OPTIONNEL macOS devant la gateway EVARuntime (launchd). Le conf
+# de référence est `gateway/deploy/nginx.conf` (arbre Linux, fait foi) : ce
+# fichier en réplique les invariants — journal d'accès rédigé (SEC-016),
+# timeouts dérivés du registre (COR-009), pas de HTTP/2 livré (OPS-009), pas de
+# « Connection "upgrade" » — modulo trois divergences volontaires :
+#   - pas de TLS actif par défaut (recette commentée en fin de fichier) ;
+#   - /admin/ restreint à 127.0.0.1 (poste de développement, accès physique) ;
+#   - chemins Homebrew pour logs et certificats (/opt/homebrew/...).
+# La garde `tests/test_deploy_trees_parity.py` (PAIRES_SEMANTIQUES) vérifie que
+# ces invariants communs ne dérivent pas entre les deux arbres.
+#
+# Homebrew inclut les fichiers de servers/* DANS le contexte `http` de son
+# nginx.conf : `map` et `log_format` — directives de contexte http — sont donc
+# LÉGAUX dans ce fichier, contrairement à ce qu'une ancienne version de cet
+# en-tête laissait entendre. `deploy-macos/update.sh` copie ce fichier tel quel
+# dans servers/llm-gateway puis valide avec `nginx -t` : aucun templating.
+#
+#   brew install nginx
+#   cp gateway/deploy-macos/nginx.conf.macOS /opt/homebrew/etc/nginx/servers/llm-gateway
+#   brew services restart nginx
+#
+# Points critiques SSE (streaming) :
+#   proxy_buffering off       — désactive le buffer nginx côté réponse
+#   X-Accel-Buffering: no     — désactive le buffer nginx côté upstream
+#   chunked_transfer_encoding — nécessaire pour le streaming HTTP/1.1
+#   proxy_read_timeout 900 s  — voir « Dimensionnement des timeouts » ci-dessous
+#
+# Dimensionnement des timeouts (COR-009) — DÉRIVÉ DU REGISTRE, comme le conf
+# Linux : `ServerManager.ensure_loaded` attend `load_timeout_seconds + 10`, et
+# le pire modèle du registre livré monte à 610 s (minimax-m2.7, désactivé mais
+# réactivable). Le proxy accorde 900 s sur les routes d'inférence ET sur
+# /admin/ — POST /admin/models/{id}/load attend le chargement complet — et
+# 30 s sur /v1/models et /ready, qui ne chargent rien. À 60 s (défaut nginx)
+# sur /admin/, le bouton « Load » du dashboard finissait en 504 alors que le
+# chargement RÉUSSISSAIT côté serveur : défaut d'origine de ce fichier.
+# `gateway/doctor.py` (contrôle nginx_timeouts) recalcule l'exigence et la
+# garde de parité cite les mêmes routes des deux confs.
+#
+# Sécurité :
+#   /admin/ restreint à 127.0.0.1 (divergence macOS assumée : Linux autorise
+#   les plages RFC1918, un poste de développement n'a pas de réseau campus)
+#   Headers de sécurité HTTP (HSTS réservé au bloc TLS, voir la recette)
+#   Anti-slowloris : timeouts courts sur header/body du client
+#   limit_conn borne les streams SSE concurrents par IP (DoS GPU)
+#   Journal d'accès rédigé : aucun nom d'utilisateur en clair (SEC-016)
 
 upstream llm_gateway {
     server 127.0.0.1:8000;
@@ -11,11 +52,90 @@ upstream llm_gateway {
     keepalive_timeout 60s;
 }
 
-# Zone de rate-limiting (defense-in-depth, complément au rate limiting applicatif)
+# Zone de rate-limiting nginx (defense-in-depth, complément au rate limiting applicatif)
 limit_req_zone $binary_remote_addr zone=api_zone:10m rate=60r/m;
 # Zone de limitation des connexions concurrentes (borne les streams SSE par IP)
 limit_conn_zone $binary_remote_addr zone=api_conn:10m;
 
+# ── Journal d'accès rédigé (SEC-016) ──────────────────────────────────────────
+# AGENTS.md § Security Rules (SEC-008) : « Never log a username, an email, or
+# the free-text notes field ». Côté Python, SEC-010 a posé un filtre sur le
+# logger `uvicorn.access` (`gateway/main.py`, `_UvicornAccessRedactor`). Mais
+# nginx est DEVANT et tient SON propre journal : le format `combined` par
+# défaut écrit `$request`, c'est-à-dire la ligne de requête brute — méthode,
+# URI COMPLÈTE et query string. Un opérateur qui appelle
+#   GET /admin/users/Jean-Dupont
+#   GET /admin/usage?username=Jean-Dupont
+# écrivait donc ce nom en clair dans le journal, ce qui vide l'anonymisation
+# RGPD (DEC-001) de son sens : la ligne `users` est effacée, le journal en
+# garde copie. La première version de CE fichier avait le défaut en pire :
+# `access_log` commenté (avec une coquille « eva_rigged ») et aucun
+# `log_format` déclaré → nginx journalisait `$request` brut en `combined`.
+#
+# Arbitrage : `access_log off` fermerait la fuite mais rendrait tout diagnostic
+# d'incident impossible. On garde donc le journal, en remplaçant `$request` par
+# une reconstruction rédigée. Ce qui DISPARAÎT : le seul segment de chemin et
+# les seules valeurs de paramètres qui peuvent porter un nom. Deux variables de
+# `combined` sont retirées volontairement :
+#   - `$remote_user` : jamais renseigné ici (authentification applicative par
+#     clé Bearer), mais il porterait un identifiant si un `auth_basic` arrivait ;
+#   - `$http_referer` : contrôlé par le navigateur, susceptible de recopier
+#     l'URI d'une page admin en contournant toute la rédaction.
+# `$request_body` n'est PAS journalisé : c'est par lui que transitent `email`
+# et le champ libre `notes` (POST/PATCH /admin/users). Ne pas l'ajouter.
+
+# Chemin rédigé, dérivé de `$uri` et NON de `$request_uri` : `$uri` est
+# normalisé et pourcent-décodé, donc `/admin/users/%4Aean` y devient
+# `/admin/users/Jean` et tombe dans la règle — même chaîne que voit le filtre
+# uvicorn (`scope["path"]`), les deux côtés rédigent la même chose.
+#
+# Routes visées, telles qu'exposées par gateway/admin.py :
+#   GET|PATCH|DELETE /admin/users/{username}
+#   GET|POST         /admin/users/{username}/keys
+# La règle générique est EN DERNIER et sert de filet : toute sous-ressource
+# ajoutée demain sous /admin/users/{username}/… est rédigée par défaut. Le
+# défaut est fail-closed, comme la liste d'autorisation des paramètres.
+# `/admin/users` (liste) et `/admin/keys/{key_prefix}` ne portent pas de nom :
+# ils ne sont pas rédigés.
+map $uri $eva_log_path {
+    default                       $uri;
+    "~^/admin/users/[^/]+/keys$"  "/admin/users/<redacted>/keys";
+    "~^/admin/users/[^/]+"        "/admin/users/<redacted>";
+}
+
+# Query string rédigée, sur LISTE D'AUTORISATION — miroir de
+# `_LOGGABLE_QUERY_PARAMS` dans gateway/main.py (SEC-010). Ces cinq paramètres
+# sont structurels (pagination, bornes de dates, forçage) et n'identifient
+# personne ; `username` de `GET /admin/usage` est précisément celui que la liste
+# n'autorise pas. Tout le reste est rédigé, y compris un paramètre ajouté
+# demain : le sens de la faute est fail-closed.
+#
+# DIVERGENCE ASSUMÉE avec le filtre uvicorn : la décision est prise ici sur la
+# query string ENTIÈRE (nginx ne sait pas itérer sur les paramètres dans un
+# `map`), là où uvicorn rédige valeur par valeur. La divergence va donc
+# toujours dans le sens le plus conservateur. La liste des NOMS autorisés est
+# identique des deux côtés — une seule politique, pas deux. Comparaison
+# insensible à la casse (`~*`), comme le `nom.lower()` de main.py.
+map $args $eva_log_args {
+    default  "?<redacted>";
+    ""       "";
+    "~*^(from_date|to_date|limit|force|period)=[^&]*(&(from_date|to_date|limit|force|period)=[^&]*)*$"  "?$args";
+}
+
+# Équivalent de `combined`, `$request` remplacé par sa reconstruction rédigée,
+# et `$request_time` ajouté (durée : indispensable en incident sur une
+# passerelle d'inférence, absent de `combined`). DOIT rester identique à celui
+# du conf Linux : la garde de parité compare les deux.
+log_format eva_redacted
+    '$remote_addr [$time_local] '
+    '"$request_method $eva_log_path$eva_log_args $server_protocol" '
+    '$status $body_bytes_sent $request_time '
+    '"$http_user_agent"';
+
+# ── Serveur principal (port 80) ───────────────────────────────────────────────
+# Un seul bloc : c'est lui qui proxifie la gateway, et il redirige vers HTTPS
+# QUAND un certificat existe (comportement macOS volontaire — le HTTPS n'est
+# actif qu'après avoir décommenté la recette en fin de fichier).
 server {
     listen 80;
     server_name localhost;
@@ -25,64 +145,204 @@ server {
         return 301 https://$host$request_uri;
     }
 
-    # Journal d'accès — anonymisation des noms dans les URI admin
-    # Note: log_format must be defined at http level in nginx.conf
-    # access_log /opt/homebrew/var/log/nginx/llm-gateway-access.log eva_rigged;
-    error_log  /opt/homebrew/var/log/nginx/llm-gateway-error.log warn;
+    # Taille max du body (prompts longs) — aligné sur le conf Linux
+    client_max_body_size 10m;
 
-    # Anti-slowloris : timeouts courts sur header/body du client
-    client_body_timeout 10s;
-    client_header_timeout 10s;
-    keepalive_timeout 65s;
-    send_timeout 10s;
-    client_max_body_size 1m;
+    # ── Anti-slowloris ────────────────────────────────────────────────────────
+    # Un client doit envoyer ses headers et son body sans traîner. Ces timeouts
+    # NE s'appliquent qu'à la RÉCEPTION de la requête client (pas au streaming
+    # de la réponse, géré par proxy_read_timeout/proxy_send_timeout).
+    client_header_timeout   15s;
+    client_body_timeout     15s;
+    client_body_buffer_size 128k;
+    large_client_header_buffers 4 16k;
 
-    location / {
+    # Headers de sécurité HTTP. Pas de HSTS hors TLS : il n'est légitime
+    # qu'une fois le bloc 443 réellement actif (voir la recette HTTPS).
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+
+    # Journal d'accès rédigé (SEC-016), voir l'en-tête du fichier. Déclaré au
+    # niveau `server` : il couvre TOUTES les locations par héritage, y compris
+    # celles ajoutées plus tard. Les `access_log off` de /health et /ready
+    # restent prioritaires : ces sondes n'ont rien à journaliser. Le port 80
+    # journalise lui aussi — une redirection écrit l'URI demandée exactement
+    # comme une requête servie, et `GET /admin/users/<nom>` y écrivait le nom
+    # en clair avant même de rediriger.
+    access_log /opt/homebrew/var/log/nginx/llm-gateway-access.log eva_redacted;
+
+    error_log /opt/homebrew/var/log/nginx/llm-gateway-error.log warn;
+
+    # ── Liste des modèles (/v1/models) ─────────────────────────────────────────
+    # Route légère, non-streamante : rate-limit souple, PAS de limit_conn stricte
+    # (une requête GET rapide ne doit pas consommer un slot de concurrence GPU).
+    location = /v1/models {
+        limit_req zone=api_zone burst=10 nodelay;
+        limit_req_status 429;
+
         proxy_pass http://llm_gateway;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    30s;
+        proxy_read_timeout    30s;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection        "";
+    }
+
+    # ── API d'inférence streamante ────────────────────────────────────────────
+    # Ces routes déclenchent l'inférence GPU et peuvent streamer (SSE) longtemps.
+    # limit_conn borne les streams concurrents par IP → protège le GPU du DoS.
+    #
+    # `/completion` (sans préfixe /v1/) est l'endpoint natif llama.cpp documenté
+    # en docs/api.md §7. Même regex que le conf Linux : sans elle, la route
+    # tomberait dans le « location / » de repli (404) — COR-009.
+    location ~ ^(/v1/(chat/completions|completions|completion|embeddings)|/completion)$ {
+        # Rate limiting nginx (60 req/min par IP, burst de 10)
+        limit_req  zone=api_zone burst=10 nodelay;
+        limit_req_status 429;
+        # Max 4 requêtes d'inférence concurrentes par IP (borne les streams SSE)
+        limit_conn api_conn 4;
+        limit_conn_status 429;
+
+        proxy_pass http://llm_gateway;
+
+        # HTTP/1.1 requis pour le chunked transfer (streaming SSE)
+        proxy_http_version 1.1;
+
+        # CRITIQUE pour le streaming SSE : désactiver TOUT buffering
+        proxy_buffering        off;
+        proxy_cache            off;
+        chunked_transfer_encoding on;
+
+        # Signaler à nginx de ne pas bufferiser la réponse upstream
+        add_header X-Accel-Buffering no always;
+
+        # Timeouts longs (NE PAS réduire) : une première requête sur un modèle
+        # froid attend son chargement AVANT le 1er token. Dimensionnement en
+        # tête de fichier — dérivé du registre, comme le conf Linux.
+        proxy_connect_timeout  10s;
+        proxy_send_timeout     900s;
+        proxy_read_timeout     900s;
+
+        # Headers de forwarding
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
-        # SSE (streaming) — désactive le buffer nginx côté réponse
-        proxy_buffering off;
-        proxy_cache off;
-        chunked_transfer_encoding on;
-        tcp_nopush on;
-        tcp_nodelay on;
-
-        # Timeout : doit couvrir MODEL_LOAD_TIMEOUT_SECONDS + marge
-        # Par défaut 180s + 10s = 190s ; on met 300s pour absorber les gros modèles
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
-
-        # Rate limiting (complément au rate limiting applicatif)
-        limit_req zone=api_zone burst=5 nodelay;
-        limit_conn api_conn 10;
+        # Connection keep-alive vers upstream
+        proxy_set_header Connection "";
     }
 
-    location /admin/ {
-        # Restreindre l'accès admin à localhost uniquement en mode local
-        allow 127.0.0.1;
-        deny all;
+    # ── Autres routes /v1/ (fallback : tokenize, rerank, etc.) ─────────────────
+    # Conserve le comportement streaming/SSE d'origine par prudence, mais borné
+    # en concurrence comme les routes d'inférence.
+    location /v1/ {
+        limit_req  zone=api_zone burst=10 nodelay;
+        limit_req_status 429;
+        limit_conn api_conn 4;
+        limit_conn_status 429;
 
         proxy_pass http://llm_gateway;
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
+
+        proxy_buffering        off;
+        proxy_cache            off;
+        chunked_transfer_encoding on;
+        add_header X-Accel-Buffering no always;
+
+        # Même dimensionnement que le bloc d'inférence : /v1/tokenize et
+        # /v1/detokenize peuvent aussi déclencher un chargement de modèle.
+        proxy_connect_timeout  10s;
+        proxy_send_timeout     900s;
+        proxy_read_timeout     900s;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
     }
 
-    location /health {
-        proxy_pass http://llm_gateway;
+    # ── Health check (pas de rate limit, pas de log) ──────────────────────
+    # `proxy_http_version 1.1` + Connection vide : sans eux, chaque sonde
+    # consommerait une connexion upstream au lieu de réutiliser le keepalive.
+    location = /health {
+        proxy_pass         http://llm_gateway;
+        proxy_http_version 1.1;
+        proxy_set_header   Connection "";
+        access_log         off;
+    }
+
+    # ── Readiness (non authentifiée, documentée en docs/api.md §2) ────────
+    # Sonde distincte de /health : elle dit si la gateway peut SERVIR maintenant.
+    # `location =` EXACT (comme le conf Linux) : un préfixe /ready attraperait
+    # aussi /ready-xyz. Non-divulgation : le corps public ne contient que des
+    # identifiants de contrôle et des codes stables. Rate-limitée pour qu'une
+    # sonde publique ne devienne pas un levier de charge ; access_log coupé,
+    # un load balancer l'appelle en boucle.
+    location = /ready {
+        limit_req zone=api_zone burst=10 nodelay;
+        limit_req_status 429;
+
+        proxy_pass         http://llm_gateway;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   Connection        "";
+
+        # Contrôles structurels uniquement (stat de fichiers, arithmétique VRAM) :
+        # aucun chargement de modèle, donc pas de timeout long à prévoir.
+        proxy_connect_timeout 10s;
+        proxy_send_timeout    30s;
+        proxy_read_timeout    30s;
+
         access_log off;
     }
 
-    location /ready {
-        proxy_pass http://llm_gateway;
-        access_log off;
+    # ── Admin (localhost uniquement) ──────────────────────────────────────
+    location /admin/ {
+        # Divergence macOS assumée : le conf Linux autorise les plages RFC1918
+        # (10/8, 172.16/12, 192.168/16) pour le réseau campus ; sur un poste de
+        # développement, l'admin passe par localhost — c'est un resserrement,
+        # pas un relâchement.
+        allow 127.0.0.1;
+        deny  all;
+
+        # ── Journal d'erreur (SEC-016) ────────────────────────────────────────
+        # nginx n'a PAS d'équivalent de `log_format` pour le journal d'erreur :
+        # chaque ligne de niveau `error` traîne un contexte « client: … ,
+        # request: "GET /admin/users/<nom> HTTP/1.1" » — l'URI BRUTE, hors de
+        # portée des `map` ci-dessus. On relève donc le seuil à `crit` sur la
+        # seule location qui porte un nom dans son chemin. L'événement reste
+        # visible dans le journal d'accès rédigé (statut 403/502/504, adresse,
+        # durée) ; seul son commentaire disparaît.
+        error_log /opt/homebrew/var/log/nginx/llm-gateway-error.log crit;
+
+        proxy_pass         http://llm_gateway;
+        proxy_http_version 1.1;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   Connection        "";
+
+        # Timeouts longs et NON 30s/60s (COR-009) : POST /admin/models/{id}/load
+        # attend le chargement complet du modèle. Dimensionnement en tête de
+        # fichier — dérivé du registre, comme le conf Linux.
+        proxy_connect_timeout  10s;
+        proxy_send_timeout     900s;
+        proxy_read_timeout     900s;
+    }
+
+    # Bloquer tout le reste (nginx n'est pas un proxy ouvert)
+    location / {
+        return 404;
     }
 }
 
@@ -92,11 +352,16 @@ server {
 #     -keyout /opt/homebrew/etc/nginx/ssl/server.key \
 #     -out /opt/homebrew/etc/nginx/ssl/server.crt \
 #     -subj "/CN=localhost"
+# puis décommenter le bloc ci-dessous et recharger (brew services restart nginx).
 #
-# Décommenter le bloc ci-dessous après création du certificat :
-
+# PAS de « http2 » sous aucune forme dans la conf livrée (OPS-009, même
+# arbitrage que deploy/nginx.conf) : « listen … ssl http2 » est DÉPRÉCIÉ depuis
+# nginx 1.25.1 (warning à chaque `nginx -t`/reload), et « http2 on; » n'existe
+# PAS avant 1.25.1 (« unknown directive », le service refuse de démarrer).
+# Vérifier `nginx -v` avant de décommenter « http2 on; » ci-dessous.
+#
 # server {
-#     listen 443 ssl http2;
+#     listen 443 ssl;
 #     server_name localhost;
 #
 #     ssl_certificate /opt/homebrew/etc/nginx/ssl/server.crt;
@@ -104,6 +369,14 @@ server {
 #     ssl_protocols TLSv1.2 TLSv1.3;
 #     ssl_ciphers HIGH:!aNULL:!MD5;
 #     ssl_prefer_server_ciphers on;
+#     ssl_session_cache shared:SSL:10m;
+#     ssl_session_timeout 1d;
 #
-#     # Mêmes directives que le bloc HTTP ci-dessus...
+#     # HSTS : uniquement ici, une fois TLS réellement actif.
+#     # add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+#
+#     # http2 on;
+#
+#     # Mêmes locations que le bloc HTTP ci-dessus (client_max_body_size,
+#     # journal rédigé, timeouts 900 s sur /admin/ et l'inférence, 404 en repli).
 # }

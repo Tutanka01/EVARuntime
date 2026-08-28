@@ -22,6 +22,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHIPPED_NGINX_CONF = REPO_ROOT / "gateway" / "deploy" / "nginx.conf"
+SHIPPED_NGINX_CONF_MACOS = REPO_ROOT / "gateway" / "deploy-macos" / "nginx.conf.macOS"
 SHIPPED_MODELS_YAML = REPO_ROOT / "gateway" / "models.yaml"
 DEPLOYMENT_DOC = REPO_ROOT / "docs" / "deployment.md"
 API_DOC = REPO_ROOT / "docs" / "api.md"
@@ -150,6 +151,20 @@ def test_http2_reste_disponible_en_une_ligne_a_decommenter(conf_text):
     assert "1.25.1" in doc
 
 
+def test_la_conf_macos_n_emploie_aucune_directive_depreciee():
+    """
+    OPS-009 vaut aussi pour l'arbre macOS : `nginx.conf.macOS` est copié tel quel
+    par `deploy-macos/update.sh` et doit démarrer sans warning sur les nginx
+    récents. Détecteur partagé avec le conf Linux — son contrôle positif
+    (`test_le_detecteur_de_depreciation_voit_le_defaut_dorigine`) prouve déjà
+    qu'il voit. Les AUTRES invariants communs des deux confs (timeouts ≥ registre,
+    body size 10m, rédaction SEC-016, statuts 429, Connection "") ne sont pas
+    redécrits ici : ils sont gardés une seule fois par
+    `tests/test_deploy_trees_parity.py` (PAIRES_SEMANTIQUES).
+    """
+    assert find_deprecated(SHIPPED_NGINX_CONF_MACOS.read_text(encoding="utf-8")) == []
+
+
 # ── COR-009 : timeouts dérivés du registre ────────────────────────────────────
 
 def _https_server(text):
@@ -199,6 +214,11 @@ def test_le_registre_livre_est_lisible_et_dimensionnant():
     assert any(getattr(m, "load_timeout_seconds", None) for m in models)
     assert required >= 610, required
 
+
+# Remarque : la copie macOS (`deploy-macos/nginx.conf.macOS`) est soumise à la
+# MÊME exigence de timeouts — mais elle n'est pas redécrite ici, pour n'avoir
+# qu'un seul garde : `tests/test_deploy_trees_parity.py` (PAIRES_SEMANTIQUES)
+# réutilise `_required_timeout_seconds` et aligne les mêmes routes des deux confs.
 
 @pytest.mark.parametrize("path", [
     "/admin/models/llama-3.3-70b-instruct/load",
