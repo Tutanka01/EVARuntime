@@ -18,6 +18,22 @@ def secret_is_placeholder(secret: str) -> bool:
     return not secret or secret.strip().upper().startswith("CHANGE_ME")
 
 
+# Longueur minimale d'un secret d'exploitation non-placeholder. Alignement avec
+# node_agent.validate_runtime_security() et le garde cluster AGENT_SECRET de
+# model_manager._build_manager().
+SECRET_MIN_LENGTH = 32
+
+
+def secret_is_weak(secret: str) -> bool:
+    """
+    True si un secret est vide, placeholder ou trop court pour l'exploitation.
+
+    Un secret trivial (« password », « 12345678 ») passe le filtre placeholder :
+    c'est la faille corrigée côté ADMIN_SECRET (audit 2026-08-28, ISSUE 2).
+    """
+    return secret_is_placeholder(secret) or len(secret) < SECRET_MIN_LENGTH
+
+
 def split_list_setting(value: object, name: str) -> object:
     """
     Normalise un réglage de liste reçu depuis l'environnement.
@@ -322,6 +338,10 @@ class Settings(BaseSettings):
 
     def admin_secret_is_placeholder(self) -> bool:
         return secret_is_placeholder(self.admin_secret)
+
+    def admin_secret_is_weak(self) -> bool:
+        """Placeholder OU trop court → routes /admin fail-closed (SEC)."""
+        return secret_is_weak(self.admin_secret)
 
     def internal_api_key_is_placeholder(self) -> bool:
         return secret_is_placeholder(self.internal_api_key)

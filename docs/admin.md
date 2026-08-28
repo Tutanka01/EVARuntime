@@ -66,10 +66,11 @@ Toutes les routes `/admin/` nécessitent :
 - L'`ADMIN_SECRET` (dans `/etc/llm-gateway/env`) en Bearer token
 - Être sur le réseau campus (filtrage IP nginx)
 
-> **Fail-closed :** si `ADMIN_SECRET` est vide ou laissé à sa valeur d'exemple
-> (`CHANGE_ME_*`), toutes les routes `/admin/` répondent 503 tant qu'un secret
-> fort n'est pas configuré. Générer avec :
+> **Fail-closed :** si `ADMIN_SECRET` est vide, laissé à sa valeur d'exemple
+> (`CHANGE_ME_*`) ou plus court que 32 caractères, toutes les routes `/admin/`
+> répondent 503 tant qu'un secret fort n'est pas configuré. Générer avec :
 > `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`
+> `doctor` signale un secret faible comme un échec bloquant (exit 1).
 
 ```bash
 # Récupérer l'ADMIN_SECRET
@@ -2464,6 +2465,8 @@ reste à faire ? » et ne périme pas. Les deux sont nécessaires.
 
 ### Sécurité de l'`ADMIN_SECRET`
 
+- Minimum 32 caractères, non-placeholder : un secret plus faible désactive les
+  routes `/admin` (fail-closed 503) et est signalé bloquant par `doctor`
 - Ne jamais transmettre l'`ADMIN_SECRET` par email ou messagerie non chiffrée
 - Si compromis : générer un nouveau secret, mettre à jour `/etc/llm-gateway/env`,
   et redémarrer le service

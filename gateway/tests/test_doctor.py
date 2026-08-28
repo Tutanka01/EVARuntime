@@ -1430,6 +1430,36 @@ def test_cluster_short_agent_secret_is_blocking(tmp_path, monkeypatch):
     assert "trop-court" not in result.message  # jamais la valeur, juste la taille
 
 
+def test_admin_secret_placeholder_is_blocking(tmp_path, monkeypatch):
+    host = healthy_host(tmp_path, monkeypatch, ADMIN_SECRET="CHANGE_ME_ADMIN_SECRET")
+    report = run(host.options())
+
+    result = check(report, "admin_secret")
+    assert result.status == "fail"
+    assert result.code == "admin_secret_placeholder"
+    assert result.is_blocking is True
+    assert report.exit_code() == doctor.EXIT_BLOCKING
+
+
+def test_admin_secret_short_is_blocking(tmp_path, monkeypatch):
+    host = healthy_host(tmp_path, monkeypatch, ADMIN_SECRET="password")
+    result = check(run(host.options()), "admin_secret")
+    assert result.status == "fail"
+    assert result.code == "admin_secret_too_short"
+    assert result.is_blocking is True
+    # Jamais la valeur dans le rapport, seulement la taille jugée.
+    assert "password" not in result.message
+    assert "8 caractères" in result.message
+
+
+def test_admin_secret_strong_passes(tmp_path, monkeypatch):
+    """Contrôle positif : le secret par défaut du hôte sain passe le check."""
+    host = healthy_host(tmp_path, monkeypatch)
+    result = check(run(host.options()), "admin_secret")
+    assert result.status == "pass"
+    assert result.is_blocking is False
+
+
 def test_cluster_invalid_nodes_inventory_is_blocking(tmp_path, monkeypatch):
     host = cluster_host(tmp_path, monkeypatch)
     (tmp_path / "nodes.yaml").write_text("pas: un inventaire\n", encoding="utf-8")

@@ -96,19 +96,25 @@ async def require_admin(
     Vérifie que le header Authorization: Bearer <ADMIN_SECRET> est correct.
     En production, ces routes sont également filtrées par IP dans nginx.
 
-    Fail-closed : si ADMIN_SECRET est vide ou laissé à sa valeur d'exemple,
-    les routes admin sont désactivées plutôt que protégées par un secret connu.
+    Fail-closed : si ADMIN_SECRET est vide, laissé à sa valeur d'exemple ou
+    trop court (< SECRET_MIN_LENGTH), les routes admin sont désactivées plutôt
+    que protégées par un secret prévisible.
     """
-    from config import settings  # import local pour éviter la circularité
+    from config import SECRET_MIN_LENGTH, settings  # import local pour éviter la circularité
 
-    if settings.admin_secret_is_placeholder():
+    if settings.admin_secret_is_weak():
         log.critical(
-            "Tentative d'accès admin alors qu'ADMIN_SECRET n'est pas configuré "
-            "(vide ou valeur CHANGE_ME_*). Routes admin désactivées."
+            "Tentative d'accès admin alors qu'ADMIN_SECRET est absent, "
+            "placeholder ou plus court que %d caractères. Routes admin "
+            "désactivées (fail-closed).",
+            SECRET_MIN_LENGTH,
         )
         raise HTTPException(
             status_code=503,
-            detail="Administration désactivée : ADMIN_SECRET non configuré sur le serveur.",
+            detail=(
+                "Administration désactivée : ADMIN_SECRET non configuré ou "
+                "trop faible sur le serveur."
+            ),
         )
 
     if not credentials or credentials.scheme.lower() != "bearer":

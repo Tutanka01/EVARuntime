@@ -99,7 +99,7 @@ from typing import Any, Iterable, Sequence
 from pydantic_settings import DotEnvSettingsSource
 
 import readiness
-from config import Settings, secret_is_placeholder
+from config import SECRET_MIN_LENGTH, Settings, secret_is_placeholder
 from config import settings as _ambient_settings
 from llama_version import probe_llama_version
 from model_registry import IntegrityError, ModelDefinition, ModelRegistry
@@ -2077,6 +2077,40 @@ def check_systemd_limits(
     return _combine("systemd_limits", findings, summary + ".")
 
 
+# ── Contrôles secrets d'exploitation ──────────────────────────────────────────
+
+def check_admin_secret(config: Any) -> CheckResult:
+    """
+    ADMIN_SECRET faible = routes /admin protégées par un secret prévisible.
+
+    La gateway est fail-closed (503 sur /admin/*) pour un secret placeholder
+    OU plus court que SECRET_MIN_LENGTH — même politique que
+    `auth.require_admin`. Doctor la rend visible et BLOQUANTE avant le
+    démarrage (exit 1), sans jamais afficher la valeur : seule sa longueur
+    est jugée. (Audit 2026-08-28, ISSUE 2 : « password » passait avant.)
+    """
+    secret = str(getattr(config, "admin_secret", "") or "")
+    if secret_is_placeholder(secret):
+        return CheckResult(
+            "admin_secret", "fail", "admin_secret_placeholder",
+            "ADMIN_SECRET est vide ou laissé à sa valeur d'exemple : les routes "
+            "/admin sont DÉSACTIVÉES (fail-closed) et doctor bloque. Générez-en "
+            "un : python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"",
+        )
+    if len(secret) < SECRET_MIN_LENGTH:
+        return CheckResult(
+            "admin_secret", "fail", "admin_secret_too_short",
+            f"ADMIN_SECRET fait {len(secret)} caractères ; {SECRET_MIN_LENGTH} au "
+            "minimum sont exigés. Les routes /admin sont DÉSACTIVÉES (fail-closed) "
+            "et doctor bloque. Générez-en un : python3 -c \"import secrets; "
+            "print(secrets.token_urlsafe(32))\"",
+        )
+    return CheckResult(
+        "admin_secret", "pass", "ok",
+        "ADMIN_SECRET présent et de longueur suffisante.",
+    )
+
+
 # ── Contrôles cluster ─────────────────────────────────────────────────────────
 
 def check_cluster_agent_secret(config: Any) -> CheckResult:
@@ -2186,6 +2220,7 @@ CHECK_ORDER = (
     "models_registry",
     "enabled_models",
     "secrets",
+    "admin_secret",
     # État local persistant
     "database",
     "database_permissions",
@@ -2398,6 +2433,9 @@ async def run_doctor(options: DoctorOptions | None = None) -> DoctorReport:
 
     checks["systemd_limits"] = _safe1(
         check_systemd_limits, "systemd_limits", unit_path, config, models, sizes or {}
+    )
+    checks["admin_secret"] = _safe1(
+        check_admin_secret, "admin_secret", config
     )
     checks["cluster_agent_secret"] = _safe1(
         check_cluster_agent_secret, "cluster_agent_secret", config

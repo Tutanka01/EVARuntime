@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import database as db
 from admin import router as admin_router
 from auth import get_current_user
-from config import settings
+from config import SECRET_MIN_LENGTH, settings
 from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
 from model_manager import model_manager
@@ -115,6 +115,15 @@ async def lifespan(app: FastAPI):
         log.critical(
             "ADMIN_SECRET non configuré (vide ou CHANGE_ME_*) — les routes /admin "
             "sont DÉSACTIVÉES tant qu'un secret fort n'est pas défini."
+        )
+    elif settings.admin_secret_is_weak():
+        # Secret non-placeholder mais trivial (« password ») : même fail-closed
+        # que le placeholder. La longueur est loguée, jamais la valeur.
+        log.critical(
+            "ADMIN_SECRET trop faible (%d caractères ; %d minimum) — les routes "
+            "/admin sont DÉSACTIVÉES tant qu'un secret fort n'est pas défini.",
+            len(settings.admin_secret),
+            SECRET_MIN_LENGTH,
         )
     if settings.cluster_mode == "local" and settings.internal_api_key_is_placeholder():
         log.critical(

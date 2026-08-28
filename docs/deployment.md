@@ -1284,10 +1284,10 @@ CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 
 # ── Secrets (générés par install.sh — ne pas modifier manuellement) ───────────
-# IMPORTANT : les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou
-# laissé à une valeur d'exemple CHANGE_ME_*. La clé interne est transmise à
-# llama-server via la variable d'environnement LLAMA_API_KEY (jamais en argument
-# de commande, qui serait visible via ps).
+# IMPORTANT : les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide,
+# laissé à une valeur d'exemple CHANGE_ME_* ou plus court que 32 caractères.
+# La clé interne est transmise à llama-server via la variable d'environnement
+# LLAMA_API_KEY (jamais en argument de commande, qui serait visible via ps).
 INTERNAL_API_KEY=<généré>
 ADMIN_SECRET=<généré>
 

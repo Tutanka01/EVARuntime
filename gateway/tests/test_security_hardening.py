@@ -61,6 +61,39 @@ def test_admin_routes_disabled_with_empty_secret(monkeypatch):
     assert response.status_code in (403, 503)
 
 
+@pytest.mark.parametrize(
+    "secret_faible", ["password", "12345678", "a" * 31]
+)
+def test_admin_routes_disabled_with_weak_secret(monkeypatch, secret_faible):
+    """
+    Fail-closed : un ADMIN_SECRET trivial ou trop court désactive /admin, comme
+    un placeholder. « password » n'est pas un CHANGE_ME : il passait avant le
+    durcissement (audit 2026-08-28, ISSUE 2).
+    """
+    monkeypatch.setattr(settings, "admin_secret", secret_faible)
+    client = TestClient(main.app)
+    # Même en présentant la valeur faible « correcte », l'accès est refusé.
+    response = client.get(
+        "/admin/cluster",
+        headers={"Authorization": f"Bearer {secret_faible}"},
+    )
+    assert response.status_code == 503
+
+
+def test_admin_secret_exactly_32_chars_is_accepted(monkeypatch):
+    """
+    Contrôle positif : le garde porte bien sur la longueur et pas au-delà —
+    32 caractères exactement suffisent et la route redevient accessible.
+    """
+    secret = "a" * 32
+    monkeypatch.setattr(settings, "admin_secret", secret)
+    client = TestClient(main.app)
+    response = client.get(
+        "/admin/cluster", headers={"Authorization": f"Bearer {secret}"}
+    )
+    assert response.status_code == 200
+
+
 # ── Quota mensuel ─────────────────────────────────────────────────────────────
 
 def _user(monthly_limit: int) -> dict:
