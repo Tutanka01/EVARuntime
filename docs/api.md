@@ -1197,6 +1197,13 @@ Toutes les erreurs suivent le format OpenAI standard :
 }
 ```
 
+> **Note de confidentialité** : les messages d'erreur ne contiennent jamais de
+> détail d'infrastructure (chemins de fichiers, stderr de `llama-server`, URL
+> internes, corps HTTP des node-agents). Un échec de chargement renvoie un
+> message générique identifiant le modèle ; le détail technique complet reste
+> dans les journaux serveur (corrélation avec l'`request_id` du journal
+> d'usage).
+
 ### Gestion des erreurs avec openai-python
 
 ```python

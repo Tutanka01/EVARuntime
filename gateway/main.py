@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import logging.config
 import time
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import database as db
 from admin import router as admin_router
 from auth import get_current_user
-from config import settings
+from config import SECRET_MIN_LENGTH, settings
 from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
 from model_manager import model_manager
@@ -105,6 +106,40 @@ async def _validate_inference_runtime(enabled_models) -> None:
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
+_RETENTION_INTERVAL_SECONDS = 24 * 3600
+_retention_task: asyncio.Task | None = None
+
+
+async def _retention_loop() -> None:
+    """
+    Boucle de rétention RGPD : une passe immédiate, puis toutes les 24 h.
+
+    Supprime les entrées `usage_log` au-delà de USAGE_RETENTION_DAYS (0 =
+    désactivé) et borne les sauvegardes `*.pre-migration.*.bak` à
+    MIGRATION_BACKUPS_TO_KEEP — sans quoi une copie des données personnelles
+    survivait indéfiniment à `anonymize_user` (DEC-001). Un échec n'est jamais
+    fatal : la passe suivante retentera.
+    """
+    while True:
+        try:
+            counts = await db.run_retention_pass(
+                settings.usage_retention_days,
+                settings.migration_backups_to_keep,
+            )
+            if counts["usage_deleted"] or counts["backups_purged"]:
+                log.info(
+                    "Rétention RGPD : %d entrée(s) usage_log supprimée(s), "
+                    "%d sauvegarde(s) pre-migration purgée(s).",
+                    counts["usage_deleted"],
+                    counts["backups_purged"],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Passe de rétention RGPD échouée (reprise dans 24 h).")
+        await asyncio.sleep(_RETENTION_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialisation au démarrage, nettoyage à l'arrêt."""
@@ -115,6 +150,15 @@ async def lifespan(app: FastAPI):
         log.critical(
             "ADMIN_SECRET non configuré (vide ou CHANGE_ME_*) — les routes /admin "
             "sont DÉSACTIVÉES tant qu'un secret fort n'est pas défini."
+        )
+    elif settings.admin_secret_is_weak():
+        # Secret non-placeholder mais trivial (« password ») : même fail-closed
+        # que le placeholder. La longueur est loguée, jamais la valeur.
+        log.critical(
+            "ADMIN_SECRET trop faible (%d caractères ; %d minimum) — les routes "
+            "/admin sont DÉSACTIVÉES tant qu'un secret fort n'est pas défini.",
+            len(settings.admin_secret),
+            SECRET_MIN_LENGTH,
         )
     if settings.cluster_mode == "local" and settings.internal_api_key_is_placeholder():
         log.critical(
@@ -173,6 +217,13 @@ async def lifespan(app: FastAPI):
     await db.init_db()
     log.info("Base de données initialisée : %s", settings.db_path)
 
+    # ── Rétention RGPD (usage_log + sauvegardes pre-migration) ────────────────
+    # Une passe au démarrage (borne aussi les fichiers hérités d'avant ce
+    # correctif), puis toutes les 24 h. Suppression seule : jamais de VACUUM
+    # sous trafic. 0 désactive la rétention usage_log.
+    global _retention_task
+    _retention_task = asyncio.create_task(_retention_loop(), name="rgpd-retention")
+
     log.info("Mode déploiement : CLUSTER_MODE=%s", settings.cluster_mode)
     await model_manager.start_health_monitor()
 
@@ -199,6 +250,14 @@ async def lifespan(app: FastAPI):
     init_http_client()
 
     yield
+
+    if _retention_task is not None:
+        _retention_task.cancel()
+        try:
+            await _retention_task
+        except asyncio.CancelledError:
+            pass
+        _retention_task = None
 
     if settings.cluster_mode == "cluster":
         log.info(

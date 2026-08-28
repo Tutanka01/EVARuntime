@@ -215,8 +215,13 @@ async def proxy_request(
             headers={"Retry-After": str(settings.capacity_queue_retry_after_seconds)},
         )
     except TimeoutError as exc:
+        # Le message est sûr par construction (server_manager._wait_for_health) :
+        # ni stderr, ni chemin, ni URL interne. On le journalise côté serveur
+        # pour corrélation avec le détail technique (OPS-004).
+        log.error("Chargement de '%s' impossible (timeout) : %s", model_id, exc)
         return _openai_error(503, str(exc), "server_error")
     except RuntimeError as exc:
+        log.error("Chargement de '%s' impossible : %s", model_id, exc)
         return _openai_error(503, str(exc), "server_error")
     except Exception:
         log.exception("Erreur inattendue lors du chargement du modèle '%s'", model_id)

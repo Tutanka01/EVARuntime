@@ -64,6 +64,19 @@ divergence est devenue légitime — la déclarer dans le manifeste avec sa
 justification. Tout nouveau fichier dupliqué doit être déclaré : un fichier
 commun non répertorié fait échouer la CI.
 
+Les fichiers de **rôle équivalent mais de nom différent** — `deploy/nginx.conf`
+(référence) et `deploy-macos/nginx.conf.macOS` — échappent au mécanisme par nom
+(intersection des noms de fichiers) : ils sont appariés à part dans
+`PAIRES_SEMANTIQUES` et comparés sur leurs **invariants communs** — rédaction
+du journal d'accès (SEC-016), timeouts dérivés du registre (COR-009),
+`client_max_body_size`, statuts 429, `Connection ""`, aucun `http2` actif — pas
+à la ligne. Leurs divergences légitimes restent tolérées (TLS actif côté Linux
+et recette commentée côté macOS, allowlist admin, chemins Homebrew) ; un écart
+de timeout ou de rédaction entre les deux confs fait échouer la CI. Un contrôle
+positif de mutation réinjecte les défauts d'origine de la copie macOS (timeout
+court, `$request` brut, « Connection "upgrade" ») et prouve que le garde les
+voit.
+
 ### Installation rapide
 
 ```bash
@@ -177,6 +190,33 @@ La mise à jour préserve :
 - `~/.config/evaruntime/env` (hors clés de mode explicitement demandées)
 - `~/Library/Application Support/evaruntime/data/gateway.db` (base de données)
 - `~/Library/Application Support/evaruntime/models/` (modèles GGUF)
+
+#### Reverse-proxy optionnel (nginx — Homebrew)
+
+La gateway écoute en clair sur `127.0.0.1:8000` ; pour la mettre derrière nginx
+(port 80, HTTPS local, poste partagé) :
+
+```bash
+brew install nginx
+cp gateway/deploy-macos/nginx.conf.macOS /opt/homebrew/etc/nginx/servers/llm-gateway
+brew services restart nginx
+```
+
+La copie macOS réplique les invariants du conf de référence
+(`gateway/deploy/nginx.conf`, [§8](#8-configuration-nginx) et
+[§16](#16-durcissement-nginx-anti-slowloris-et-concurrence)) : journal d'accès
+rédigé `eva_redacted` — aucun `username` ni email en clair (SEC-016) —
+`error_log crit` sur `/admin/`, timeouts 900 s dérivés du registre (COR-009) sur
+l'inférence et `/admin/`, anti-slowloris, `limit_conn` bornant les streams SSE,
+`client_max_body_size 10m`, `Connection ""` (keepalive upstream).
+
+Trois divergences sont volontaires, déclarées dans l'en-tête du fichier : TLS
+inactif par défaut (recette HTTPS commentée en fin de fichier), `/admin/`
+restreint à `127.0.0.1` (poste de développement, là où Linux autorise les plages
+RFC1918 du réseau campus), chemins Homebrew
+(`/opt/homebrew/var/log/nginx/llm-gateway-*.log`). La parité de ces invariants
+est gardée par `tests/test_deploy_trees_parity.py` (paires sémantiques) :
+toute divergence de timeout ou de rédaction entre les deux confs échoue en CI.
 
 #### uninstall.sh — Désinstallation propre
 
@@ -1283,11 +1323,17 @@ CAPACITY_QUEUE_TIMEOUT_SECONDS=120
 CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 
+# ── Rétention RGPD ────────────────────────────────────────────────────────────
+# usage_log : suppression au-delà de N jours, au démarrage puis toutes les 24 h
+# (0 = désactivé). Sauvegardes pre-migration : N plus récentes conservées (≥ 1).
+USAGE_RETENTION_DAYS=365
+MIGRATION_BACKUPS_TO_KEEP=2
+
 # ── Secrets (générés par install.sh — ne pas modifier manuellement) ───────────
-# IMPORTANT : les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide ou
-# laissé à une valeur d'exemple CHANGE_ME_*. La clé interne est transmise à
-# llama-server via la variable d'environnement LLAMA_API_KEY (jamais en argument
-# de commande, qui serait visible via ps).
+# IMPORTANT : les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide,
+# laissé à une valeur d'exemple CHANGE_ME_* ou plus court que 32 caractères.
+# La clé interne est transmise à llama-server via la variable d'environnement
+# LLAMA_API_KEY (jamais en argument de commande, qui serait visible via ps).
 INTERNAL_API_KEY=<généré>
 ADMIN_SECRET=<généré>
 
@@ -3115,6 +3161,16 @@ curl -sk -H "X-Admin-Secret: $ADMIN_SECRET" \
 sudo grep -c 'CANARI' /var/log/nginx/llm-gateway-access.log   # doit afficher 0
 sudo tail -1 /var/log/nginx/llm-gateway-access.log            # doit montrer « ?<redacted> »
 ```
+
+**Copie macOS.** Le reverse-proxy optionnel de l'arbre macOS
+(`deploy-macos/nginx.conf.macOS`) réplique ces invariants — mêmes `map` de
+rédaction, même `log_format eva_redacted`, même liste d'autorisation des
+paramètres, `error_log crit` sur `/admin/` — aux chemins Homebrew près
+(`/opt/homebrew/var/log/nginx/llm-gateway-*.log`). La garde de parité
+(`tests/test_deploy_trees_parity.py`, paires sémantiques) compare les deux
+confs : toute divergence de rédaction entre les arbres échoue en CI. Le
+détail des divergences macOS volontaires : voir « Reverse-proxy optionnel »
+au chapitre Déploiement macOS.
 
 ---
 

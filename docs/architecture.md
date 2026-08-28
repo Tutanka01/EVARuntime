@@ -1102,9 +1102,15 @@ neuve (rien à protéger).
   largement accessible que la base elle-même.
 - `O_EXCL` : une sauvegarde existante n'est jamais écrasée.
 
-Ces sauvegardes ne sont pas purgées automatiquement : elles font partie de
-l'état à surveiller côté disque, et ne sont produites qu'à chaque changement de
-version de schéma.
+Ces sauvegardes contiennent une copie complète de la base (users, api_keys,
+usage_log) : leur rétention est **bornée** à `MIGRATION_BACKUPS_TO_KEEP`
+(2 par défaut, minimum 1). La purge suit chaque migration réussie et chaque
+passe de rétention du lifespan — sans elle, une copie des données personnelles
+survivrait indéfiniment à `anonymize_user` (DEC-001). Seul le motif
+`<db>.pre-migration.` est purgé : jamais les sauvegardes `.pre-admin.` /
+`.pre-bootstrap.` du registre ni les archives du script de sauvegarde. La plus
+récente est toujours conservée : la procédure de rollback ci-dessous s'appuie
+sur elle.
 
 #### Comportement en cas d'échec — fail-closed
 

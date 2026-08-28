@@ -10,6 +10,7 @@ comportement opérateur en cas d'échec.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -332,6 +333,40 @@ async def _backup_database(
     return target
 
 
+def purge_pre_migration_backups(db_path: Path, keep: int = 2) -> int:
+    """
+    Borne la rétention des sauvegardes `*.pre-migration.*.bak` (RGPD / OPS-002).
+
+    Ces sauvegardes contiennent une copie complète de la base (users, api_keys,
+    usage_log) : sans purge, elles survivent indéfiniment à `anonymize_user`
+    et DEC-001 ne garantit plus rien — une copie personnelle datée traîne
+    à côté de la base. La purge ne touche QUE le motif
+    `<nom_db>.pre-migration.` : jamais les sauvegardes `.pre-admin.` /
+    `.pre-bootstrap.` du registre, jamais les archives du script de sauvegarde.
+
+    Les `keep` sauvegardes les plus récentes sont conservées (au moins une,
+    même si `keep` vaut moins : la procédure de rollback documentée repose sur
+    la plus récente). Retourne le nombre de fichiers supprimés.
+    """
+    keep = max(1, keep)
+    prefix = f"{db_path.name}.pre-migration."
+    candidates = sorted(
+        (p for p in db_path.parent.glob(f"{prefix}*.bak") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    removed = 0
+    for stale in candidates[keep:]:
+        try:
+            stale.unlink()
+            removed += 1
+        except OSError:
+            # Best-effort : un fichier retenu (permission, antivirus) ne doit
+            # pas empêcher le démarrage ; il sera retenté à la prochaine passe.
+            logger.warning("Purge impossible de la sauvegarde %s.", stale)
+    return removed
+
+
 async def _apply_migration(db: aiosqlite.Connection, migration: Migration) -> None:
     """
     Applique une migration de façon atomique : SQL, hook Python et
@@ -453,6 +488,18 @@ async def _migrate(db_path: Path) -> None:
                 await _apply_migration(db, migration)
         finally:
             await db.execute("PRAGMA foreign_keys = ON")
+
+        # Borne la rétention des sauvegardes produites (RGPD / OPS-002) —
+        # uniquement après un succès complet : en cas d'échec, toutes les
+        # sauvegardes de la série restent disponibles pour le rollback.
+        purged = purge_pre_migration_backups(
+            db_path, settings.migration_backups_to_keep
+        )
+        if purged:
+            logger.info(
+                "Rétention des sauvegardes pre-migration : %d fichier(s) purgé(s).",
+                purged,
+            )
 
 
 async def init_db() -> None:
@@ -802,6 +849,32 @@ async def log_usage(
         await db.commit()
 
 
+async def _delete_usage_rows(db: aiosqlite.Connection, days: int) -> int:
+    """DELETE partagé des entrées usage_log plus anciennes que `days` jours."""
+    cursor = await db.execute(
+        "DELETE FROM usage_log WHERE timestamp < datetime('now', ? || ' days')",
+        (f"-{days}",),
+    )
+    deleted = cursor.rowcount
+    await db.commit()
+    return deleted
+
+
+async def delete_usage_older_than(days: int) -> int:
+    """
+    Suppression LIVE des entrées `usage_log` plus anciennes que `days` jours.
+
+    Contrairement à `purge_usage_older_than`, aucun `VACUUM` : la requête
+    s'exécute pendant que la gateway sert (WAL, transaction courte). L'espace
+    disque n'est rendu que par la prochaine purge manuelle hors ligne.
+    Retourne le nombre de lignes supprimées.
+    """
+    if days < 0:
+        raise ValueError("days doit être >= 0")
+    async with get_db() as db:
+        return await _delete_usage_rows(db, days)
+
+
 async def purge_usage_older_than(days: int) -> int:
     """
     Purge de rétention MANUELLE (opt-in) des entrées `usage_log` plus anciennes
@@ -809,22 +882,38 @@ async def purge_usage_older_than(days: int) -> int:
 
     Le `timestamp` est stocké en UTC au format SQLite (`datetime('now')`), donc la
     comparaison à `datetime('now', '-N days')` est correcte. Retourne le nombre de
-    lignes supprimées. Aucune suppression automatique n'est déclenchée ailleurs ;
-    à exécuter hors ligne (VACUUM verrouille la base).
+    lignes supprimées. À exécuter hors ligne (VACUUM verrouille la base) — la
+    rétention automatique quotidienne passe par `delete_usage_older_than`,
+    qui ne fait pas de VACUUM. Le VACUUM s'exécute sur la MÊME connexion que
+    le DELETE : une seconde connexion porte encore des statements ouverts.
     """
     if days < 0:
         raise ValueError("days doit être >= 0")
     async with get_db() as db:
-        cursor = await db.execute(
-            "DELETE FROM usage_log WHERE timestamp < datetime('now', ? || ' days')",
-            (f"-{days}",),
-        )
-        deleted = cursor.rowcount
-        await db.commit()
+        deleted = await _delete_usage_rows(db, days)
         # VACUUM complet (pas de PRAGMA incremental_vacuum : auto_vacuum n'est pas
         # activé, et on ne le change pas sur une base existante).
         await db.execute("VACUUM")
         return deleted
+
+
+async def run_retention_pass(usage_days: int, bak_keep: int) -> dict[str, int]:
+    """
+    Une passe de rétention RGPD, appelée par le lifespan de la gateway au
+    démarrage puis toutes les 24 h : usage_log au-delà de `usage_days` jours
+    (0 = désactivé) et sauvegardes pre-migration au-delà des `bak_keep` plus
+    récentes.
+
+    Vivre-sûr : suppression seule, jamais de VACUUM (la purge des .bak est
+    sync FS — déportée hors de la boucle d'événements).
+    """
+    deleted_usage = 0
+    if usage_days > 0:
+        deleted_usage = await delete_usage_older_than(usage_days)
+    purged_backups = await asyncio.to_thread(
+        purge_pre_migration_backups, settings.db_path, bak_keep
+    )
+    return {"usage_deleted": deleted_usage, "backups_purged": purged_backups}
 
 
 async def get_usage_report(

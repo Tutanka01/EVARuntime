@@ -83,6 +83,7 @@ contrôle critique en échec) :
 | `models_config` | `MODELS_CONFIG_PATH` présent et lisible | oui | identique |
 | `enabled_models` | au moins un modèle `enabled: true` dans le registre | oui | identique |
 | `secrets` | `ADMIN_SECRET` / `INTERNAL_API_KEY` (ou `AGENT_SECRET`) non laissés à une valeur `CHANGE_ME_*` | **non** (`warn`) | identique, sur `AGENT_SECRET` |
+| `admin_secret` | `ADMIN_SECRET` présent, non-placeholder et d'au moins 32 caractères (routes `/admin` fail-closed sinon) | oui | identique |
 | `llama_server_binary` | `LLAMA_SERVER_BIN` existe et est exécutable | oui | `skip` — délégué aux node-agents |
 | `model_files` | pour chaque modèle **activé** : GGUF présent et lisible, plus `mmproj_path` si la capability `vision` est déclarée | oui | `skip` — délégué aux node-agents |
 | `database` | répertoire de la base inscriptible (WAL crée `-wal`/`-shm`) et fichier inscriptible s'il existe | oui | identique |

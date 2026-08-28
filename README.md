@@ -225,7 +225,7 @@ Start with [gateway/.env.example](gateway/.env.example). The important settings 
 | `MODELS_CONFIG_PATH` | YAML model registry |
 | `LLAMA_SERVER_BIN` | Published CUDA runtime (supported default: `/opt/llama.cpp/current/llama-server`) |
 | `INTERNAL_API_KEY` | Internal gateway-to-backend key |
-| `ADMIN_SECRET` | Secret for admin endpoints |
+| `ADMIN_SECRET` | Secret for admin endpoints (≥ 32 chars, enforced fail-closed) |
 | `IDLE_TIMEOUT_SECONDS` | Idle delay before unloading a model |
 | `TOTAL_VRAM_GB` | Total GPU VRAM used to compute the model manager budget |
 | `CLUSTER_MODE` | `local` or `cluster` |

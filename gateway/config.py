@@ -18,6 +18,22 @@ def secret_is_placeholder(secret: str) -> bool:
     return not secret or secret.strip().upper().startswith("CHANGE_ME")
 
 
+# Longueur minimale d'un secret d'exploitation non-placeholder. Alignement avec
+# node_agent.validate_runtime_security() et le garde cluster AGENT_SECRET de
+# model_manager._build_manager().
+SECRET_MIN_LENGTH = 32
+
+
+def secret_is_weak(secret: str) -> bool:
+    """
+    True si un secret est vide, placeholder ou trop court pour l'exploitation.
+
+    Un secret trivial (« password », « 12345678 ») passe le filtre placeholder :
+    c'est la faille corrigée côté ADMIN_SECRET (audit 2026-08-28, ISSUE 2).
+    """
+    return secret_is_placeholder(secret) or len(secret) < SECRET_MIN_LENGTH
+
+
 def split_list_setting(value: object, name: str) -> object:
     """
     Normalise un réglage de liste reçu depuis l'environnement.
@@ -180,6 +196,18 @@ class Settings(BaseSettings):
     # Secret pour les endpoints /admin (en plus du filtrage IP)
     admin_secret: str = "CHANGE_ME_ADMIN_SECRET"
 
+    # ── Rétention RGPD ─────────────────────────────────────────────────────────
+    # Entrées usage_log supprimées au-delà de N jours : au démarrage, puis
+    # toutes les 24 h (suppression seule, sans VACUUM). 0 = rétention
+    # désactivée. L'espace disque n'est rendu que par la purge manuelle
+    # `llmgw purge-usage` (VACUUM, hors ligne).
+    usage_retention_days: int = 365
+    # Sauvegardes `*.pre-migration.*.bak` conservées (les plus récentes).
+    # Minimum 1 : la procédure de rollback documentée repose sur la plus
+    # récente. Elles contiennent une copie complète de la base — la borne est
+    # ce qui empêche une copie de survivre indéfiniment à `anonymize_user`.
+    migration_backups_to_keep: int = 2
+
     # ── Gateway réseau ─────────────────────────────────────────────────────────
     gateway_host: str = "127.0.0.1"
     gateway_port: int = 8000
@@ -243,6 +271,20 @@ class Settings(BaseSettings):
     def validate_max_models(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"max_loaded_models doit être ≥ 1, reçu : {v}")
+        return v
+
+    @field_validator("usage_retention_days")
+    @classmethod
+    def validate_usage_retention(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"usage_retention_days doit être ≥ 0 (0 = désactivé), reçu : {v}")
+        return v
+
+    @field_validator("migration_backups_to_keep")
+    @classmethod
+    def validate_migration_backups_to_keep(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"migration_backups_to_keep doit être ≥ 1, reçu : {v}")
         return v
 
     @field_validator(
@@ -322,6 +364,10 @@ class Settings(BaseSettings):
 
     def admin_secret_is_placeholder(self) -> bool:
         return secret_is_placeholder(self.admin_secret)
+
+    def admin_secret_is_weak(self) -> bool:
+        """Placeholder OU trop court → routes /admin fail-closed (SEC)."""
+        return secret_is_weak(self.admin_secret)
 
     def internal_api_key_is_placeholder(self) -> bool:
         return secret_is_placeholder(self.internal_api_key)
