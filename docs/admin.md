@@ -693,13 +693,19 @@ w.writerows(data)
 
 ### Rétention / purge du journal d'usage
 
-Le journal `usage_log` grossit indéfiniment. La purge est **manuelle et opt-in** :
-aucune suppression n'est déclenchée automatiquement. Utilisez la commande CLI
-`purge-usage` pour supprimer les entrées plus anciennes que N jours, suivie d'un
-`VACUUM` complet qui restitue l'espace disque.
+**Rétention automatique (défaut) :** les entrées `usage_log` plus anciennes que
+`USAGE_RETENTION_DAYS` (365 par défaut, `0` = désactivé) sont supprimées au
+démarrage de la gateway puis toutes les 24 h — suppression seule, sans `VACUUM`,
+sans interruption de service. C'est la borne qui empêche une copie pseudonymisée
+de survivre indéfiniment ; elle complète la politique DEC-001 (l'anonymisation
+conserve l'usage agrégé, la rétention en borne la durée).
+
+**Rendu d'espace disque (manuel, hors ligne) :** la suppression ne restitue pas
+l'espace disque. Utilisez la commande CLI `purge-usage` pour une passe avec
+`VACUUM` complet :
 
 ```bash
-# Supprimer les entrées usage_log de plus de 365 jours
+# Supprimer les entrées usage_log de plus de 365 jours + VACUUM
 llmgw purge-usage --older-than-days 365
 # → « Purge terminée : N entrée(s) usage_log supprimée(s) (> 365 jours). »
 ```
@@ -711,6 +717,12 @@ llmgw purge-usage --older-than-days 365
 > La rétention n'affecte que l'historique de reporting. Les quotas glissants
 > (30 jours) ne portent que sur des fenêtres récentes ; conservez donc au moins
 > ~30 jours de journal si vous purgez agressivement.
+
+**Rétention des sauvegardes pre-migration :** les `*.pre-migration.*.bak` sont
+bornées à `MIGRATION_BACKUPS_TO_KEEP` (2 par défaut, minimum 1 — la procédure
+de rollback repose sur la plus récente). La purge suit chaque migration réussie
+et chaque passe de rétention ; elle ne touche jamais les sauvegardes
+`.pre-admin.` / `.pre-bootstrap.` du registre.
 
 ---
 

@@ -196,6 +196,18 @@ class Settings(BaseSettings):
     # Secret pour les endpoints /admin (en plus du filtrage IP)
     admin_secret: str = "CHANGE_ME_ADMIN_SECRET"
 
+    # ── Rétention RGPD ─────────────────────────────────────────────────────────
+    # Entrées usage_log supprimées au-delà de N jours : au démarrage, puis
+    # toutes les 24 h (suppression seule, sans VACUUM). 0 = rétention
+    # désactivée. L'espace disque n'est rendu que par la purge manuelle
+    # `llmgw purge-usage` (VACUUM, hors ligne).
+    usage_retention_days: int = 365
+    # Sauvegardes `*.pre-migration.*.bak` conservées (les plus récentes).
+    # Minimum 1 : la procédure de rollback documentée repose sur la plus
+    # récente. Elles contiennent une copie complète de la base — la borne est
+    # ce qui empêche une copie de survivre indéfiniment à `anonymize_user`.
+    migration_backups_to_keep: int = 2
+
     # ── Gateway réseau ─────────────────────────────────────────────────────────
     gateway_host: str = "127.0.0.1"
     gateway_port: int = 8000
@@ -259,6 +271,20 @@ class Settings(BaseSettings):
     def validate_max_models(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"max_loaded_models doit être ≥ 1, reçu : {v}")
+        return v
+
+    @field_validator("usage_retention_days")
+    @classmethod
+    def validate_usage_retention(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"usage_retention_days doit être ≥ 0 (0 = désactivé), reçu : {v}")
+        return v
+
+    @field_validator("migration_backups_to_keep")
+    @classmethod
+    def validate_migration_backups_to_keep(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"migration_backups_to_keep doit être ≥ 1, reçu : {v}")
         return v
 
     @field_validator(

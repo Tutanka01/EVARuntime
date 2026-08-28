@@ -1283,6 +1283,12 @@ CAPACITY_QUEUE_TIMEOUT_SECONDS=120
 CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 
+# ── Rétention RGPD ────────────────────────────────────────────────────────────
+# usage_log : suppression au-delà de N jours, au démarrage puis toutes les 24 h
+# (0 = désactivé). Sauvegardes pre-migration : N plus récentes conservées (≥ 1).
+USAGE_RETENTION_DAYS=365
+MIGRATION_BACKUPS_TO_KEEP=2
+
 # ── Secrets (générés par install.sh — ne pas modifier manuellement) ───────────
 # IMPORTANT : les routes /admin répondent 503 tant qu'ADMIN_SECRET est vide,
 # laissé à une valeur d'exemple CHANGE_ME_* ou plus court que 32 caractères.
