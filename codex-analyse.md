@@ -29,7 +29,7 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 | **Où en est-on** | Jalons **M0 et M1 atteints**. Après fusion de la PR #13 dans `dev`, l'audit post-merge (§0.16) a réparé le contrat de l'installation réelle : runtime/service/registre alignés, artefacts d'exploitation installés, dépendances hashées, dashboard hors ligne, métriques runtime et runbook complet. M2 reste volontairement non prononcé |
 | **Ce qui bloque** | **Deux preuves P0 terrain**, pas un correctif local : exécuter la recette vrai petit GGUF (TST-004) et observer profils systemd/nginx sur le matériel de staging (OPS-001). Le `bootstrap-apply --apply` GPU/nginx et son rapport restent la preuve de sortie M2 |
 | **Ce qui vient ensuite** | Fournir une matrice `--runtime-variants` épinglée réelle, exécuter le runbook de `docs/deployment.md` sur l'hôte cible, lancer `doctor`, la recette petit GGUF puis le premier token via nginx, et archiver le rapport. Ensuite seulement : restore drill, endurance et SLO de M4/M5 |
-| **Santé des tests** | Dernier relevé documenté : **2408 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). La collecte du 2026-08-24 recense **2414 tests gateway + 67 node-agent** ; les 10 tests de flux récemment ajoutés passent localement. `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
+| **Santé des tests** | Dernier relevé documenté : **2447 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). Relevé du 2026-08-28 : **2449 tests gateway + 67 node-agent**. `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
 | **Reste à faire** | 25 items sur 96 (§0.3). Tous les P0 de code/supply-chain identifiés sont fermés ; TST-004 et OPS-001 restent ouverts parce que leur acceptation exige un runtime/GGUF et un staging réels |
 | **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
 | **Ce que l'audit post-merge a appris** | Une procédure peut être juste module par module et rester inexécutable une fois installée : chemins runtime divergents, EnvironmentFile jamais promu, modèles absents activés, artefacts seulement copiés par update et documentation pointant vers un secret inexistant. Voir §0.16 |
@@ -65,7 +65,7 @@ le verdict post-merge et les preuves encore requises.
 
 | Champ | Valeur |
 |---|---|
-| Dernière mise à jour | 2026-08-24 |
+| Dernière mise à jour | 2026-08-28 |
 | Phase | **Audit post-merge de production — code et runbook durcis, jalon M2 toujours non prononcé.** Les défauts du layout installé, du service env, de la reproductibilité et de l'observabilité sont fermés. La sortie attend l'exécution physique GPU/nginx/GGUF et les deux P0 terrain TST-004 / OPS-001 |
 | Jalon atteint | **M1 — planificateur de bootstrap** (§13), sortie prononcée (§0.12.1). M0 atteint le 2026-07-30 (§0.7.1) |
 | Jalon visé | **M2 — installation jusqu'au premier token** (§13) — état post-merge en **§0.16.1** |
@@ -79,9 +79,9 @@ le verdict post-merge et les preuves encore requises.
 
 | Suite | Commande | Référence | État courant |
 |---|---|---:|---:|
-| `gateway` | `cd gateway && python -m pytest tests -q` | 309 | **2410** 🔬 (2408 réussis + 2 `skip` locaux) |
+| `gateway` | `cd gateway && python -m pytest tests -q` | 309 | **2449** 🔬 (2447 réussis + 2 `skip` locaux) |
 | `node_agent` | `cd node_agent && python -m pytest tests -q` | 45 | **67** 🔬 |
-| **Total** | — | **354** | **2477** 🔬 (2475 réussis + 2 `skip`) |
+| **Total** | — | **354** | **2516** 🔬 (2514 réussis + 2 `skip`) |
 
 Cette base est le point de non-régression : aucune livraison ne doit la faire
 baisser, et chaque item livré doit l'augmenter du nombre de ses régressions.
@@ -337,6 +337,7 @@ ainsi qu'un rollback tardif et les courses local/cluster, sont testés.
 | 2026-08-03 | COR-030, TST-007, SEC-017, AUT-019, COR-027 | `b4140ca`, `f3bbc11`, `8d59ff3`, `ab6f9c3`, `661ddac` | `pytest tests -q` (2 composants) + 21 rouges par retrait | **2363** après fusion (+36) ; **dernier blocage de code de M2 levé**, garde-fou d'imports rendu voyant (2 tests d'absence étaient inertes), recoupement du manifeste raccordé au parcours 🔬 |
 | 2026-08-03 | **Vague 7** | `55b36fb` | Les 2 suites + `ruff` + `bash -n` sur les deux composants | **2426 réussis** (2363 + 1 `skip` / 63) ; 18 items livrés, **Lot B clos**, aucun blocage de code connu restant sur la route de M2. Jalon **toujours non prononcé** : preuve terrain seule manquante (§0.15.1) 🔬 |
 | 2026-08-03 | **Revue PR #13** | `a5970cb`, suivi `5b431c3` | Faux layout `/opt`, snapshot/rollback réel, branches GPU bash, rapport bout en bout, concurrence scalaire ; suites complètes locales puis CI Python 3.11 (`30827615422`) + `ruff` + `bash -n` + audit | **2441 tests CI** (2378 / 63), +14. Quatre raccords inter-chantiers fermés : `bootstrap/` réellement déployé, CPU-only actualisable, `constat-opérateur` conservé, édition YAML concurrente refusée 🔬 |
+| 2026-08-28 | **Issue #29** (parité deploy) | — | `pytest tests -q` (gateway, **2447** / 2 `skip`) + `ruff` + `bash -n` des deux arbres + mutation unilatérale rejouée sur le garde | Garde de parité `deploy/` (référence) ↔ `deploy-macos/` livré : `gateway/tests/test_deploy_trees_parity.py`, 23 tests (manifeste bijectif des 8 fichiers communs, miroirs normalisés, fonctions partagées, divergences justifiées, invariants transverses, contrôle positif de mutation). **6 dérives réelles fermées**, dont `deploy-macos/update.sh` exécutant le smoke test **Linux** (gate sur un autre artefact que celui déployé) et le signal SEC-002 absent de l'arbre macOS. Rotation de backup macOS unifiée sur la boucle Linux, **exécutée pour de vrai** sur répertoire factice. CI : `bash -n` étendu à `gateway/deploy-macos/*.sh` 🔬 |
 
 ### 0.7.1 Sortie du jalon M0
 

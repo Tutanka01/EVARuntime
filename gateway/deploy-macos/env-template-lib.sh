@@ -122,3 +122,10 @@ CLUSTER_MODE=local
 # CLUSTER_HEALTH_FAILURES_TO_OFFLINE=3
 EOF
 }
+
+# ── Clés de durcissement attendues dans un environnement existant ─────────────
+# Même contrat que deploy/env-template-lib.sh : update.sh ne régénère JAMAIS le
+# fichier d'environnement. Sur une installation antérieure à SEC-002, ces clés
+# peuvent manquer ; update.sh les signale, l'opérateur tranche. Elles ne sont
+# jamais ajoutées d'autorité — voir la copie Linux pour la justification complète.
+DEPLOY_HARDENING_KEYS=(ALLOWED_MODEL_DIRS CORS_ALLOW_ORIGINS LLAMA_SERVER_MIN_BUILD)

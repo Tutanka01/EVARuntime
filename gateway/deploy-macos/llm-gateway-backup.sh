@@ -14,7 +14,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# ── Configuration (surchargée par l'environnement / le fichier d'environnement) ────────
+# ── Configuration (surchargée par l'environnement) ────────────────────────────
 # DB_PATH et BACKUP_DIR peuvent être fournis par ~/.config/evaruntime/env.
 DB_PATH="${DB_PATH:-$HOME/Library/Application Support/evaruntime/data/gateway.db}"
 BACKUP_DIR="${BACKUP_DIR:-$HOME/Library/Application Support/evaruntime/backups}"
@@ -48,6 +48,12 @@ fi
 log "Sauvegarde créée : $DEST ($(du -h "$DEST" | cut -f1))"
 
 # ── Rotation : suppression des sauvegardes plus vieilles que RETENTION_DAYS ────
-find "$BACKUP_DIR" -name 'gateway-*.db' -type f -mtime "+$RETENTION_DAYS" -delete 2>/dev/null || true
+# On ne touche qu'aux fichiers gateway-*.db de ce répertoire.
+DELETED=0
+while IFS= read -r -d '' old; do
+    rm -f "$old"
+    DELETED=$((DELETED + 1))
+done < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'gateway-*.db' -mtime +"$RETENTION_DAYS" -print0)
 
-log "Rotation terminée — $RETENTION_DAYS jours de rétention conservées."
+log "Rotation : $DELETED sauvegarde(s) de plus de ${RETENTION_DAYS} jours supprimée(s)."
+log "Terminé."

@@ -66,6 +66,7 @@ jobs:
       - name: Parse Bash scripts
         run: |
           bash -n gateway/deploy/*.sh
+          bash -n gateway/deploy-macos/*.sh
           bash -n node_agent/deploy/*.sh
 
       - name: Test local and cluster mode selection
