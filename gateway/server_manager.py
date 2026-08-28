@@ -43,6 +43,19 @@ def format_url_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
+# Marqueurs de saturation GPU/CUDA recherchés dans le stderr de llama-server.
+# Source unique : LocalModelManager._is_load_capacity_error s'appuie sur la
+# même liste pour déclencher sa retry après éviction réelle.
+LOAD_CAPACITY_MARKERS: tuple[str, ...] = (
+    "cuda",
+    "out of memory",
+    "unable to allocate",
+    "failed to allocate",
+    "failed to fit params to free device memory",
+    "cudamalloc failed",
+)
+
+
 class ModelState(str, Enum):
     UNLOADED  = "unloaded"
     LOADING   = "loading"
@@ -358,8 +371,15 @@ class ServerManager:
         """
         Poll /health toutes les 2s jusqu'à {"status": "ok"}.
         Lève TimeoutError si le serveur ne répond pas dans le délai configuré.
-        Lève RuntimeError si le processus meurt avant d'être prêt — inclut les
-        dernières lignes stderr pour diagnostic (CUDA OOM, mauvais chemin, etc.).
+        Lève RuntimeError si le processus meurt avant d'être prêt.
+
+        Le message d'exception est relayé tel quel au client par proxy.py :
+        il ne doit donc contenir NI stderr brut, NI chemin de fichier, NI URL
+        interne (SEC — fuite d'infra au client, audit 2026-08-28). Le tail
+        stderr complet part au journal serveur via log.error. Seul marqueur
+        conservé dans le message : « out of memory » quand le stderr l'indique,
+        pour que LocalModelManager._is_load_capacity_error déclenche sa retry
+        après éviction réelle.
         """
         url = self.llama_url("/health")
         timeout = self._model.load_timeout_seconds or settings.model_load_timeout_seconds
@@ -372,11 +392,23 @@ class ServerManager:
                     await asyncio.sleep(0.15)
                     tail = list(self._stderr_tail)
                     tail_text = "\n  ".join(tail) if tail else "(aucune sortie capturée)"
-                    raise RuntimeError(
-                        f"llama-server '{self._model.id}' s'est terminé prématurément "
-                        f"(code {self._process.returncode}).\n"
-                        f"Stderr (dernières {len(tail)} lignes) :\n  {tail_text}"
+                    log.error(
+                        "llama-server '%s' mort (code %s) — tail stderr complet :\n  %s",
+                        self._model.id,
+                        self._process.returncode,
+                        tail_text,
                     )
+                    message = (
+                        f"Le modèle '{self._model.id}' n'a pas démarré : le "
+                        f"processus llama-server s'est terminé prématurément "
+                        f"(code {self._process.returncode})."
+                    )
+                    if any(m in tail_text.lower() for m in LOAD_CAPACITY_MARKERS):
+                        message += (
+                            " Cause probable : mémoire GPU insuffisante "
+                            "(out of memory)."
+                        )
+                    raise RuntimeError(message)
 
                 try:
                     resp = await client.get(url)
@@ -389,9 +421,15 @@ class ServerManager:
 
                 await asyncio.sleep(2)
 
+        log.error(
+            "llama-server '%s' injoignable sur %s après %ds (timeout de santé).",
+            self._model.id,
+            url,
+            timeout,
+        )
         raise TimeoutError(
-            f"llama-server '{self._model.id}' n'a pas répondu sur {url} "
-            f"dans les {timeout}s."
+            f"Le modèle '{self._model.id}' n'a pas répondu dans les {timeout}s "
+            f"imparties."
         )
 
     # ── Déchargement ──────────────────────────────────────────────────────────

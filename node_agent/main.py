@@ -260,9 +260,17 @@ class _AgentState:
         try:
             await mgr.ensure_loaded()
         except Exception as exc:
+            # Le détail (tail stderr llama-server, chemins de modèles) reste au
+            # journal de l'agent : le corps HTTP remonte tel quel dans les
+            # exceptions du node_client côté orchestrateur, qui étaient
+            # retransmises au client final (SEC — fuite d'infra, audit 2026-08-28).
+            log.error("Échec du chargement de '%s' sur le nœud : %s", model.id, exc)
             async with self._lock:
                 self._release_manager(model.id, mgr)
-            raise HTTPException(status_code=500, detail=f"Échec du chargement : {exc}") from exc
+            raise HTTPException(
+                status_code=500,
+                detail=f"Échec du chargement du modèle '{model.id}' sur le nœud.",
+            ) from exc
 
         return LoadResponse(
             model_id=model.id,

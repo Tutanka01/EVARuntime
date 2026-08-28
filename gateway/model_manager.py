@@ -27,7 +27,7 @@ from collections import deque
 
 from config import settings
 from model_registry import ModelDefinition, ModelRegistry
-from server_manager import ModelState, ServerManager
+from server_manager import LOAD_CAPACITY_MARKERS, ModelState, ServerManager
 from telemetry import CAPACITY_QUEUE_SECONDS
 
 log = logging.getLogger(__name__)
@@ -485,17 +485,7 @@ class LocalModelManager:
     @staticmethod
     def _is_load_capacity_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        return any(
-            marker in text
-            for marker in (
-                "cuda",
-                "out of memory",
-                "unable to allocate",
-                "failed to allocate",
-                "failed to fit params to free device memory",
-                "cudamalloc failed",
-            )
-        )
+        return any(marker in text for marker in LOAD_CAPACITY_MARKERS)
 
     async def _forget_failed_manager(self, model_id: str, manager: ServerManager) -> None:
         async with self._capacity_cond:

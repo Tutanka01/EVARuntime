@@ -624,10 +624,19 @@ class ClusterManager:
                         suspect_exclusions.clear()
                         continue
                     if failures:
-                        detail = "; ".join(failures)
+                        # Le détail des échecs embarque les corps HTTP renvoyés
+                        # par les node-agents (stderr llama-server, chemins de
+                        # modèles) : journal serveur uniquement, jamais dans le
+                        # message client (SEC — fuite d'infra, audit 2026-08-28).
+                        log.error(
+                            "Chargement de '%s' impossible sur tous les nœuds "
+                            "candidats : %s",
+                            model.id,
+                            "; ".join(failures),
+                        )
                         raise RuntimeError(
-                            f"Échec du chargement de '{model.id}' sur tous les "
-                            f"nœuds candidats : {detail}"
+                            f"Le modèle '{model.id}' n'a pas pu être chargé sur "
+                            "les nœuds disponibles (détail dans les logs)."
                         ) from exc
                     raise RuntimeError(str(exc)) from exc
                 chosen_state = self._nodes[chosen_snapshot.node_id]
@@ -648,7 +657,17 @@ class ClusterManager:
                             suspect_exclusions.clear()
                             continue
                         if failures:
-                            raise RuntimeError("; ".join(failures)) from exc
+                            log.error(
+                                "Chargement de '%s' impossible sur tous les "
+                                "nœuds candidats : %s",
+                                model.id,
+                                "; ".join(failures),
+                            )
+                            raise RuntimeError(
+                                f"Le modèle '{model.id}' n'a pas pu être chargé "
+                                "sur les nœuds disponibles (détail dans les "
+                                "logs)."
+                            ) from exc
                         raise RuntimeError(str(exc)) from exc
                     if current_choice.node_id != chosen_state.node_id:
                         continue
