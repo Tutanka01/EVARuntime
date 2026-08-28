@@ -35,6 +35,35 @@ Le binaire `llama-server` doit être accessible dans votre `$PATH`. Homebrew l'i
 | GPU | CUDA (NVIDIA) | Metal (Apple Silicon natif) |
 | Reverse-proxy | nginx (systemd) | nginx (Homebrew, optionnel) |
 
+#### Parité des deux arborescences (issue #29)
+
+`gateway/deploy/` **fait foi** pour toute partie commune : un correctif appliqué
+à un fichier présent dans les deux arbres doit être répliqué dans
+`deploy-macos/`, sauf divergence explicitement déclarée.
+
+Cette règle est appliquée par un garde automatique,
+`gateway/tests/test_deploy_trees_parity.py`, exécuté à chaque CI (job
+`gateway`) et lançable à la main :
+
+```bash
+cd gateway && python -m pytest tests/test_deploy_trees_parity.py -v
+```
+
+Le garde maintient un manifeste des huit fichiers communs avec trois
+politiques : **miroir** (`smoke_test.sh`, `llm-gateway-backup.sh` — identiques
+modulo les chemins plateformes), **fonctions partagées** (libs divergentes par
+nature dont les fonctions communes restent comparées) et **divergence
+déclarée** (`install.sh`, `update.sh`, … — justification écrite dans le
+manifeste). Il vérifie aussi les invariants transverses : chaque `update.sh`
+exécute le smoke test de **son** arbre, le signal SEC-002
+(`DEPLOY_HARDENING_KEYS`) est porté par les deux copies, aucun chemin Linux ne
+réside dans `deploy-macos/`, et les scripts des deux arbres passent `bash -n`.
+
+En cas d'échec du garde : porter le changement sur l'autre copie, ou — si la
+divergence est devenue légitime — la déclarer dans le manifeste avec sa
+justification. Tout nouveau fichier dupliqué doit être déclaré : un fichier
+commun non répertorié fait échouer la CI.
+
 ### Installation rapide
 
 ```bash

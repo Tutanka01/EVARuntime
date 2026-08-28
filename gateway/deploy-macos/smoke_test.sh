@@ -11,8 +11,8 @@
 #          (content, reasoning_content ou tool_calls) → log d'usage
 #
 # Usage manuel (incident, validation avant ouverture du trafic) :
-#   sudo bash gateway/deploy/smoke_test.sh
-#   sudo bash gateway/deploy/smoke_test.sh --base-url https://llm.example.fr \
+#   sudo bash gateway/deploy-macos/smoke_test.sh
+#   sudo bash gateway/deploy-macos/smoke_test.sh --base-url https://llm.example.fr \
 #        --model llama-3.1-8b-instruct --ttft-threshold-ms 5000
 #
 # Usage automatisé : appelé par update.sh après le redémarrage. Un échec

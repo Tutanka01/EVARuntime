@@ -81,7 +81,7 @@ deploy_sync_gateway_operational_files() {
 
     mkdir -p "$target_root/deploy"
     for file in "${_DEPLOY_OPERATIONAL_FILES[@]}"; do
-        cp "$source_root/deploy-macos/$file" "$target_root/deploy/"
+        cp "$source_root/deploy-macos/$file" "$target_root/deploy/$file"
     done
 }
 

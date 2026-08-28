@@ -14,7 +14,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# ── Configuration (surchargée par l'environnement / l'EnvironmentFile) ────────
+# ── Configuration (surchargée par l'environnement) ────────────────────────────
 # DB_PATH et BACKUP_DIR peuvent être fournis par /etc/llm-gateway/env.
 DB_PATH="${DB_PATH:-/var/lib/llm-gateway/gateway.db}"
 BACKUP_DIR="${BACKUP_DIR:-/var/lib/llm-gateway/backups}"

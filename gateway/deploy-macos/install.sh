@@ -149,7 +149,7 @@ fi
 
 # ── Préflight GPU Metal ───────────────────────────────────────────────────────
 
-GPU_VERDICT="$(deploy_gpu_verdict "$EFFECTIVE_MODE" "" "${INSTALL_REQUIRED_COMMANDS_GPU[0]:-}")" || true
+GPU_VERDICT="$(deploy_gpu_verdict "$EFFECTIVE_MODE" "")" || true
 if [[ "$GPU_VERDICT" == "metal-detected" ]]; then
     info "GPU Apple Silicon détecté (Metal) — accélération GPU activée."
 else

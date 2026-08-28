@@ -26,6 +26,9 @@ subprocesses.
   configuration.
 - `gateway/deploy/smoke_test.sh`: first-token recipe. Gates `update.sh` and is
   runnable standalone during an incident.
+- `gateway/deploy-macos/`: launchd/Homebrew mirror of `deploy/`. `deploy/` is
+  the reference tree: parity is enforced by
+  `gateway/tests/test_deploy_trees_parity.py` (issue #29).
 - `gateway/static/dashboard.html`: admin dashboard served by the main gateway.
 - `gateway/tests/`: main gateway unit tests.
 - `node_agent/`: lightweight FastAPI agent that loads/unloads `llama-server` on a
@@ -188,6 +191,12 @@ For deployment-only changes, validate scripts/configs by inspection and, where
 reasonable, with syntax checks. Do not run installers against the host unless the
 user explicitly asks for it. Deployment logic can still be tested for real: drive
 the script against a fake local HTTP server, as `test_smoke_test_script.py` does.
+
+Deploy scripts exist twice (`gateway/deploy/` for Linux/systemd,
+`gateway/deploy-macos/` for launchd). `gateway/deploy/` is the reference: when a
+fix touches a common file, replicate it on the other side or declare the
+divergence with a justification in `test_deploy_trees_parity.py` — CI fails on
+undeclared drift.
 
 Two rules that caught real defects:
 

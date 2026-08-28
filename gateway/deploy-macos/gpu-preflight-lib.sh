@@ -14,8 +14,9 @@
 #
 # Retourne toujours 0 sur macOS : il n'y a pas d'échappatoire nécessaire.
 
-# Clé écrite dans /etc/llm-gateway/env quand l'absence de GPU est assumée.
-# `gateway/doctor.py` lit EXACTEMENT cette clé (doctor.GPU_WAIVER_ENV_KEY).
+# Clé de waiver GPU : `gateway/doctor.py` lit EXACTEMENT cette clé
+# (doctor.GPU_WAIVER_ENV_KEY). Sur macOS, le verdict Metal ne refuse jamais :
+# la clé ne devrait jamais devoir être posée.
 GPU_WAIVER_ENV_KEY="ALLOW_NO_GPU"
 
 # deploy_gpu_waiver_declared <valeur>

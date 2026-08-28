@@ -16,7 +16,7 @@
 #   Une version n'est conservée que si elle SERT réellement, pas seulement si elle
 #   répond. Trois contrôles se succèdent :
 #     1. `/ready` après le redémarrage (readiness structurelle stricte).
-#     2. `deploy/smoke_test.sh` : recette du premier token de bout en bout.
+#     2. `deploy-macos/smoke_test.sh` : recette du premier token de bout en bout.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -37,6 +37,10 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # shellcheck source=deploy-macos/code-layout-lib.sh
 source "$SCRIPT_DIR/deploy-macos/code-layout-lib.sh"
+# env-template-lib fournit DEPLOY_HARDENING_KEYS (signal SEC-002), comme la
+# copie Linux qui source deploy/env-template-lib.sh dans son update.sh.
+# shellcheck source=deploy-macos/env-template-lib.sh
+source "$SCRIPT_DIR/deploy-macos/env-template-lib.sh"
 
 UPDATE_NGINX=false
 while [[ $# -gt 0 ]]; do
@@ -60,6 +64,27 @@ section "Vérification du service en cours…"
 if ! sudo launchctl list com.evaruntime.gateway &>/dev/null; then
     warn "Service com.evaruntime.gateway non chargé dans launchd."
     warn "→ L'update continuera mais le service ne sera pas redémarré automatiquement."
+fi
+
+# ── Durcissements absents d'un environnement antérieur à SEC-002 ──────────────
+# Même sémantique que deploy/update.sh : update.sh ne régénère JAMAIS le fichier
+# d'environnement. Sur une installation antérieure à SEC-002, ces clés peuvent
+# manquer. Elles ne sont PAS ajoutées d'autorité — écrire « CORS_ALLOW_ORIGINS= »
+# sur une installation qui sert un client navigateur la casserait en silence,
+# au milieu d'une mise à jour. On signale, l'opérateur tranche.
+if [[ -f "$CONFIG_FILE" ]]; then
+    MISSING_HARDENING=()
+    for hardening_key in "${DEPLOY_HARDENING_KEYS[@]}"; do
+        if ! grep -qE "^[[:space:]]*${hardening_key}=" "$CONFIG_FILE"; then
+            MISSING_HARDENING+=("$hardening_key")
+        fi
+    done
+    if (( ${#MISSING_HARDENING[@]} > 0 )); then
+        warn "Durcissements SEC-002 absents de $CONFIG_FILE : ${MISSING_HARDENING[*]}"
+        warn "→ Cette mise à jour ne les ajoute pas : les poser sans vous demander"
+        warn "  pourrait couper un client navigateur ou refuser le démarrage."
+        warn "→ Voir docs/deployment.md §5, puis « bash $SCRIPT_DIR/deploy-macos/doctor-macos.sh »."
+    fi
 fi
 
 # ── 1. Sauvegarde de la version actuelle ──────────────────────────────────────
@@ -170,7 +195,10 @@ fi
 
 section "Recette du premier token…"
 
-SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
+# Exécuter la copie de CET arbre : c'est celle qu'install.sh déploie et que cet
+# update maintient. Exercer la copie Linux validerait un autre artefact que
+# celui réellement déployé (parité deploy/deploy-macos, issue #29).
+SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy-macos/smoke_test.sh"
 
 if [[ -f "$SMOKE_TEST_SCRIPT" ]]; then
     info "Exécution de la recette du premier token…"
