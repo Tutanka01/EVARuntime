@@ -2459,9 +2459,11 @@ reste à faire ? » et ne périme pas. Les deux sont nécessaires.
   `vram_gb` doit refléter la consommation **avec** `cpu_moe` (attention + embeddings
   seulement). Sans ce flag, llama-server crashe avec exit code 1 dès qu'un autre modèle
   est chargé simultanément. Corriger à chaud via `PATCH /admin/models/{id}`.
-- Si un modèle crashe au chargement (exit code 1), les **dernières lignes de stderr**
-  sont désormais incluses dans le message d'erreur retourné au client et dans les logs
-  gateway — chercher `Stderr (dernières N lignes)` dans `journalctl -u llm-gateway`.
+- Si un modèle crashe au chargement (exit code 1), le **tail stderr complet** est
+  journalisé côté gateway — chercher `tail stderr complet` dans
+  `journalctl -u llm-gateway`. Le message renvoyé au client reste générique :
+  aucune fuite de chemin de fichier, de stderr ou d'URL interne dans les
+  réponses d'erreur (SEC).
 
 ### Sécurité de l'`ADMIN_SECRET`
 
