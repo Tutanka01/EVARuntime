@@ -3250,6 +3250,7 @@ le runtime de la gateway locale.
 |----------|--------|------|
 | `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `25.0` | Attente max des requêtes actives (modèles pinnés) au SIGTERM avant déchargement forcé (`0` = pas d'attente). |
 | `SHUTDOWN_DRAIN_POLL_SECONDS` | `0.2` | Intervalle de poll pendant le drain. |
+| `SHUTDOWN_BACKGROUND_FLUSH_SECONDS` | `5.0` | Deadline (s) du flush des usages fire-and-forget au SIGTERM, après le déchargement des modèles et avant la fermeture du client HTTP (`0` = pas d'attente). |
 | `VRAM_RECONCILE_INTERVAL_SECONDS` | `60.0` | Intervalle entre deux sondes `nvidia-smi` de réconciliation VRAM (`0` = désactivé). |
 | `VRAM_RECONCILE_PROBE_TIMEOUT_SECONDS` | `5.0` | Timeout de la sonde `nvidia-smi`. |
 | `VRAM_RECONCILE_DRIFT_THRESHOLD` | `0.15` | Seuil de dérive relative déclenchant un warning (0.15 = +15 %). |

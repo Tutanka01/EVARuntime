@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import database as db
 from admin import router as admin_router
 from auth import get_current_user
+from background import drain_pending
 from config import SECRET_MIN_LENGTH, settings
 from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
@@ -267,6 +268,13 @@ async def lifespan(app: FastAPI):
     else:
         log.info("Arrêt de la gateway — déchargement de tous les modèles locaux…")
     await model_manager.shutdown()
+    # Flush borné des tâches fire-and-forget (lignes d'usage planifiées juste
+    # avant le SIGTERM) : après le déchargement des modèles, avant la fermeture
+    # du client HTTP et de la DB, sinon les dernières lignes d'usage sont
+    # perdues au redémarrage. Les tâches restantes ne sont pas annulées.
+    remaining = await drain_pending(settings.shutdown_background_flush_seconds)
+    if remaining:
+        log.info("Flush des tâches d'arrière-plan : %d encore en cours.", remaining)
     await aclose_http_client()
     log.info("=== LLM Gateway UPPA arrêt propre ===")
 

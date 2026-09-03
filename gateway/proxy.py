@@ -37,8 +37,11 @@ import json
 import logging
 import time
 import uuid
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from typing import AsyncGenerator, Callable
 
+import anyio  # backend asyncio de starlette/httpcore — dépendance déjà verrouillée, pas un ajout
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -142,6 +145,87 @@ async def _report_backend_failure(manager: ServerManager) -> None:
         )
 
 
+# ── Stream upstream ouvert en pré-flight ─────────────────────────────────────
+
+@dataclass
+class _OpenedStream:
+    """
+    Connexion upstream ouverte (contexte httpx entré) mais pas encore lue.
+
+    Le pré-flight de `proxy_request` ouvre le stream ici pour connaître le
+    statut AVANT d'envoyer le premier octet SSE au client : un 4xx/5xx du
+    backend est alors relayé comme une vraie réponse HTTP d'erreur, pas comme
+    un flux 200 contenant un JSON d'erreur brut. Le générateur `_stream_proxy`
+    devient propriétaire du contexte et le rend au pool dans son finally.
+    """
+
+    ctx: AbstractAsyncContextManager[httpx.Response]
+    response: httpx.Response
+
+
+async def _open_upstream_stream(
+    manager: ServerManager,
+    path: str,
+    json_body: dict,
+) -> _OpenedStream:
+    """
+    Ouvre le stream upstream sans consommer le corps : on entre dans le
+    contexte httpx (requête émise, statut et headers reçus) et la lecture des
+    chunks est laissée au générateur. Client partagé uniquement — on ne ferme
+    JAMAIS ce client ici, seule la connexion empruntée est rendue au pool.
+    """
+    client = get_http_client()
+    ctx = client.stream(
+        "POST",
+        manager.llama_url(path),
+        json=json_body,
+        headers=manager.auth_headers(),
+    )
+    response = await ctx.__aenter__()
+    return _OpenedStream(ctx=ctx, response=response)
+
+
+async def _discard_opened(opened: _OpenedStream) -> None:
+    """Ferme silencieusement un stream upstream ouvert mais jamais consommé."""
+    try:
+        await opened.ctx.__aexit__(None, None, None)
+    except Exception as exc:
+        log.debug("Fermeture du stream upstream ignorée : %s", exc)
+
+
+def _schedule_usage_log(
+    *,
+    user: dict,
+    model_id: str,
+    request_id: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    status_code: int,
+    start_time: float,
+) -> asyncio.Task:
+    """
+    Planifie la ligne d'usage terminale d'une requête streaming, en
+    fire-and-forget. Appelée exactement UNE fois par requête : soit en
+    pré-flight (échec avant tout octet envoyé), soit dans le finally du
+    générateur — y compris sur déconnexion client (GeneratorExit), sinon la
+    ligne était perdue : rien après le finally d'un générateur fermé ne
+    s'exécute jamais.
+
+    Retourne la tâche pour que l'appelant puisse l'attendre sous annulation
+    (voir le finally de _stream_proxy).
+    """
+    return fire_and_forget(db.log_usage(
+        user_id=user["user_id"],
+        key_id=user["key_id"],
+        model=model_id,
+        prompt_tokens=int(prompt_tokens or 0),
+        completion_tokens=int(completion_tokens or 0),
+        duration_ms=int((time.monotonic() - start_time) * 1000),
+        status_code=status_code,
+        request_id=request_id,
+    ), name="log_usage_stream")
+
+
 def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
     """
     Résout l'ID du modèle à utiliser pour une requête.
@@ -232,19 +316,22 @@ async def proxy_request(
     start_time = time.monotonic()
 
     if is_streaming:
-        # Le pin du stream est géré DANS le générateur (_stream_proxy appelle
-        # manager.pin() en premier et manager.unpin() dans son finally). Ainsi le
-        # modèle reste protégé pendant toute la durée du stream, y compris en cas
-        # de déconnexion client (GeneratorExit → finally).
+        # Pré-flight : la connexion upstream est ouverte ICI, avant de renvoyer
+        # la StreamingResponse. Un 4xx/5xx du backend (ou une erreur de
+        # transport) est donc converti en vraie réponse HTTP AVANT le premier
+        # octet SSE, au lieu d'être relayé comme un flux 200 contenant un JSON
+        # d'erreur brut. Le générateur ne fait plus que relayer les chunks.
         #
-        # Pin de garde : entre le return de cette fonction et le démarrage effectif
-        # du générateur par Starlette, le modèle n'est pas encore pinné et pourrait
-        # être évincé par une requête concurrente. On pose donc un pin temporaire,
-        # relâché dès que le générateur démarre (on_start) — ou par timer si le
-        # générateur ne démarre jamais (déconnexion immédiate), pour ne pas
-        # bloquer l'éviction indéfiniment.
+        # Pin de garde : entre le return de cette fonction et le démarrage
+        # effectif du générateur par Starlette, le modèle n'est pas encore
+        # pinné par le stream et pourrait être évincé par une requête
+        # concurrente. On pose donc un pin temporaire, relâché dès que le
+        # générateur démarre (on_start) — ou par timer si le générateur ne
+        # démarre jamais (déconnexion immédiate), pour ne pas bloquer
+        # l'éviction indéfiniment.
         manager.pin()
         guard_released = False
+        opened: _OpenedStream | None = None
 
         def _release_stream_guard() -> None:
             nonlocal guard_released
@@ -254,11 +341,150 @@ async def proxy_request(
             guard_timer.cancel()
             manager.unpin()
 
-        guard_timer = asyncio.get_running_loop().call_later(30.0, _release_stream_guard)
+        def _close_unclaimed_stream() -> None:
+            """Timer 30 s : le générateur n'a jamais démarré (jamais itéré).
+
+            Le stream ouvert en pré-flight est alors orphelin — le générateur
+            ne le réclamera jamais et son finally ne le fermera pas. On le
+            rend au pool ici, sinon la connexion resterait ouverte jusqu'au
+            GC. Quand le générateur a démarré, `_release_stream_guard` a déjà
+            annulé ce timer et posé `guard_released` : le stream réclamé n'est
+            jamais fermé ici (pas de double fermeture possible).
+            """
+            nonlocal opened
+            if guard_released:
+                return
+            if opened is not None:
+                orphan, opened = opened, None
+                fire_and_forget(_discard_opened(orphan), name="discard_stream")
+            _release_stream_guard()
+
+        guard_timer = asyncio.get_running_loop().call_later(
+            30.0, _close_unclaimed_stream
+        )
+
+        body_with_usage = {**body, "stream_options": {"include_usage": True}}
+
+        try:
+            opened = await _open_upstream_stream(manager, path, body_with_usage)
+        except httpx.TimeoutException:
+            _release_stream_guard()
+            await _report_backend_failure(manager)
+            _schedule_usage_log(
+                user=user,
+                model_id=manager.model.id,
+                request_id=request_id,
+                prompt_tokens=0,
+                completion_tokens=0,
+                status_code=504,
+                start_time=request_start_time,
+            )
+            return _openai_error(
+                504, "Timeout : le modèle n'a pas répondu à temps.", "server_error"
+            )
+        except httpx.RequestError as exc:
+            _release_stream_guard()
+            await _report_backend_failure(manager)
+            log.error("Erreur de connexion à llama-server '%s' : %s", manager.model.id, exc)
+            _schedule_usage_log(
+                user=user,
+                model_id=manager.model.id,
+                request_id=request_id,
+                prompt_tokens=0,
+                completion_tokens=0,
+                status_code=502,
+                start_time=request_start_time,
+            )
+            return _openai_error(
+                502, "Impossible de joindre le backend d'inférence.", "server_error"
+            )
+        except Exception:
+            # Ni timeout ni erreur transport : panne inattendue du client HTTP
+            # (client fermé au shutdown, StreamClosed…). On reflète le
+            # catch-all du chargement de modèle ci-dessus plutôt que de
+            # laisser fuir le pin de garde et la ligne d'usage dans un 500
+            # framework nu.
+            log.exception("Ouverture du stream impossible pour '%s'", manager.model.id)
+            _release_stream_guard()
+            _schedule_usage_log(
+                user=user,
+                model_id=manager.model.id,
+                request_id=request_id,
+                prompt_tokens=0,
+                completion_tokens=0,
+                status_code=500,
+                start_time=request_start_time,
+            )
+            return _openai_error(500, "Erreur interne du serveur.", "server_error")
+
+        upstream_status = opened.response.status_code
+        if upstream_status >= 400:
+            # Statut d'erreur reçu avant tout octet SSE : on lit le corps pour
+            # décider du relais, on referme le contexte (finally), puis on
+            # répond avec une vraie erreur HTTP (mêmes sémantiques que
+            # _non_stream_proxy).
+            raw_body: bytes | None
+            try:
+                raw_body = await opened.response.aread()
+            except httpx.RequestError as exc:
+                # Reset en pleine lecture du corps d'erreur : pas de relais
+                # possible, on retombe sur l'enveloppe 502 générique.
+                log.error(
+                    "Lecture du corps d'erreur de llama-server '%s' interrompue : %s",
+                    manager.model.id, exc,
+                )
+                raw_body = None
+            finally:
+                # Sur TOUS les chemins de cette branche : contexte rendu au
+                # pool et pin de garde relâché — jamais de fuite, même si la
+                # lecture du corps a échoué.
+                await _discard_opened(opened)
+                _release_stream_guard()
+            try:
+                data = json.loads(raw_body) if raw_body is not None else None
+            except ValueError:
+                data = None
+            log.warning(
+                "Stream refusé par llama-server '%s' (HTTP %d)",
+                manager.model.id, upstream_status,
+            )
+            if isinstance(data, dict):
+                # Cohérence avec _non_stream_proxy : l'ID public remplace
+                # l'identifiant interne du backend, sans l'ajouter si absent.
+                if "model" in data:
+                    data["model"] = manager.model.id
+                _schedule_usage_log(
+                    user=user,
+                    model_id=manager.model.id,
+                    request_id=request_id,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    status_code=upstream_status,
+                    start_time=request_start_time,
+                )
+                return JSONResponse(content=data, status_code=upstream_status)
+            log.error(
+                "Réponse non-JSON de llama-server '%s' (HTTP %d) sur un stream",
+                manager.model.id, upstream_status,
+            )
+            _schedule_usage_log(
+                user=user,
+                model_id=manager.model.id,
+                request_id=request_id,
+                prompt_tokens=0,
+                completion_tokens=0,
+                status_code=502,
+                start_time=request_start_time,
+            )
+            return _openai_error(502, "Réponse invalide du backend d'inférence.", "server_error")
 
         return StreamingResponse(
             _stream_proxy(
-                path, body, user, request_id, start_time, manager,
+                user=user,
+                request_id=request_id,
+                start_time=start_time,
+                manager=manager,
+                opened=opened,
                 on_start=_release_stream_guard,
                 telemetry_start_time=request_start_time,
             ),
@@ -342,17 +568,21 @@ async def _non_stream_proxy(
 # ── Proxy streaming SSE ───────────────────────────────────────────────────────
 
 async def _stream_proxy(
-    path: str,
-    body: dict,
     user: dict,
     request_id: str,
     start_time: float,
     manager: ServerManager,
+    opened: _OpenedStream,
+    *,
     on_start: Callable[[], None] | None = None,
     telemetry_start_time: float | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """
     Générateur async qui pipe les chunks SSE de llama-server vers le client.
+
+    La connexion upstream est déjà ouverte (pré-flight de `proxy_request`,
+    via `_open_upstream_stream`) : ce générateur n'ouvre plus rien, il
+    devient propriétaire de `opened` et le rend au pool dans son finally.
 
     Chaque événement est relayé dès sa réception, y compris lorsque la
     requête contient des tools. Les extensions du backend comme
@@ -364,6 +594,10 @@ async def _stream_proxy(
     client (GeneratorExit) ou d'exception réseau. Cela protège le modèle
     contre une éviction LRU pendant toute la durée du stream.
 
+    Le finally planifie aussi la ligne d'usage terminale, UNE seule fois par
+    requête (499 = déconnexion client). Rien après le finally d'un générateur
+    fermé ne s'exécutant jamais, ce log ne peut plus vivre en dehors.
+
     on_start : callback appelé dès que le pin du stream est posé — utilisé par
     proxy_request pour relâcher son pin de garde.
     """
@@ -373,6 +607,7 @@ async def _stream_proxy(
     prompt_tokens = 0
     completion_tokens = 0
     status_code = 200
+    terminal_logged = False
     ttft_recorded = False
     ttft_start = start_time if telemetry_start_time is None else telemetry_start_time
 
@@ -395,69 +630,96 @@ async def _stream_proxy(
         )
         ttft_recorded = True
 
-    body_with_usage = {**body, "stream_options": {"include_usage": True}}
-
     try:
-        # Client partagé : client.stream(...) emprunte une connexion du pool le
-        # temps du stream puis la rend au context-exit. On NE ferme JAMAIS le
-        # client partagé ici — seule la connexion empruntée est libérée.
-        client = get_http_client()
-        async with client.stream(
-            "POST",
-            manager.llama_url(path),
-            json=body_with_usage,
-            headers=manager.auth_headers(),
-        ) as response:
-            status_code = response.status_code
+        response = opened.response
+        async for line in response.aiter_lines():
+            if not line:
+                yield b"\n"
+                continue
 
-            async for line in response.aiter_lines():
-                if not line:
-                    yield b"\n"
-                    continue
+            if line.startswith("data: ") and line != "data: [DONE]":
+                try:
+                    chunk = json.loads(line[6:])
+                    if "model" in chunk:
+                        chunk["model"] = manager.model.id
+                    if usage := chunk.get("usage"):
+                        prompt_tokens = usage.get("prompt_tokens", 0)
+                        completion_tokens = usage.get("completion_tokens", 0)
+                    _record_ttft(chunk)
+                    line = "data: " + json.dumps(chunk, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    pass
 
-                if line.startswith("data: ") and line != "data: [DONE]":
-                    try:
-                        chunk = json.loads(line[6:])
-                        if "model" in chunk:
-                            chunk["model"] = manager.model.id
-                        if usage := chunk.get("usage"):
-                            prompt_tokens = usage.get("prompt_tokens", 0)
-                            completion_tokens = usage.get("completion_tokens", 0)
-                        _record_ttft(chunk)
-                        line = "data: " + json.dumps(chunk, ensure_ascii=False)
-                    except json.JSONDecodeError:
-                        pass
-
-                yield (line + "\n\n").encode()
+            yield (line + "\n\n").encode()
 
     except httpx.TimeoutException:
         await _report_backend_failure(manager)
         err = _sse_error("Timeout d'inférence dépassé.")
-        yield err.encode()
         status_code = 504
+        yield err.encode()
     except httpx.RequestError as exc:
         await _report_backend_failure(manager)
         log.error("Erreur stream llama-server '%s' : %s", manager.model.id, exc)
         err = _sse_error("Erreur de connexion au backend d'inférence.")
-        yield err.encode()
         status_code = 502
+        yield err.encode()
+    except (GeneratorExit, asyncio.CancelledError):
+        # Déconnexion client (aclose/annulation) : aucun yield ni await de
+        # flux ici — le nettoyage vit uniquement dans le finally, qui doit
+        # pouvoir s'exécuter jusqu'au bout sans rien re-yielder.
+        status_code = 499
+        raise
+    except Exception:
+        status_code = 500
+        log.exception("Erreur inattendue dans le stream '%s'", manager.model.id)
+        raise
     finally:
-        # Garantie absolue : unpin même si le client se déconnecte (GeneratorExit),
-        # si une exception réseau survient, ou si le stream se termine normalement.
-        manager.unpin()
-
-    duration_ms = int((time.monotonic() - start_time) * 1000)
-
-    fire_and_forget(db.log_usage(
-        user_id=user["user_id"],
-        key_id=user["key_id"],
-        model=manager.model.id,
-        prompt_tokens=int(prompt_tokens or 0),
-        completion_tokens=int(completion_tokens or 0),
-        duration_ms=duration_ms,
-        status_code=status_code,
-        request_id=request_id,
-    ), name="log_usage_stream")
+        # Garantie absolue : fermeture du contexte upstream (rendu au pool du
+        # client partagé — jamais le client lui-même), unpin, puis UNE ligne
+        # d'usage terminale, même si le client se déconnecte (GeneratorExit),
+        # si une exception réseau survient, ou si le stream se termine
+        # normalement.
+        #
+        # Bouclier anyio : sous uvicorn (asgi spec_version 2.3), Starlette
+        # itère la réponse dans un task group et ANNULE la scope à la
+        # déconnexion client. anyio re-livre alors CancelledError à CHAQUE
+        # await de la scope (boucle call_soon tant que la scope reste
+        # annulée) : sans bouclier, le premier await du finally échouait et
+        # sautait unpin + la ligne 499 — fuite de _active_requests, modèle
+        # plus jamais idle-évictable. La scope bouclier réparente la tâche
+        # hors de portée de la re-livraison : le nettoyage est ininterruptible.
+        with anyio.CancelScope(shield=True):
+            try:
+                await opened.ctx.__aexit__(None, None, None)
+            except Exception as exc:
+                log.debug("Fermeture du stream upstream ignorée : %s", exc)
+            manager.unpin()
+            if not terminal_logged:
+                terminal_logged = True
+                usage_task = _schedule_usage_log(
+                    user=user,
+                    model_id=manager.model.id,
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    status_code=status_code,
+                    start_time=start_time,
+                )
+                # Sous annulation, la tâche fire-and-forget risque de ne jamais
+                # tourner (loop en cours d'arrêt, task group en teardown) : on
+                # l'attend ici, sous bouclier, UNIQUEMENT quand la tâche
+                # courante est réellement annulée (cancelling() > 0). Chemin
+                # normal : cancelling() == 0 → fire-and-forget pur, zéro
+                # latence ajoutée. Une erreur DB ne doit jamais masquer la
+                # GeneratorExit/CancelledError en cours de re-raise.
+                if asyncio.current_task().cancelling() > 0:
+                    try:
+                        await usage_task
+                    except Exception as exc:
+                        log.debug(
+                            "Ligne d'usage terminale non écrite (annulation) : %s",
+                            exc,
+                        )
 
 
 # ── /v1/models ────────────────────────────────────────────────────────────────
