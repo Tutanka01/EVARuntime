@@ -39,7 +39,6 @@ logs/
 .vscode/
 
 CLAUDE.md
-VISION.md
 
 # Audit local détaillé — ne pas committer (contient cartographie infra)
 AUDIT.md

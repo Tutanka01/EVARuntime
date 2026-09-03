@@ -1,5 +1,11 @@
 # Veille technique — Moteur d'inférence & optimisations
 
+> **Note de statut (3 septembre 2026).** Cette note est historique. Sa
+> conclusion initiale selon laquelle vLLM ne peut pas libérer sa VRAM n’est
+> plus valable : vLLM documente désormais un Sleep Mode de niveaux 1 et 2.
+> Pour toute décision actuelle, consulter [ROADMAP.md](../../ROADMAP.md) et
+> vérifier la documentation du moteur à la version réellement épinglée.
+
 > Synthèse des recherches menées sur le choix du moteur d'inférence et les évolutions
 > à venir pour EVARuntime. Mise à jour : avril 2026.
 

@@ -13,6 +13,28 @@ The codebase favors pragmatic operations over a heavy platform stack:
 FastAPI, SQLite WAL, systemd, nginx, and `llama.cpp` managed as gateway-owned
 subprocesses.
 
+## Documentation and planning source of truth
+
+- `ROADMAP.md` is the canonical public roadmap, current status, known
+  limitations, target architecture, and prioritized work. Read it first for a
+  new feature, review, or audit.
+- `docs/vision.md` is the concise product vision. `VISION.md` is only a
+  historical entry point that links to it; do not maintain a second copy.
+- `docs/architecture.md`, `docs/api.md`, `docs/deployment.md`, and
+  `docs/observability.md` describe behavior already delivered.
+- `codex-analyse.md` is a historical implementation log. Use it only when
+  reconstructing an old change; its counters and statuses are not authoritative.
+- Use GitHub Issues for scoped, actionable work with acceptance criteria. Keep
+  broad initiatives as epics and use checklists or linked issues for their
+  current slice. Use a discussion/RFC for an unresolved architectural choice,
+  then record the final decision in an ADR before implementing it.
+
+Do not duplicate the same live status in multiple documents. When behavior
+changes, update the relevant technical document and the roadmap milestone in
+the same change. Keep security and correctness defects explicit even when they
+are not yet scheduled; do not hide them merely to reduce the visible issue
+count.
+
 ## Repository Map
 
 - `gateway/`: main OpenAI-compatible gateway.
@@ -33,7 +55,9 @@ subprocesses.
 - `gateway/tests/`: main gateway unit tests.
 - `node_agent/`: lightweight FastAPI agent that loads/unloads `llama-server` on a
   remote GPU node.
-- `docs/`: main gateway architecture, API, admin, deployment, and research notes.
+- `docs/`: main gateway architecture, API, admin, deployment, vision, decisions,
+  and research notes.
+- `ROADMAP.md`: canonical project roadmap and consolidated audit findings.
 
 ## Core Architecture
 
@@ -167,7 +191,8 @@ change goes through a migration.
   `PRAGMA foreign_keys` cannot be changed inside a transaction — the engine
   toggles it around the whole migration series.
 - A `*.pre-migration.*.bak` backup is produced before any migration that
-  actually applies. These are gitignored and not yet purged (see OPS-002).
+  actually applies. These files are gitignored and subject to the bounded
+  retention policy in `gateway/database.py` (see OPS-002).
 - Details: `docs/architecture.md`, section « Migrations versionnées ».
 
 ## Testing Expectations
@@ -212,6 +237,10 @@ Two rules that caught real defects:
 
 Keep docs synchronized with behavior. Important docs:
 
+- `ROADMAP.md`: public status, milestones, known limitations, and prioritized
+  epics. Keep the public backlog curated; do not turn every future idea into an
+  issue immediately.
+- `docs/vision.md`: concise product thesis and differentiation.
 - `README.md`: public overview and repository-level quick start.
 - `docs/architecture.md`: main gateway design and invariants.
 - `docs/api.md`: user-facing OpenAI-compatible API behavior.
@@ -236,14 +265,16 @@ the same change.
 
 When you need context, start here:
 
-0. `codex-analyse.md` §0 — living implementation tracker: prioritized backlog
-   with acceptance criteria, decisions already made, defects found during
-   implementation, and operational caveats. Read it before resuming any item.
+0. `ROADMAP.md` — canonical status, current risks, milestones, and target
+   architecture.
 1. `README.md`
 2. `docs/architecture.md`
-3. `gateway/main.py`
-4. `gateway/proxy.py`
-5. `gateway/model_manager.py`
-6. `gateway/model_registry.py`
-7. `gateway/cluster/*` for cluster behavior
-8. `node_agent/main.py`
+3. `docs/api.md` or `docs/deployment.md`, depending on the task
+4. `gateway/main.py`
+5. `gateway/proxy.py`
+6. `gateway/model_manager.py`
+7. `gateway/model_registry.py`
+8. `gateway/cluster/*` for cluster behavior
+9. `node_agent/main.py`
+10. `codex-analyse.md` only when historical implementation context is needed;
+    it is not the current tracker.

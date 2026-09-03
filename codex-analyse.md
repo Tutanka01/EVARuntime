@@ -1,6 +1,12 @@
 # EVARuntime — plan de consolidation et parcours automatisé jusqu'au premier token
 
-> Document de pilotage vivant
+> **Archive historique.** Le suivi courant et la roadmap sont désormais dans
+> [`ROADMAP.md`](ROADMAP.md). Ce document conserve le journal détaillé des
+> vagues d’implémentation et des preuves anciennes ; ses compteurs, statuts et
+> références de commit peuvent être obsolètes. Ne pas l’utiliser comme source
+> de vérité pour une nouvelle tâche.
+
+> Document de pilotage historique — conservé pour le contexte d’implémentation
 > Créé le 30 juillet 2026
 > Périmètre : `gateway`, `node_agent`, déploiement et exploitation
 > État initial : audit en lecture seule, 433 tests réussis, aucun test réel GPU/GGUF

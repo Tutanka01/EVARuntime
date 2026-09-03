@@ -1,5 +1,9 @@
 # Architecture technique — Cluster EVA Inference Gateway
 
+> Ce document décrit l’architecture actuellement livrée. Pour les limites
+> connues, l’intégration multi-runtime, les modèles multi-GPU et les jalons à
+> venir, consulter la [roadmap](../ROADMAP.md) et la [vision produit](vision.md).
+
 Ce document explique les décisions de conception, les flux de données et
 les invariants de sécurité du gateway. Il s'adresse aux développeurs et
 aux administrateurs souhaitant comprendre ou modifier le système.
