@@ -147,6 +147,12 @@ class Settings(BaseSettings):
     # à l'expiration, l'opération est refusée en 409 (jamais un stream tué en
     # silence) — sauf force=true explicite. 0 = refus immédiat si occupé.
     admin_unload_drain_timeout_seconds: float = 5.0
+    # Flush des lignes d'usage fire-and-forget au shutdown : deadline (s)
+    # d'attente des tâches d'arrière-plan encore en vol (background.drain_pending),
+    # après le déchargement des modèles et avant la fermeture du client HTTP.
+    # Sans ce drain, les derniers log_usage juste avant le SIGTERM étaient
+    # perdus. 0 = pas d'attente.
+    shutdown_background_flush_seconds: float = 5.0
 
     # Réconciliation VRAM avec nvidia-smi (détection de dérive, NON FATAL).
     # 0 = désactivé. Intervalle entre deux sondes nvidia-smi.
@@ -346,6 +352,7 @@ class Settings(BaseSettings):
         "shutdown_drain_timeout_seconds",
         "shutdown_drain_poll_seconds",
         "admin_unload_drain_timeout_seconds",
+        "shutdown_background_flush_seconds",
         "vram_reconcile_interval_seconds",
         "vram_reconcile_probe_timeout_seconds",
         "vram_reconcile_drift_threshold",

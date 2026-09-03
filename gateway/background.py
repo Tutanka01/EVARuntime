@@ -32,3 +32,28 @@ def _on_done(task: asyncio.Task) -> None:
     exc = task.exception()
     if exc is not None:
         log.error("Tâche d'arrière-plan '%s' échouée : %s", task.get_name(), exc)
+
+
+async def drain_pending(deadline_seconds: float) -> int:
+    """
+    Attend (borné) la fin des tâches fire-and-forget encore en cours.
+
+    Utilisé au shutdown : les lignes d'usage planifiées en fire-and-forget
+    juste avant le SIGTERM ne doivent pas être perdues par un arrêt immédiat.
+    On attend au plus ``deadline_seconds`` le lot de tâches en vol au moment
+    de l'appel (snapshot) ; celles qui tournent encore à l'expiration ne sont
+    PAS annulées. Retour : leur nombre, pour journalisation par l'appelant.
+    """
+    pending = {task for task in _tasks if not task.done()}
+    if not pending or deadline_seconds <= 0:
+        return len(pending)
+    _, still_running = await asyncio.wait(pending, timeout=deadline_seconds)
+    remaining = len(still_running)
+    if remaining:
+        log.warning(
+            "%d tâche(s) d'arrière-plan encore en cours à l'expiration du "
+            "drain : %s",
+            remaining,
+            ", ".join(sorted(t.get_name() for t in still_running)),
+        )
+    return remaining

@@ -1288,6 +1288,14 @@ immédiat. Au-delà du délai, déchargement forcé avec un warning.
 |----------|--------|------|
 | `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `25.0` | Attente max des requêtes actives avant déchargement forcé (`0` = pas d'attente) |
 | `SHUTDOWN_DRAIN_POLL_SECONDS` | `0.2` | Intervalle de poll pendant le drain |
+| `SHUTDOWN_BACKGROUND_FLUSH_SECONDS` | `5.0` | Deadline du flush des usages fire-and-forget au SIGTERM (`0` = pas d'attente) |
+
+En complément, les lignes d'usage journalisées en fire-and-forget juste avant
+l'arrêt peuvent encore être en vol au SIGTERM : après `model_manager.shutdown()`
+et **avant** la fermeture du client HTTP, le lifespan attend au plus
+`SHUTDOWN_BACKGROUND_FLUSH_SECONDS` la fin des tâches d'arrière-plan
+(`background.drain_pending`). Les tâches non terminées à l'expiration ne sont
+pas annulées — un warning non fatal liste celles qui restent.
 
 ### Réconciliation VRAM via `nvidia-smi`
 
