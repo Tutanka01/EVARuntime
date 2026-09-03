@@ -9,6 +9,11 @@
 
 EVARuntime turns one or more NVIDIA GPU servers into a controlled, auditable and energy-aware LLM inference platform. It exposes a familiar OpenAI-compatible API while keeping model execution, access control and usage logs inside your own infrastructure.
 
+> **Project status:** the local `llama.cpp` path and its lifecycle controls are
+> heavily tested. Physical GPU qualification, energy accounting, vLLM and
+> multi-node model sharding are active roadmap items. See the
+> [roadmap](ROADMAP.md) and [product vision](docs/vision.md).
+
 Developed by **Mohamad El Akhal** within the **Université de Pau et des Pays de l'Adour (UPPA)**.
 
 ---
@@ -234,6 +239,8 @@ Never publish real `.env` files, generated secrets, TLS private keys, databases 
 
 ## Documentation
 
+- [Roadmap and project status](ROADMAP.md)
+- [Product vision](docs/vision.md)
 - [Architecture](docs/architecture.md)
 - [Dependency and CVE policy](docs/dependency-policy.md)
 - [API guide](docs/api.md)
