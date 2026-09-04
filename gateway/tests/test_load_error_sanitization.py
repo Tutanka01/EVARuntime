@@ -20,18 +20,21 @@ Couverture en deux couches :
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from pathlib import Path
 
 import pytest
 import telemetry
 
+import integrity
 from cluster.cluster_manager import ClusterManager
 from cluster.node_client import LocalNodeAdapter, NodeProtocolError
 from cluster.node_protocol import NodeHealth, NodeStatus, UnloadResponse
 from model_manager import LocalModelManager
 from proxy import proxy_request
-from server_manager import ServerManager
+from server_manager import LOAD_CAPACITY_MARKERS, ServerManager
 
 # ── Doubles de test (locaux, inspirés de test_server_manager.py) ─────────────
 
@@ -64,12 +67,19 @@ class _FakeLlamaParams:
 class FakeModelDef:
     """Champs requis par ServerManager ET ClusterManager."""
 
-    def __init__(self, mid: str = "m1", vram: float = 10.0, load_timeout: int = 5):
+    def __init__(
+        self,
+        mid: str = "m1",
+        vram: float = 10.0,
+        load_timeout: int = 5,
+        sha256: str | None = None,
+    ):
         self.id = mid
         self.vram_gb = vram
         self.enabled = True
         self.description = ""
         self.path = Path(CHEMIN_SECRET)
+        self.sha256 = sha256
         self.capabilities = ["text_generation"]
         self.llama_params = _FakeLlamaParams()
         self.speculative = None
@@ -118,8 +128,11 @@ def seed_stderr(mgr: ServerManager, lines: list[str]) -> None:
 @pytest.fixture(autouse=True)
 def reset_telemetry():
     telemetry.reset_all()
+    # Le cache attesté d'integrity.py est un état module — repartir de zéro.
+    integrity.reset_integrity_cache()
     yield
     telemetry.reset_all()
+    integrity.reset_integrity_cache()
 
 
 # ── Couche 1a : mort du processus (mode local) ────────────────────────────────
@@ -350,3 +363,80 @@ async def test_proxy_relaye_le_message_sain_et_journalise(monkeypatch, caplog):
     assert "/models/" not in response.body.decode()
     # Contrôle positif : le proxy a bien journalisé le message de chargement.
     assert "Chargement de 'm1' impossible" in caplog.text
+
+
+# ── Couche 1c : refus d'intégrité GGUF (SEC-ART-001) ──────────────────────────
+
+@pytest.mark.anyio
+async def test_refus_integrite_sans_chemin_dans_la_reponse_proxy(monkeypatch, caplog, tmp_path):
+    """
+    SEC-ART-001 : un GGUF falsifié (empreinte déclarée ≠ fichier) refuse le
+    chargement AVANT tout lancement de llama-server. Le RuntimeError suit le
+    même contrat de sanitisation que _wait_for_health — ni chemin, ni
+    empreinte, ni marqueur de capacité — et le proxy le relaie en 503 dans
+    l'envelope d'erreur OpenAI.
+    """
+    gguf = tmp_path / "modele.gguf"
+    gguf.write_bytes(b"contenu legitime")
+    digest_attendu = hashlib.sha256(b"contenu falsifie").hexdigest()
+
+    model = FakeModelDef("m1", sha256=digest_attendu)
+    model.path = gguf
+    mgr = ServerManager(model, port=9001, idle_unload_enabled=False)
+    starts = {"count": 0}
+
+    async def fake_start():
+        starts["count"] += 1
+        mgr._process = FakeProcess()
+
+    async def fake_kill():
+        mgr._process = None
+
+    async def interdit():
+        raise AssertionError(
+            "_wait_for_health ne doit pas être atteint après un refus d'intégrité"
+        )
+
+    monkeypatch.setattr(mgr, "_start_process", fake_start)
+    monkeypatch.setattr(mgr, "_wait_for_health", interdit)
+    monkeypatch.setattr(mgr, "_kill_process", fake_kill)
+
+    with caplog.at_level(logging.INFO, logger="server_manager"):
+        with pytest.raises(RuntimeError) as exc_info:
+            await mgr.ensure_loaded()
+    message = str(exc_info.value)
+
+    assert "m1" in message
+    assert "intégrité" in message
+    assert str(gguf) not in message
+    assert digest_attendu not in message
+    for marker in LOAD_CAPACITY_MARKERS:
+        assert marker not in message.lower()
+    assert starts["count"] == 0, "aucun sous-processus lancé sur un artefact refusé"
+
+    # Contrôle positif : le détail complet (chemin, empreintes) est au journal.
+    assert str(gguf) in caplog.text
+    assert "SEC-ART-001" in caplog.text
+    assert digest_attendu in caplog.text
+
+    # Couche 2 : le proxy relaie le message sain tel quel (503, envelope OpenAI).
+    class Manager:
+        registry = _FakeRegistryProxy()
+
+        async def ensure_model_loaded(self, model_id: str):
+            raise exc_info.value
+
+    response = await proxy_request(
+        _FakeRequest(b'{"model":"m1","messages":[]}'),
+        "/v1/chat/completions",
+        {"user_id": 1, "key_id": 1},
+        Manager(),
+    )
+
+    assert response.status_code == 503
+    body = json.loads(response.body)
+    assert body["error"]["message"] == message
+    assert body["error"]["type"] == "server_error"
+    assert body["error"]["code"] == "503"
+    assert str(gguf) not in response.body.decode()
+    assert "/models/" not in response.body.decode()

@@ -25,6 +25,7 @@ from admin import router as admin_router
 from auth import get_current_user
 from background import drain_pending
 from config import SECRET_MIN_LENGTH, settings
+from integrity import attest_gguf
 from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
 from model_manager import model_manager
@@ -75,6 +76,12 @@ async def _validate_inference_runtime(enabled_models) -> None:
     trafic. En mode cluster, l'orchestrateur ne doit pas exiger que ces fichiers
     existent localement : chaque node-agent applique les mêmes contrôles au
     chargement, sur le nœud qui possède effectivement le binaire et les modèles.
+
+    Le hachage SHA-256 est hors event loop (asyncio.to_thread via attest_gguf)
+    et alimente le cache attesté partagé avec la vérification pré-chargement
+    (ServerManager._verify_artifact_integrity) : un GGUF inchangé n'est haché
+    qu'une fois par processus, toute mutation ultérieure est re-vérifiée au
+    chargement (SEC-ART-001).
     """
     if settings.cluster_mode == "cluster":
         log.info(
@@ -95,7 +102,7 @@ async def _validate_inference_runtime(enabled_models) -> None:
         if model.sha256 is None:
             continue
         try:
-            model.verify_integrity()
+            await attest_gguf(model)
             log.info("Intégrité SHA-256 vérifiée : %s", model.id)
         except IntegrityError as exc:
             log.critical("Intégrité GGUF compromise : %s", exc)

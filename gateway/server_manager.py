@@ -32,7 +32,8 @@ from enum import Enum
 import httpx
 
 from config import settings
-from model_registry import ModelDefinition
+from integrity import attest_gguf
+from model_registry import IntegrityError, ModelDefinition
 from telemetry import MODEL_LOAD_SECONDS
 
 log = logging.getLogger(__name__)
@@ -258,11 +259,48 @@ class ServerManager:
 
     # ── Chargement ────────────────────────────────────────────────────────────
 
+    async def _verify_artifact_integrity(self) -> None:
+        """
+        Attestation d'intégrité du GGUF (SEC-ART-001), fail-closed : appelée
+        JUSTE AVANT _start_process, aucun sous-processus llama-server n'est
+        lancé si le fichier ne correspond plus à l'empreinte déclarée — un
+        GGUF substitué après le démarrage de la gateway est donc refusé à
+        chaque transition vers LOADING.
+
+        Coût O(stat) quand le fichier est inchangé : le cache attesté
+        d'integrity.py est clé sur (chemin résolu, empreinte déclarée)
+        confrontée à l'identité fichier (dev/ino/size/mtime_ns). Le
+        single-flight des hachages est de toute façon garanti par _load_task :
+        _load_and_signal ne tourne que dans une task unique par ServerManager.
+
+        Sanitisation (même contrat que _wait_for_health) : le détail complet
+        de l'IntegrityError — chemin, empreintes — part au journal seul via
+        log.critical ; le message client ne contient ni chemin, ni empreinte,
+        ni stderr, ET aucun marqueur de LOAD_CAPACITY_MARKERS : une atteinte
+        à l'intégrité ne doit jamais être classée « saturation GPU » par
+        LocalModelManager._is_load_capacity_error (sinon la retry après
+        éviction déchargerait d'autres modèles en pure perte).
+        """
+        # No-op sans empreinte déclarée : les modèles sans sha256 restent
+        # chargeables (attestation opt-in, comme au démarrage).
+        if getattr(self._model, "sha256", None) is None:
+            return
+        try:
+            await attest_gguf(self._model)
+        except IntegrityError as exc:
+            log.critical("Intégrité GGUF compromise (SEC-ART-001) : %s", exc)
+            raise RuntimeError(
+                f"Artefact du modèle '{self._model.id}' refusé par la vérification "
+                "d'intégrité — chargement annulé."
+            ) from exc
+
     async def _load_and_signal(self, event: asyncio.Event) -> None:
         """Lance llama-server et signale l'event quand prêt (ou en cas d'erreur)."""
         started_at = time.monotonic()
         outcome = "success"
         try:
+            # SEC-ART-001 : fail-closed avant tout lancement de sous-processus.
+            await self._verify_artifact_integrity()
             await self._start_process()
             await self._wait_for_health()
 
