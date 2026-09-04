@@ -46,6 +46,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Chargé APRÈS avoir ajusté sys.path
 from config import settings  # → node_agent/config.py
+from integrity import attest_gguf
 from llama_version import enforce_llama_min_build
 from model_registry import IntegrityError, ModelRegistry
 from server_manager import ModelState, ServerManager, format_url_host
@@ -163,7 +164,12 @@ class _AgentState:
         return f"http://{format_url_host(settings.llama_server_host)}:{port}"
 
     async def load(self, model_dict: dict) -> LoadResponse:
-        """Charge un modèle depuis sa définition YAML. Idempotent."""
+        """
+        Charge un modèle depuis sa définition YAML. Idempotent.
+
+        Lève 422 si l'attestation d'intégrité du GGUF (empreinte `sha256`
+        déclarée) échoue — avant toute réservation de port.
+        """
         # Valider via le même parseur que la gateway — mêmes règles de sécurité.
         try:
             model = self._validator._parse_entry(model_dict)
@@ -173,12 +179,20 @@ class _AgentState:
         _validate_model_files(model)
 
         # Garde-fou supply-chain (opt-in) : si le modèle déclare un `sha256`, on
-        # vérifie l'intégrité du GGUF AVANT de lancer le sous-processus. Coût :
-        # hash complet d'un gros fichier (plusieurs Go) — acceptable au chargement,
-        # jamais dans le chemin de requête. Inerte si `sha256` absent.
+        # vérifie l'intégrité du GGUF AVANT de lancer le sous-processus.
+        # CLU-002 : le hachage est exécuté hors event loop (asyncio.to_thread via
+        # integrity.attest_gguf) — /health, unload et heartbeat restent réactifs
+        # pendant l'empreinte d'un GGUF de plusieurs Go — et s'appuie sur un
+        # cache attesté : recharger idempotemment un modèle READY ne re-hache
+        # pas (O(stat)), et le single-flight par clé partage un seul hachage
+        # entre chargements concurrents. La vérification « juste avant le
+        # lancement du sous-processus » reste assurée par
+        # ServerManager._load_and_signal (module partagé) ; l'appel ici garantit
+        # le 422 AVANT toute réservation de port (fail-fast). Inerte si
+        # `sha256` absent.
         if model.sha256 is not None:
             try:
-                model.verify_integrity()
+                await attest_gguf(model)
             except IntegrityError as exc:
                 raise HTTPException(
                     status_code=422,
