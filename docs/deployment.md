@@ -1457,14 +1457,21 @@ sha256sum /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
 Comportement :
 
 - **absent** (défaut) → aucune vérification (rétro-compatible) ;
-- **présent** → au démarrage (gateway) et avant chaque chargement (node-agent),
+- **présent** → au démarrage, puis **à chaque transition vers LOADING**
+  (gateway, fail-closed juste avant le lancement de llama-server — SEC-ART-001),
   le SHA-256 réel du fichier est recalculé et comparé. Un écart bloque le
-  chargement du modèle (log critical côté gateway, HTTP 422 côté node-agent) —
-  protection contre un GGUF substitué ou corrompu.
+  chargement du modèle : RuntimeError 503 côté gateway — le détail (chemin,
+  empreintes) reste dans les journaux, le message client ne les expose pas —
+  et HTTP 422 côté node-agent avant réservation de port. Protection contre un
+  GGUF substitué ou corrompu après le démarrage.
 
-> **Coût :** hacher un GGUF de plusieurs Go prend plusieurs secondes. La
-> vérification n'a lieu qu'au démarrage/chargement, jamais dans le chemin de
-> requête. À réserver aux modèles critiques.
+> **Coût :** hacher un GGUF de plusieurs Go prend plusieurs secondes. Le hachage
+> est exécuté hors event loop et un **cache attesté** (identité fichier :
+> taille, mtime, inode + empreinte déclarée) évite de re-hacher un fichier
+> inchangé : un GGUF non modifié n'est haché qu'une fois par processus, même
+> après plusieurs cycles chargement/déchargement. Toute mutation du fichier
+> (taille, mtime, inode) force une re-vérification. La vérification n'a jamais
+> lieu dans le chemin de requête. À réserver aux modèles critiques.
 
 ### Activer un modèle
 

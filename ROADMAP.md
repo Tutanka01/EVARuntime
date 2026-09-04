@@ -94,14 +94,17 @@ proposés ; ils peuvent être regroupés dans les epics GitHub.
 | ID | Priorité | Constat | Conséquence | Acceptation minimale |
 |---|:---:|---|---|---|
 | `CLU-001` | P0 | `ClusterManager.unload_model()` ignore l’échec booléen de `_do_unload()` | L’admin peut annoncer une VRAM libérée alors que l’ancien serveur tourne toujours | Erreur typée/503, placement conservé et état `unload_uncertain` |
-| `SEC-ART-001` | P0 | Le SHA-256 est vérifié au démarrage, mais pas à chaque transition vers `LOADING` | Un GGUF peut être remplacé après le démarrage puis chargé sans nouvelle attestation | Vérification fail-closed juste avant chaque chargement |
-| `CLU-002` | P0 | Le hash d’un gros GGUF est synchrone dans le seul event loop du node agent | `/health`, unload et heartbeat peuvent être bloqués pendant plusieurs minutes | Hash hors event loop, single-flight et cache attesté |
+| `SEC-ART-001` ✅ | P0 | Le SHA-256 est vérifié au démarrage, mais pas à chaque transition vers `LOADING` | Un GGUF peut être remplacé après le démarrage puis chargé sans nouvelle attestation | Vérification fail-closed juste avant chaque chargement |
+| `CLU-002` ✅ | P0 | Le hash d'un gros GGUF est synchrone dans le seul event loop du node agent | `/health`, unload et heartbeat peuvent être bloqués pendant plusieurs minutes | Hash hors event loop, single-flight et cache attesté |
 | `COR-013` ✅ | P0 | Une réponse upstream 4xx/5xx est relayée comme stream HTTP 200 | Les clients OpenAI reçoivent une enveloppe invalide ou du JSON brut dans du SSE | Statut et enveloppe d’erreur traités avant le premier octet |
 | `ACC-001` ✅ | P0 | La journalisation d’usage est après le `finally` du générateur SSE | Une déconnexion peut libérer le pin sans enregistrer l’usage partiel | Un seul résultat terminal, y compris `client_cancelled` |
 | `ACC-002` ✅ | P0 | Les tâches `fire_and_forget` ne sont pas drainées au shutdown | Les derniers usages peuvent être perdus lors d’un redémarrage | Queue bornée et flush avec deadline |
 
-✅ = corrigé avec tests (lot 1 de l’épic #39 : pré-flight du statut upstream, résultat
-terminal unique protégé par bouclier anyio, drain borné `SHUTDOWN_BACKGROUND_FLUSH_SECONDS`).
+✅ = corrigé avec tests. Lot 1 de l'épic #39 : pré-flight du statut upstream, résultat
+terminal unique protégé par bouclier anyio, drain borné `SHUTDOWN_BACKGROUND_FLUSH_SECONDS`.
+Lot 2 : attestation GGUF fail-closed à chaque transition `LOADING` (SEC-ART-001) et
+hachage hors event loop avec single-flight et cache attesté (CLU-002) — module partagé
+`gateway/integrity.py`, utilisé par le gateway et le node agent.
 | `CLU-003` | P0 | L’idempotence du node agent dépend seulement de `model.id` | Une nouvelle définition peut continuer à servir une ancienne génération | `deployment_digest` et `generation_id` obligatoires |
 | `CLU-005` | P0 | Le timeout cluster fixe est inférieur aux chargements de certains modèles | L’orchestrateur abandonne alors que l’agent continue, créant des doublons | `operation_id`, progression et deadline négociée |
 | `CFG-001` | P0 | VRAM, ports, quotas et timeouts peuvent prendre des valeurs incohérentes | Échecs tardifs et interprétation accidentelle d’un quota négatif | Validation de bornes et invariants croisés au démarrage |
@@ -522,8 +525,10 @@ CLU-003. Aucune opération ne doit annoncer un état non confirmé.
 
 Progression (épic #39) : COR-013, ACC-001 et ACC-002 sont corrigés (lot 1 —
 erreurs OpenAI avant premier octet, résultat terminal unique sous déconnexion,
-drain borné au shutdown). Restent : CLU-001, SEC-ART-001, CLU-002, CLU-003,
-CFG-001 (+ CLU-005, REG-001, REG-002).
+drain borné au shutdown) ; SEC-ART-001 et CLU-002 le sont (lot 2 — attestation
+GGUF fail-closed à chaque chargement, hachage hors event loop, single-flight,
+cache attesté). Restent : CLU-001, CLU-003, CFG-001
+(+ CLU-005, REG-001, REG-002).
 
 ### R1 — preuve terrain et cluster qualifié
 
