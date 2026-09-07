@@ -202,8 +202,11 @@ class ModelDefinition:
 
         No-op si `sha256` n'est pas déclaré (retourne True). Sinon calcule le
         hash par blocs de 1 Mo. Lève IntegrityError si le fichier est absent ou
-        si l'empreinte ne correspond pas. Coûteux sur un gros GGUF — à n'appeler
-        qu'au chargement, jamais dans le chemin de requête.
+        si l'empreinte ne correspond pas. Cette méthode synchrone est réservée
+        aux outils hors event loop, notamment ``doctor`` ; le runtime utilise
+        ``integrity.attest_gguf``. Une requête qui déclenche un chargement à
+        froid peut attendre cette attestation, tandis qu'un modèle déjà READY
+        ne la recalcule pas.
         """
         if self.sha256 is None:
             return True

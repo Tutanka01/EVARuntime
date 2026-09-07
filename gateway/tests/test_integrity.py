@@ -7,7 +7,7 @@ Tests du module d'attestation d'intégrité GGUF (SEC-ART-001 / CLU-002) :
 - échecs fail-closed : fichier absent, empreinte divergente, mutation pendant
   le hachage (TOCTOU) ;
 - single-flight : un seul hachage partagé entre appelants concurrents ;
-- annulation du porteur sans bloquer les appels suivants ;
+- annulation du porteur sans double hachage ni blocage des appels suivants ;
 - robustesse multi-boucles (asyncio.run séquentiels) et borne du cache.
 """
 from __future__ import annotations
@@ -66,6 +66,23 @@ async def _until(predicate, timeout: float = 2.0):
         if time.monotonic() > deadline:
             raise AssertionError("condition jamais remplie (délai dépassé)")
         await asyncio.sleep(0.005)
+
+
+def _observe_inflight_waiter(monkeypatch):
+    """Signale qu'un appelant a rejoint la future single-flight partagée."""
+    joined = asyncio.Event()
+    original_shield = integrity.asyncio.shield
+    shield_calls = 0
+
+    def _shield_and_signal(fut):
+        nonlocal shield_calls
+        shield_calls += 1
+        if shield_calls >= 2:
+            joined.set()
+        return original_shield(fut)
+
+    monkeypatch.setattr(integrity.asyncio, "shield", _shield_and_signal)
+    return joined
 
 
 # ── No-op et chemin nominal ──────────────────────────────────────────────────
@@ -197,7 +214,7 @@ async def test_mutation_during_hash_refused(tmp_path):
 
 # ── Single-flight ────────────────────────────────────────────────────────────
 
-async def test_concurrent_callers_share_one_hash(tmp_path):
+async def test_concurrent_callers_share_one_hash(tmp_path, monkeypatch):
     _path, model, digest = _make_model(tmp_path)
 
     gate = threading.Event()
@@ -205,10 +222,11 @@ async def test_concurrent_callers_share_one_hash(tmp_path):
     original = integrity._hash_file
     integrity._hash_file = counter
     try:
+        joined = _observe_inflight_waiter(monkeypatch)
         first = asyncio.create_task(attest_gguf(model))
         await _until(lambda: len(integrity._inflight) == 1)
         second = asyncio.create_task(attest_gguf(model))
-        await asyncio.sleep(0)  # laisse le second appelant atteindre shield(fut)
+        await asyncio.wait_for(joined.wait(), timeout=2.0)
         assert counter.calls <= 1
         gate.set()
         results = await asyncio.gather(first, second)
@@ -219,7 +237,7 @@ async def test_concurrent_callers_share_one_hash(tmp_path):
         integrity._hash_file = original
 
 
-async def test_owner_cancellation_does_not_hang_waiters(tmp_path):
+async def test_owner_cancellation_does_not_hang_waiters(tmp_path, monkeypatch):
     _path, model, digest = _make_model(tmp_path)
 
     gate = threading.Event()
@@ -227,19 +245,22 @@ async def test_owner_cancellation_does_not_hang_waiters(tmp_path):
     original = integrity._hash_file
     integrity._hash_file = counter
     try:
+        joined = _observe_inflight_waiter(monkeypatch)
         owner = asyncio.create_task(attest_gguf(model))
         await _until(lambda: len(integrity._inflight) == 1)
         waiter = asyncio.create_task(attest_gguf(model))
-        await asyncio.sleep(0)
+        await asyncio.wait_for(joined.wait(), timeout=2.0)
         owner.cancel()
-        # L'annulation d'un await to_thread n'aboutit qu'à la fin du thread :
-        # on libère le hachage pour que la livraison du CancelledError ait lieu.
+        # L'attente asyncio peut être annulée avant la fin du thread worker ;
+        # on libère le hachage pour que ce worker termine proprement.
         gate.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.gather(owner)
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.gather(waiter)
-        # L'entrée en vol est purgée : un appel suivant repart proprement.
+        # Le worker partagé survit à l'annulation de son premier appelant ; le
+        # waiter reçoit le résultat sans lancer un second hachage en parallèle.
+        assert await asyncio.gather(waiter) == [digest]
+        assert counter.calls == 1
+        # L'entrée en vol est purgée et le résultat est en cache.
         assert not integrity._inflight
         assert await attest_gguf(model) == digest
     finally:

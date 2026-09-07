@@ -234,11 +234,17 @@ class ServerManager:
         effective_timeout = (self._model.load_timeout_seconds or settings.model_load_timeout_seconds) + 10
         try:
             await asyncio.wait_for(event.wait(), timeout=effective_timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
+            # Le délai porte sur le chargement partagé : abandonner l'appelant
+            # sans arrêter _load_task libérerait ensuite le manager et son port
+            # alors que la task pourrait encore démarrer llama-server. Passer
+            # par unload() annule, attend et tue un éventuel processus avant de
+            # rendre le contrôle au gestionnaire de pool.
+            await self.unload(reason="timeout de chargement")
             raise TimeoutError(
                 f"Le modèle '{self._model.id}' n'a pas démarré dans les "
                 f"{effective_timeout}s imparties."
-            )
+            ) from exc
 
         if self._load_error:
             raise self._load_error

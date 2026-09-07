@@ -17,10 +17,13 @@ Propriétés :
   plusieurs Go ;
 - cache attesté clé sur ``(chemin résolu, empreinte déclarée)`` confronté à
   l'identité fichier ``(st_dev, st_ino, st_size, st_mtime_ns)`` : un fichier
-  inchangé n'est pas re-haché, un fichier modifié — ou une empreinte déclarée
-  différente (édition YAML + reload) — est toujours re-vérifié ;
-- single-flight : un seul hachage en vol par clé, les appelants concurrents
-  partagent le même résultat ;
+  inchangé n'est pas re-haché tant que son entrée reste dans le cache borné,
+  un fichier modifié — ou une empreinte déclarée différente (édition YAML +
+  reload) — est toujours re-vérifié ;
+- single-flight : un seul hachage en vol par clé et par event loop, porté par une tâche
+  indépendante des appelants ; les annulations des appelants n'abandonnent
+  donc pas un hachage en cours et les appelants concurrents partagent le même
+  résultat ;
 - re-stat après hachage : un fichier substitué pendant le hachage est refusé.
   Fenêtre TOCTOU résiduelle documentée : réécriture avec même taille, même
   inode et même ``mtime_ns`` (hors modèle de menace actuel).
@@ -91,10 +94,12 @@ def _hash_and_restat(path: Path) -> tuple[str, _FileIdentity]:
 
 # Cache attesté : {(chemin résolu, empreinte déclarée): identité attestée}.
 _attested: dict[tuple[str, str], _FileIdentity] = {}
-# Hachages en vol : {(chemin, empreinte): (id(loop), future)}. L'id de boucle
-# évite d'attendre une future attachée à un autre event loop (tests séquentiels,
-# TestClient) — on repart alors sur un hachage propre à la boucle courante.
-_inflight: dict[tuple[str, str], tuple[int, asyncio.Future]] = {}
+# Hachages en vol : {(chemin, empreinte): (id(loop), future, worker)}. L'id de
+# boucle évite d'attendre une future attachée à un autre event loop (tests
+# séquentiels, TestClient) — on repart alors sur un hachage propre à la boucle
+# courante. Le worker est conservé pour que la tâche de fond ne soit pas
+# collectée avant d'avoir livré le résultat.
+_inflight: dict[tuple[str, str], tuple[int, asyncio.Future, asyncio.Task]] = {}
 _guard = threading.Lock()
 
 
@@ -105,6 +110,65 @@ def reset_integrity_cache() -> None:
         _inflight.clear()
 
 
+def _deliver_error(fut: asyncio.Future, error: Exception) -> None:
+    """Propage un échec aux co-attendants sans « never retrieved » au GC."""
+    if fut.done():
+        return
+    fut.set_exception(error)
+    # Si aucun appelant n'attend la future (p.ex. déconnexion du client),
+    # consommer l'exception évite un warning asyncio au moment du GC.
+    fut.exception()
+
+
+async def _run_attestation(
+    *,
+    key: tuple[str, str],
+    declared: str,
+    model_id: str,
+    path: Path,
+    fut: asyncio.Future,
+) -> None:
+    """Exécute un hachage single-flight indépendamment de ses appelants."""
+    try:
+        digest, attested = await asyncio.to_thread(_hash_and_restat, path)
+    except OSError:
+        error = IntegrityError(
+            f"[{model_id}] Fichier GGUF introuvable ou illisible pour "
+            f"vérification d'intégrité : {path}"
+        )
+        with _guard:
+            _deliver_error(fut, error)
+    except BaseException as exc:
+        # Un worker annulé (notamment lors de l'arrêt de la boucle) doit
+        # réveiller ses appelants sans laisser une future pendante.
+        with _guard:
+            if isinstance(exc, Exception):
+                _deliver_error(fut, exc)
+            elif not fut.done():
+                fut.cancel()
+    else:
+        if digest != declared:
+            error = IntegrityError(
+                f"[{model_id}] Empreinte SHA-256 non conforme pour {path} : "
+                f"attendu {declared}, obtenu {digest}. Fichier GGUF "
+                "potentiellement corrompu ou substitué (SEC-ART-001)."
+            )
+            with _guard:
+                _deliver_error(fut, error)
+        else:
+            with _guard:
+                _attested[key] = attested
+                if len(_attested) > _CACHE_MAX_ENTRIES:
+                    _attested.pop(next(iter(_attested)))
+                if not fut.done():
+                    fut.set_result(declared)
+    finally:
+        with _guard:
+            live = _inflight.get(key)
+            if live is not None and live[1] is fut:
+                _inflight.pop(key, None)
+
+
 async def attest_gguf(model) -> str:
     """
     Vérifie fail-closed l'empreinte SHA-256 du GGUF d'un modèle.
@@ -113,8 +177,9 @@ async def attest_gguf(model) -> str:
 
     1. stat hors event loop → identité fichier courante ;
     2. cache attesté conforme → attestation déjà valable, aucun I/O lourd ;
-    3. sinon hachage hors event loop, single-flight par clé, re-stat après
-       hachage, puis mise en cache uniquement si l'empreinte correspond.
+    3. sinon worker de hachage hors event loop, single-flight par clé dans la
+       boucle courante, re-stat après hachage, puis mise en cache uniquement si
+       l'empreinte correspond.
 
     Lève IntegrityError si le fichier est absent, illisible, mute pendant le
     hachage ou ne correspond pas à l'empreinte déclarée.
@@ -142,74 +207,27 @@ async def attest_gguf(model) -> str:
     if cached == identity:
         return declared
 
-    # Single-flight : un seul hachage par clé et par boucle.
+    # Single-flight : un seul hachage par clé et par boucle. Le worker est
+    # indépendant de l'appelant qui a remporté la course : une annulation de
+    # requête ne laisse donc pas un thread de hash orphelin face à un second
+    # hachage concurrent.
     with _guard:
         entry = _inflight.get(key)
         if entry is not None and entry[0] == id(loop):
             fut = entry[1]
-            owner = False
         else:
             fut = loop.create_future()
-            _inflight[key] = (id(loop), fut)
-            owner = True
-
-    if not owner:
-        # shield : l'annulation d'un appelant ne doit pas annuler le hachage
-        # partagé dont dépendent les autres appelants.
-        return await asyncio.shield(fut)
-
-    def _deliver_error(error: Exception) -> None:
-        """Propage l'échec aux co-attendants sans « never retrieved » au GC.
-
-        set_exception + lecture immédiate : les appelants qui ont déjà admis
-        la future lèveront l'exception normalement ; sans co-attendant, asyncio
-        ne logue pas l'exception comme jamais récupérée.
-        """
-        if fut.done():
-            return
-        fut.set_exception(error)
-        fut.exception()
-
-    try:
-        digest, attested = await asyncio.to_thread(_hash_and_restat, path)
-    except OSError as exc:
-        error = IntegrityError(
-            f"[{model_id}] Fichier GGUF introuvable ou illisible pour "
-            f"vérification d'intégrité : {path}"
-        )
-        with _guard:
-            _deliver_error(error)
-        raise error from exc
-    except BaseException as exc:
-        # Annulation du porteur : le thread de hachage continue mais son
-        # résultat ne sert plus ; les co-attendants reçoivent l'annulation et
-        # repartiront d'un cache vide — toujours fail-closed.
-        with _guard:
-            if not fut.done():
-                if isinstance(exc, Exception):
-                    _deliver_error(exc)
-                else:
-                    fut.cancel()
-        raise
-    else:
-        if digest != declared:
-            error = IntegrityError(
-                f"[{model_id}] Empreinte SHA-256 non conforme pour {path} : "
-                f"attendu {declared}, obtenu {digest}. Fichier GGUF "
-                "potentiellement corrompu ou substitué (SEC-ART-001)."
+            worker = loop.create_task(
+                _run_attestation(
+                    key=key,
+                    declared=declared,
+                    model_id=model_id,
+                    path=path,
+                    fut=fut,
+                )
             )
-            with _guard:
-                _deliver_error(error)
-            raise error
-        with _guard:
-            _attested[key] = attested
-            if len(_attested) > _CACHE_MAX_ENTRIES:
-                _attested.pop(next(iter(_attested)))
-            if not fut.done():
-                fut.set_result(declared)
-        return declared
-    finally:
-        with _guard:
-            live = _inflight.get(key)
-            if live is not None and live[1] is fut:
-                _inflight.pop(key, None)
+            _inflight[key] = (id(loop), fut, worker)
+
+    # shield : l'annulation d'un appelant ne doit pas annuler le résultat
+    # partagé ni le worker de hachage dont dépendent les autres appelants.
+    return await asyncio.shield(fut)

@@ -145,6 +145,35 @@ async def test_ensure_loaded_concurrent_starts_process_once(monkeypatch):
     await mgr.unload()
 
 
+@pytest.mark.anyio
+async def test_load_timeout_cancels_task_and_releases_process(monkeypatch):
+    """Un timeout ne doit pas laisser un chargement ni un process orphelin."""
+    mgr = make_manager()
+    # La valeur réelle est normalement ≥ 30 s ; une valeur négative permet de
+    # tester rapidement le chemin timeout sans modifier la configuration globale.
+    mgr._model.load_timeout_seconds = -9.99
+
+    async def fake_start():
+        mgr._process = FakeProcess()
+
+    async def fake_health():
+        await asyncio.Event().wait()
+
+    async def fake_kill():
+        mgr._process = None
+
+    monkeypatch.setattr(mgr, "_start_process", fake_start)
+    monkeypatch.setattr(mgr, "_wait_for_health", fake_health)
+    monkeypatch.setattr(mgr, "_kill_process", fake_kill)
+
+    with pytest.raises(TimeoutError, match="n'a pas démarré"):
+        await mgr.ensure_loaded()
+
+    assert mgr.state == ModelState.UNLOADED
+    assert mgr._load_task is None
+    assert mgr._process is None
+
+
 # ── Test 1b — durée du dernier chargement exposée (issue #31) ─────────────────
 
 @pytest.mark.anyio

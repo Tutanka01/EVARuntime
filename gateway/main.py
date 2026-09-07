@@ -79,8 +79,9 @@ async def _validate_inference_runtime(enabled_models) -> None:
 
     Le hachage SHA-256 est hors event loop (asyncio.to_thread via attest_gguf)
     et alimente le cache attesté partagé avec la vérification pré-chargement
-    (ServerManager._verify_artifact_integrity) : un GGUF inchangé n'est haché
-    qu'une fois par processus, toute mutation ultérieure est re-vérifiée au
+    (ServerManager._verify_artifact_integrity) : un GGUF inchangé n'est
+    normalement haché qu'une fois par processus, tant que son entrée reste
+    dans le cache borné ; toute mutation ultérieure est re-vérifiée au
     chargement (SEC-ART-001).
     """
     if settings.cluster_mode == "cluster":

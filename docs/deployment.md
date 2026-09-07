@@ -1459,7 +1459,7 @@ Comportement :
 - **absent** (défaut) → aucune vérification (rétro-compatible) ;
 - **présent** → au démarrage, puis **à chaque transition vers LOADING**
   (gateway, fail-closed juste avant le lancement de llama-server — SEC-ART-001),
-  le SHA-256 réel du fichier est recalculé et comparé. Un écart bloque le
+  l'attestation du SHA-256 réel du fichier est contrôlée. Un écart bloque le
   chargement du modèle : RuntimeError 503 côté gateway — le détail (chemin,
   empreintes) reste dans les journaux, le message client ne les expose pas —
   et HTTP 422 côté node-agent avant réservation de port. Protection contre un
@@ -1468,10 +1468,18 @@ Comportement :
 > **Coût :** hacher un GGUF de plusieurs Go prend plusieurs secondes. Le hachage
 > est exécuté hors event loop et un **cache attesté** (identité fichier :
 > taille, mtime, inode + empreinte déclarée) évite de re-hacher un fichier
-> inchangé : un GGUF non modifié n'est haché qu'une fois par processus, même
-> après plusieurs cycles chargement/déchargement. Toute mutation du fichier
-> (taille, mtime, inode) force une re-vérification. La vérification n'a jamais
-> lieu dans le chemin de requête. À réserver aux modèles critiques.
+> inchangé : un GGUF non modifié n'est normalement haché qu'une fois par
+> processus, tant que son entrée reste dans le cache borné, même après
+> plusieurs cycles chargement/déchargement. Toute mutation du fichier (taille,
+> mtime, inode) force une re-vérification. Le hachage est hors event loop, mais
+> la première requête qui déclenche un chargement à froid peut attendre cette
+> attestation ; elle n'est pas recalculée pour les requêtes d'un modèle déjà
+> READY. À réserver aux modèles critiques.
+>
+> **Limite TOCTOU :** l'attestation et l'ouverture du chemin par
+> `llama-server` ne constituent pas une opération atomique. Le re-stat refuse
+> les mutations observées pendant le hachage ; le répertoire des modèles doit
+> aussi être protégé contre les écritures non autorisées.
 
 ### Activer un modèle
 
