@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,15 +16,26 @@ from model_manager import (
     CapacityQueueTimeout,
     LocalModelManager,
 )
-from server_manager import ModelState
+from server_manager import LOAD_CAPACITY_MARKERS, ModelState, ServerManager
 
 
 class FakeModelDef:
-    def __init__(self, mid: str, vram: float, enabled: bool = True, fail_load_once: bool = False):
+    def __init__(
+        self,
+        mid: str,
+        vram: float,
+        enabled: bool = True,
+        fail_load_once: bool = False,
+        fail_message: str | None = None,
+    ):
         self.id = mid
         self.vram_gb = vram
         self.enabled = enabled
         self.fail_load_once = fail_load_once
+        # Échec persistant (non consommé au premier appel) : simule un refus
+        # permanent comme un refus d'intégrité SEC-ART-001.
+        self.fail_message = fail_message
+        self.load_attempts = 0
         self.description = ""
         self.path = Path(f"/models/{mid}.gguf")
         self.capabilities = ["text_generation"]
@@ -93,6 +105,11 @@ class FakeServerManager:
         return self._active_requests
 
     async def ensure_loaded(self):
+        self._model.load_attempts += 1
+        fail_message = getattr(self._model, "fail_message", None)
+        if fail_message is not None:
+            self._state = ModelState.UNLOADED
+            raise RuntimeError(fail_message)
         if getattr(self._model, "fail_load_once", False):
             self._model.fail_load_once = False
             self._state = ModelState.UNLOADED
@@ -339,3 +356,53 @@ async def test_proxy_queue_full_includes_retry_after(capacity_settings):
 
     assert response.status_code == 503
     assert response.headers["retry-after"] == "10"
+
+
+# ── Refus d'intégrité (SEC-ART-001) : jamais classé erreur de capacité ────────
+
+@pytest.mark.anyio
+async def test_integrity_refusal_is_not_capacity_error(capacity_settings, monkeypatch, tmp_path):
+    """
+    SEC-ART-001 : le message de refus d'intégrité ne contient aucun marqueur
+    de capacité, donc LocalModelManager ne déclenche PAS sa retry après
+    éviction — il remonte le refus tel quel en une seule tentative, sans
+    évict d'autres modèles, et libère le port.
+    """
+    # Le message produit par le VRAI ServerManager._verify_artifact_integrity
+    # sur un GGUF dont l'empreinte déclarée ne correspond pas au fichier.
+    gguf = tmp_path / "falsifie.gguf"
+    gguf.write_bytes(b"contenu legitime")
+    probe = ServerManager(
+        SimpleNamespace(id="victim", path=gguf, sha256="0" * 64),
+        port=0,
+        idle_unload_enabled=False,
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        await probe._verify_artifact_integrity()
+    refusal = exc_info.value
+
+    text = str(refusal).lower()
+    for marker in LOAD_CAPACITY_MARKERS:
+        assert marker not in text, f"marqueur de capacité '{marker}' dans le refus"
+    assert LocalModelManager._is_load_capacity_error(refusal) is False
+
+    # Bout en bout au niveau LocalModelManager : le FakeServerManager échoue
+    # avec ce message exact (le RuntimeError est la seule forme atteignant
+    # LocalModelManager, l'IntegrityError étant convertie dans ServerManager).
+    monkeypatch.setattr(settings, "total_vram_gb", 20.0)
+    monkeypatch.setattr(settings, "max_loaded_models", 2)
+    old = FakeModelDef("old", 10.0)
+    new = FakeModelDef("new", 10.0, fail_message=str(refusal))
+    manager = make_manager(monkeypatch, [old, new])
+    add_loaded(manager, old, active_requests=0, last_request_time=time.monotonic() - 100)
+    ports_avant = list(manager._port_pool)
+
+    with pytest.raises(RuntimeError) as err_info:
+        await manager.ensure_model_loaded("new")
+
+    assert str(err_info.value) == str(refusal)
+    assert new.load_attempts == 1, "un refus d'intégrité ne doit pas être retenté"
+    assert "old" in manager._managers, "un refus d'intégrité ne doit rien évincer"
+    assert "new" not in manager._managers, "le manager en échec est oublié"
+    assert "new" not in manager._allocated_ports, "le port du manager en échec est libéré"
+    assert sorted(manager._port_pool) == sorted(ports_avant), "port rendu au pool"

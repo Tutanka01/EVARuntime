@@ -825,7 +825,7 @@ DB stocke uniquement : key_hash, key_prefix (8 chars)  ◄───────�
 | DoS via modèles | `MAX_LOADED_MODELS` = taille du pool de ports |
 | Accès non autorisé | `require_admin` sur tous les endpoints `/admin/models/*` |
 | Injection model_id | Regex `^[a-z0-9][a-z0-9._-]{0,62}$` sur tous les model_id |
-| GGUF substitué / corrompu | Champ `sha256` optionnel — vérification d'intégrité au chargement |
+| GGUF substitué / corrompu | Champ `sha256` optionnel — attestation fail-closed au démarrage puis à chaque transition vers LOADING (SEC-ART-001) |
 
 ### Durcissement de llama.cpp (supply-chain)
 
@@ -837,7 +837,7 @@ et overflows de parsing GGUF menant au RCE. Trois garde-fous :
 |--------|---------------|
 | `--context-shift` désactivé | `build_llama_cmd` n'émet **jamais** ce flag — c'est le vecteur de la CVE `n_discard`. |
 | Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; **fail-closed** dès que le plancher est `> 0` — un build inférieur **ou une version illisible** refuse le démarrage (0 = désactivé, la sonde se contente alors d'un avertissement). Même verdict que `doctor`, quel que soit le chemin de démarrage (SEC-009). |
-| Intégrité GGUF | Champ `sha256` par modèle : le hash du fichier est recalculé et comparé avant chargement. |
+| Intégrité GGUF | Champ `sha256` par modèle : attestation contrôlée **à chaque transition vers LOADING**, juste avant le lancement du sous-processus — hors event loop (`asyncio.to_thread`), cache attesté clé sur l'identité fichier (taille, mtime, inode + empreinte déclarée) qui évite le re-hachage d'un fichier inchangé tant que l'entrée reste en cache, avec re-stat après hachage et single-flight par clé dans la boucle courante. Le détail (chemin, empreintes) reste en journal ; le message client est sanitisé et évite tout marqueur de capacité (pas de retry d'éviction indu). Le node agent applique la même attestation avant réservation de port, hachage hors event loop (CLU-002). |
 | Manifeste recoupé | Un manifeste de provenance §6 posé à côté du binaire ne vaut attestation qu'après confrontation **au binaire lui-même** : version et commit rendus par `--version`, puis empreinte SHA-256 du binaire face à celle consignée dans `install.binary_sha256`. Voir ci-dessous. |
 
 #### Un manifeste non recoupé n'est pas une attestation (SEC-009)

@@ -100,8 +100,9 @@ contrôle critique en échec) :
   seulement par le smoke test de mise à jour.
 - **Que les GGUF sont intègres.** `/ready` fait un `stat`, jamais une lecture ni
   un hash : un fichier de 0 octet satisfait le contrôle de présence. La
-  vérification SHA-256 (`sha256:` dans `models.yaml`) reste faite **au
-  démarrage**, où son coût est acceptable.
+  vérification SHA-256 (`sha256:` dans `models.yaml`) a lieu au démarrage puis
+  **à chaque transition vers LOADING** (SEC-ART-001), hors event loop et avec un
+  cache attesté — un fichier inchangé n'est haché qu'une fois par processus.
 - **Que le binaire llama-server est d'une version patchée.** L'épinglage
   (`LLAMA_SERVER_MIN_BUILD`) est appliqué au démarrage : `/ready` ne lance aucun
   sous-processus.
