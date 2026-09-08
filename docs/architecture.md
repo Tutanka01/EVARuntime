@@ -138,14 +138,15 @@ models:
   - id: "llava-7b"
     path: "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf"
     mmproj_path: "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf"  # projecteur CLIP — requis pour vision
+    mmproj_sha256: "<64 caractères hexadécimaux>"                 # requis pour vision
     vram_gb: 6.0
     capabilities: [text_generation, vision, streaming]
     ...
 ```
 
-Le champ `mmproj_path` est transmis à llama-server via le flag `--mmproj` uniquement
-quand `vision` est présent dans `capabilities`. Sans ce fichier, llama-server démarre
-normalement mais retourne HTTP 500 sur toute requête contenant une image.
+Les champs `mmproj_path` et `mmproj_sha256` sont obligatoires quand `vision` est
+présent dans `capabilities`. Le registre refuse sinon de démarrer. Le projecteur
+est attesté avant chaque chargement, puis transmis à llama-server via `--mmproj`.
 
 ### Speculative decoding MTP
 
@@ -185,11 +186,13 @@ binaire `llama-server` de chaque node doit supporter `--spec-type` (vérifier av
 3. `path` doit être absolu (`path.is_absolute()`) et pointer vers un `.gguf`
 4. `mmproj_path`, si présent, subit les mêmes validations que `path`
 5. Si `ALLOWED_MODEL_DIRS` est configuré : `path` et `mmproj_path` doivent être sous un répertoire autorisé
-6. `enabled`, s'il est présent, doit être un vrai booléen YAML (`true` ou
+6. Les clés inconnues, les conversions implicites et les capabilities hors de
+   `text_generation`, `streaming`, `tool_calls`, `vision`, `embeddings` sont refusées
+7. `enabled`, s'il est présent, doit être un vrai booléen YAML (`true` ou
    `false`) ; les chaînes telles que `"false"` sont refusées au lieu d'être
    coercées en vrai
-7. `vram_gb > 0` et `ubatch_size ≤ batch_size`
-8. Warning si `vision` ∈ capabilities mais `mmproj_path` absent (HTTP 500 garanti sinon)
+8. `vram_gb > 0` et `ubatch_size ≤ batch_size`
+9. `vision` exige `mmproj_path` et son `mmproj_sha256` valide
 
 ---
 
@@ -837,7 +840,7 @@ et overflows de parsing GGUF menant au RCE. Trois garde-fous :
 |--------|---------------|
 | `--context-shift` désactivé | `build_llama_cmd` n'émet **jamais** ce flag — c'est le vecteur de la CVE `n_discard`. |
 | Épinglage de version | `LLAMA_SERVER_MIN_BUILD` : au démarrage, `llama-server --version` est sondé ; **fail-closed** dès que le plancher est `> 0` — un build inférieur **ou une version illisible** refuse le démarrage (0 = désactivé, la sonde se contente alors d'un avertissement). Même verdict que `doctor`, quel que soit le chemin de démarrage (SEC-009). |
-| Intégrité GGUF | Champ `sha256` par modèle : attestation contrôlée **à chaque transition vers LOADING**, juste avant le lancement du sous-processus — hors event loop (`asyncio.to_thread`), cache attesté clé sur l'identité fichier (taille, mtime, inode + empreinte déclarée) qui évite le re-hachage d'un fichier inchangé tant que l'entrée reste en cache, avec re-stat après hachage et single-flight par clé dans la boucle courante. Le détail (chemin, empreintes) reste en journal ; le message client est sanitisé et évite tout marqueur de capacité (pas de retry d'éviction indu). Le node agent applique la même attestation avant réservation de port, hachage hors event loop (CLU-002). |
+| Intégrité des artefacts | Champ `sha256` optionnel pour le GGUF principal ; `mmproj_sha256` obligatoire avec `vision`. Chaque artefact déclaré est attesté **à chaque transition vers LOADING**, juste avant le lancement du sous-processus — hors event loop (`asyncio.to_thread`), cache attesté clé sur l'identité fichier (taille, mtime, inode + empreinte déclarée), re-stat après hachage et single-flight par clé dans la boucle courante. Le détail reste en journal ; le message client est sanitisé. Le node agent applique les mêmes contrôles avant réservation de port (CLU-002, REG-002). |
 | Manifeste recoupé | Un manifeste de provenance §6 posé à côté du binaire ne vaut attestation qu'après confrontation **au binaire lui-même** : version et commit rendus par `--version`, puis empreinte SHA-256 du binaire face à celle consignée dans `install.binary_sha256`. Voir ci-dessous. |
 
 #### Un manifeste non recoupé n'est pas une attestation (SEC-009)
@@ -1269,6 +1272,12 @@ absorber le parallélisme par modèle (`parallel` slots × plusieurs modèles).
 Le timeout d'inférence reste distinct (`connect=10s`, `read=600s`, `write=60s`,
 `pool=5s`) pour tolérer les générations longues.
 
+Les configurations gateway et node-agent sont validées avant le démarrage :
+valeurs numériques finies, budget VRAM net positif, ports dans `1..65535` sans
+collision avec le pool llama-server, quotas représentables par SQLite, timeouts
+positifs et invariants croisés des pools et des drains. Les booléens ne sont pas
+acceptés comme nombres par conversion implicite (CFG-001).
+
 ---
 
 ## Robustesse du cycle de vie (shutdown, VRAM, orphelins)
@@ -1547,7 +1556,52 @@ Si un `unload_model` échoue (nœud flaky), l'état local **n'est pas purgé de 
 optimiste** : le `llama-server` tourne peut-être encore et occupe sa VRAM.
 `_resync_after_failed_unload` re-synchronise via `health()` et ne libère l'entrée
 locale **que** si le nœud confirme l'absence du modèle. Sinon la VRAM reste
-comptée comme occupée pour éviter une sur-réservation au placement suivant.
+comptée comme occupée pour éviter une sur-réservation au placement suivant
+(CLU-001).
+
+Tant que la disparition n'est pas confirmée, le modèle passe à l'état
+`unload_uncertain` (`loaded[...].unload_uncertain = True`, visible dans le statut
+cluster) :
+
+- `DELETE /admin/models/{id}/unload` répond **503** avec l'erreur typée
+  `ClusterUnloadUncertainError` au lieu d'annoncer une VRAM libérée à tort ;
+- toute nouvelle tentative de chargement échoue immédiatement — pas de routage
+  vers une URL potentiellement disparue, pas de copie du modèle sur un autre
+  nœud — jusqu'à ce qu'un heartbeat ou un re-sync confirme la disparition.
+
+### Protocole de chargement identifié (CLU-003, CLU-005)
+
+Chaque `POST /agent/models/load` transporte désormais une identité complète, pas
+seulement `model.id` :
+
+| Champ | Rôle |
+|-------|------|
+| `deployment_digest` | SHA-256 du JSON canonique (clés triées) de la définition runtime complète. Deux définitions successives du même `model.id` ont des digests différents. |
+| `generation_id` | Identifiant stable du couple `(model.id, deployment_digest)` côté agent : une définition inchangée conserve sa génération, une définition modifiée en ouvre une nouvelle. |
+| `operation_id` | Identifiant de l'opération de chargement elle-même (une exécution, pas un contenu). |
+| `deadline_seconds` | Budget relatif négocié : le minimum entre le `load_timeout_seconds` du modèle et le timeout cluster de l'orchestrateur. |
+
+Conséquences opérationnelles :
+
+- **Acceptation puis polling.** Le POST ne bloque plus sur le chargement : il
+  retourne `202` (`state="accepted"`) dès que l'agent a réservé le travail.
+  L'orchestrateur interroge ensuite `GET /agent/operations/{operation_id}`
+  (`wait_for_operation`), avec progression (`progress`) et états terminaux
+  `ready`, `failed`, `conflict`, `deadline_exceeded`. Un timeout du RPC initial
+  ne crée plus de doublon : le même `operation_id` est réinterrogé, jamais
+  relancé sur un autre nœud.
+- **Une nouvelle définition ne peut plus servir une ancienne génération.** Si le
+  digest reçu diffère de celui du modèle actif (ou de l'opération en cours), le
+  node agent refuse avec un conflit d'identité (état `conflict`), que
+  l'orchestrateur remonte en erreur typée sans écraser le placement.
+- **Définition inchangée = chargement idempotent.** Digest et génération
+  identiques → l'agent répond `already_loaded=True` sans redémarrer
+  `llama-server`.
+
+⚠️ **Changement de protocole cassant** : ces champs sont requis sur le fil.
+Gateway et node agent doivent être mis à jour **ensemble** (une version contre
+l'autre refuse la requête de chargement). Voir `docs/deployment.md` pour la
+procédure.
 
 ### Durcissement TLS du plan de contrôle
 

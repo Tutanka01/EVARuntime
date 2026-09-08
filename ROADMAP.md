@@ -93,7 +93,7 @@ proposés ; ils peuvent être regroupés dans les epics GitHub.
 
 | ID | Priorité | Constat | Conséquence | Acceptation minimale |
 |---|:---:|---|---|---|
-| `CLU-001` | P0 | `ClusterManager.unload_model()` ignore l’échec booléen de `_do_unload()` | L’admin peut annoncer une VRAM libérée alors que l’ancien serveur tourne toujours | Erreur typée/503, placement conservé et état `unload_uncertain` |
+| `CLU-001` ✅ | P0 | `ClusterManager.unload_model()` ignore l’échec booléen de `_do_unload()` | L’admin peut annoncer une VRAM libérée alors que l’ancien serveur tourne toujours | Erreur typée/503, placement conservé et état `unload_uncertain` |
 | `SEC-ART-001` ✅ | P0 | Le SHA-256 est vérifié au démarrage, mais pas à chaque transition vers `LOADING` | Un GGUF peut être remplacé après le démarrage puis chargé sans nouvelle attestation | Vérification fail-closed juste avant chaque chargement |
 | `CLU-002` ✅ | P0 | Le hash d'un gros GGUF est synchrone dans le seul event loop du node agent | `/health`, unload et heartbeat peuvent être bloqués pendant plusieurs minutes | Hash hors event loop, single-flight et cache attesté |
 | `COR-013` ✅ | P0 | Une réponse upstream 4xx/5xx est relayée comme stream HTTP 200 | Les clients OpenAI reçoivent une enveloppe invalide ou du JSON brut dans du SSE | Statut et enveloppe d’erreur traités avant le premier octet |
@@ -105,14 +105,21 @@ terminal unique protégé par bouclier anyio, drain borné `SHUTDOWN_BACKGROUND_
 Lot 2 : attestation GGUF fail-closed à chaque transition `LOADING` (SEC-ART-001) et
 hachage hors event loop avec single-flight et cache attesté (CLU-002) — module partagé
 `gateway/integrity.py`, utilisé par le gateway et le node agent.
-| `CLU-003` | P0 | L’idempotence du node agent dépend seulement de `model.id` | Une nouvelle définition peut continuer à servir une ancienne génération | `deployment_digest` et `generation_id` obligatoires |
-| `CLU-005` | P0 | Le timeout cluster fixe est inférieur aux chargements de certains modèles | L’orchestrateur abandonne alors que l’agent continue, créant des doublons | `operation_id`, progression et deadline négociée |
-| `CFG-001` | P0 | VRAM, ports, quotas et timeouts peuvent prendre des valeurs incohérentes | Échecs tardifs et interprétation accidentelle d’un quota négatif | Validation de bornes et invariants croisés au démarrage |
+Lot 3 : registre et configuration stricts (REG-001, REG-002, CFG-001) — types YAML
+et schémas admin identiques, `vision` exige `mmproj` + `mmproj_sha256`, invariants
+croisés de configuration refusés au démarrage (gateway et node agent).
+Lot 4 : protocole cluster identifié (CLU-001, CLU-003, CLU-005) — `deployment_digest`
+et `generation_id` obligatoires sur le fil, `operation_id` avec deadline négociée et
+polling `GET /agent/operations/{id}`, unload non confirmé exposé 503 avec état
+`unload_uncertain`. Gateway et node agent doivent être déployés ensemble.
+| `CLU-003` ✅ | P0 | L’idempotence du node agent dépend seulement de `model.id` | Une nouvelle définition peut continuer à servir une ancienne génération | `deployment_digest` et `generation_id` obligatoires |
+| `CLU-005` ✅ | P0 | Le timeout cluster fixe est inférieur aux chargements de certains modèles | L’orchestrateur abandonne alors que l’agent continue, créant des doublons | `operation_id`, progression et deadline négociée |
+| `CFG-001` ✅ | P0 | VRAM, ports, quotas et timeouts peuvent prendre des valeurs incohérentes | Échecs tardifs et interprétation accidentelle d’un quota négatif | Validation de bornes et invariants croisés au démarrage |
 | `SEC-006` | P0 | Le data-plane cluster reconstruit des URLs HTTP | Prompts et secret interne peuvent transiter en clair | mTLS/WireGuard ou profil production fail-closed |
 | `TST-004` | P0 | La recette sur vrai runtime/GPU/GGUF/nginx n’est pas archivée | Le chemin installé jusqu’au premier token reste une hypothèse | Rapport reproductible signé par environnement |
 | `TST-005` | P0 | Les tests cluster utilisent surtout des fakes in-process | Les sockets, délais, streams, pannes et processus réels ne sont pas prouvés | E2E avec vrais agents/processus et injections de panne |
-| `REG-001` | P1 | Le parseur YAML accepte des types invalides ou trop permissifs | Le contrat YAML diffère du contrat admin | Schémas stricts et erreurs identiques |
-| `REG-002` | P1 | `vision` n’exige pas structurellement un projector | Une configuration apparemment valide échoue à la première image | `vision` exige `mmproj` et son intégrité |
+| `REG-001` ✅ | P1 | Le parseur YAML accepte des types invalides ou trop permissifs | Le contrat YAML diffère du contrat admin | Schémas stricts et erreurs identiques |
+| `REG-002` ✅ | P1 | `vision` n’exige pas structurellement un projector | Une configuration apparemment valide échoue à la première image | `vision` exige `mmproj` et son intégrité |
 | `PORT-001` | P1 | Les ports occupés sont détectés mais restent réallouables | Échecs répétés et réutilisation d’un port orphelin | États `available/owned/quarantined` |
 | `GPU-002` | P1 | La sonde VRAM agrège tous les GPU de l’hôte | Une charge hors `CUDA_VISIBLE_DEVICES` fausse la capacité EVA | Mesure par UUID et périmètre configuré |
 | `OBS-001` | P1 | La latence persistée exclut queue et cold start | Les SLO et rapports sont optimistes | `total_ms`, `queue_ms`, `load_ms`, `backend_ms` séparés |
@@ -527,8 +534,12 @@ Progression (épic #39) : COR-013, ACC-001 et ACC-002 sont corrigés (lot 1 —
 erreurs OpenAI avant premier octet, résultat terminal unique sous déconnexion,
 drain borné au shutdown) ; SEC-ART-001 et CLU-002 le sont (lot 2 — attestation
 GGUF fail-closed à chaque chargement, hachage hors event loop, single-flight,
-cache attesté). Restent : CLU-001, CLU-003, CFG-001
-(+ CLU-005, REG-001, REG-002).
+cache attesté) ; REG-001, REG-002 et CFG-001 le sont (lot 3 — registre et
+schémas admin stricts, projecteur vision obligatoire et attesté, invariants de
+configuration au démarrage) ; CLU-001, CLU-003 et CLU-005 le sont (lot 4 —
+protocole cluster identifié : digest/génération/opération obligatoires, polling
+d'opération, unload incertain exposé 503). Le jalon R0 est complet ; restent
+hors R0 : SEC-006, TST-004, TST-005 (R1).
 
 ### R1 — preuve terrain et cluster qualifié
 
