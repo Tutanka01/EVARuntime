@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 import database as db
 from auth import require_admin
+from cluster.cluster_manager import ClusterUnloadUncertainError
 from config import settings
 from model_registry import ModelDefinition, ModelRegistry, RegistrySnapshot
 from model_manager import (
@@ -155,6 +156,8 @@ async def _unload_for_admin(
             # déchargement normal — force=true n'a de conséquence que sur un
             # modèle occupé, cas traité ci-dessous.
             await target_manager.unload_model(model_id)
+    except ClusterUnloadUncertainError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RuntimeError as exc:
         detail = _unload_conflict_detail(exc)
         if detail is None:

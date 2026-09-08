@@ -11,9 +11,30 @@ n'utilise PAS ces schémas — voir gateway/proxy.py.
 """
 from __future__ import annotations
 
-from typing import Optional
+import hashlib
+import json
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
+
+
+def deployment_digest(model: dict) -> str:
+    """Retourne le digest stable de la définition runtime complète.
+
+    Le JSON canonique rend l'identité indépendante de l'ordre des clés YAML.
+    Le modèle est volontairement le seul élément haché : les identifiants
+    d'opération et de génération décrivent une exécution, pas son contenu.
+    """
+    try:
+        canonical = json.dumps(
+            model,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Définition de modèle non sérialisable") from exc
+    return hashlib.sha256(canonical).hexdigest()
 
 
 # ── Requêtes ──────────────────────────────────────────────────────────────────
@@ -29,6 +50,18 @@ class LoadRequest(BaseModel):
     # ModelRegistry pour valider, garantissant que les mêmes règles de sécurité
     # (regex id, allowed_model_dirs, .gguf, etc.) s'appliquent côté nœud.
     model: dict = Field(..., description="Entrée YAML du modèle à charger")
+    # L'identifiant du modèle seul ne suffit pas à distinguer deux définitions
+    # runtime successives. Ces champs sont obligatoires sur le fil.
+    deployment_digest: str = Field(
+        ...,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    )
+    generation_id: str = Field(..., min_length=1, max_length=128)
+    operation_id: str = Field(..., min_length=1, max_length=128)
+    # Budget relatif négocié par l'agent avec sa propre horloge monotone.
+    deadline_seconds: float = Field(..., gt=0, le=86_400)
 
 
 # ── Réponses ──────────────────────────────────────────────────────────────────
@@ -42,22 +75,29 @@ class LoadResponse(BaseModel):
     Cela évite un hop superflu via l'agent pour les flux SSE longs.
     """
     model_id: str
-    llama_url: str = Field(
-        ...,
-        description="URL HTTP du llama-server à utiliser pour proxifier "
-                    "les requêtes d'inférence — p.ex. http://node-a:8081",
-    )
-    internal_api_key: str = Field(
-        ...,
-        description="Clé à passer dans Authorization: Bearer <key> "
-                    "à chaque requête vers llama_url",
-    )
-    port: int
+    deployment_digest: str = ""
+    generation_id: str = ""
+    operation_id: str = ""
+    state: Literal[
+        "accepted", "loading", "ready", "failed", "conflict", "deadline_exceeded"
+    ] = "ready"
+    progress: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Une réponse 202 n'expose pas encore de data-plane utilisable.
+    llama_url: Optional[str] = Field(default=None)
+    internal_api_key: Optional[str] = Field(default=None)
+    port: Optional[int] = None
     pid: Optional[int] = None
     already_loaded: bool = Field(
         default=False,
         description="True si le modèle était déjà chargé (load idempotent)",
     )
+    deadline_seconds: Optional[float] = Field(default=None, gt=0, le=86_400)
+    error_code: Optional[str] = None
+    message: str = ""
+
+
+class OperationStatusResponse(LoadResponse):
+    """État d'une opération interrogée après un timeout du RPC initial."""
 
 
 class UnloadResponse(BaseModel):
@@ -97,6 +137,11 @@ class ModelStateOnNode(BaseModel):
     active_requests: int = 0
     vram_gb: float = 0.0
     llama_params: Optional[dict] = None
+    deployment_digest: str = ""
+    generation_id: str = ""
+    operation_id: Optional[str] = None
+    progress: float = Field(default=1.0, ge=0.0, le=1.0)
+    deadline_seconds: Optional[float] = Field(default=None, gt=0, le=86_400)
 
 
 class NodeStatus(BaseModel):

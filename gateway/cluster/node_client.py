@@ -18,9 +18,12 @@ Exceptions :
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Protocol
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
+from uuid import uuid4
 
 import httpx
 from pydantic import ValidationError
@@ -30,7 +33,9 @@ from .node_protocol import (
     LoadResponse,
     NodeHealth,
     NodeStatus,
+    OperationStatusResponse,
     UnloadResponse,
+    deployment_digest,
 )
 
 log = logging.getLogger(__name__)
@@ -56,6 +61,16 @@ class NodeClient(Protocol):
     async def status(self) -> NodeStatus: ...
     async def metrics(self) -> dict: ...
     async def load_model(self, model_dict: dict) -> LoadResponse: ...
+    async def start_load_model(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str,
+        generation_id: str,
+        operation_id: str,
+        deadline_seconds: float,
+    ) -> LoadResponse: ...
+    async def get_operation_status(self, operation_id: str) -> OperationStatusResponse: ...
     async def unload_model(self, model_id: str) -> UnloadResponse: ...
     async def unload_all(self) -> None: ...
     async def close(self) -> None: ...
@@ -84,8 +99,10 @@ class RemoteNodeClient:
         load_timeout_seconds: float = 300.0,
         verify: bool | str = True,
     ) -> None:
+        self.supports_load_operations = True
         self.node_id = node_id
         self.base_url = base_url.rstrip("/")
+        self._request_timeout = timeout_seconds
         self._health_timeout = health_timeout_seconds
         # Timeout dédié au chargement de modèle — bien plus long que le timeout
         # du plan de contrôle car un gros GGUF peut prendre plusieurs minutes.
@@ -130,17 +147,91 @@ class RemoteNodeClient:
     # ── Mutations ─────────────────────────────────────────────────────────────
 
     async def load_model(self, model_dict: dict) -> LoadResponse:
-        payload = LoadRequest(model=model_dict).model_dump()
-        # Timeout long : le chargement d'un gros modèle dépasse largement le
-        # timeout court du plan de contrôle.
+        """API historique : démarre puis attend l'opération jusqu'au terminal."""
+        response = await self.start_load_model(
+            model_dict,
+            deployment_digest=deployment_digest(model_dict),
+            generation_id=uuid4().hex,
+            operation_id=uuid4().hex,
+            deadline_seconds=self._load_timeout,
+            _timeout_override=self._load_timeout,
+        )
+        if response.state in {"ready", "failed", "conflict", "deadline_exceeded"}:
+            return response
+        return await self.wait_for_operation(
+            response.operation_id,
+            deadline_seconds=response.deadline_seconds or self._load_timeout,
+        )
+
+    async def start_load_model(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str,
+        generation_id: str,
+        operation_id: str,
+        deadline_seconds: float,
+        _timeout_override: float | None = None,
+    ) -> LoadResponse:
+        payload = LoadRequest(
+            model=model_dict,
+            deployment_digest=deployment_digest,
+            generation_id=generation_id,
+            operation_id=operation_id,
+            deadline_seconds=deadline_seconds,
+        ).model_dump()
+        # Le POST ne doit attendre que l'acceptation de l'opération. Un éventuel
+        # timeout est ensuite résolu par GET /agent/operations/{id}, avec le même
+        # identifiant, au lieu de lancer un doublon sur un autre nœud.
         raw = await self._post(
-            "/agent/models/load", json=payload, timeout=self._load_timeout
+            "/agent/models/load",
+            json=payload,
+            timeout=min(
+                self._request_timeout if _timeout_override is None else _timeout_override,
+                max(0.1, deadline_seconds),
+            ),
         )
         resp = self._parse(LoadResponse, raw)
-        # Zéro confiance dans le llama_url renvoyé par l'agent (SSRF /
-        # exfiltration de prompts) : on reconstruit l'URL à partir de l'hôte
-        # RÉEL du nœud (base_url, source de confiance) + le port retourné.
-        # Ce chemin couvre aussi already_loaded=True (idempotent).
+        if not resp.deployment_digest:
+            resp = resp.model_copy(update={"deployment_digest": deployment_digest})
+        if not resp.generation_id:
+            resp = resp.model_copy(update={"generation_id": generation_id})
+        if not resp.operation_id:
+            resp = resp.model_copy(update={"operation_id": operation_id})
+        if resp.state == "ready":
+            return self._with_trusted_url(resp)
+        return resp
+
+    async def get_operation_status(self, operation_id: str) -> OperationStatusResponse:
+        safe_operation_id = quote(operation_id, safe="._-")
+        raw = await self._get(f"/agent/operations/{safe_operation_id}")
+        response = self._parse(OperationStatusResponse, raw)
+        if response.state == "ready":
+            response = self._with_trusted_url(response)
+        return response
+
+    async def wait_for_operation(
+        self, operation_id: str, *, deadline_seconds: float
+    ) -> LoadResponse:
+        """Attend une opération sans jamais substituer un nouvel operation_id."""
+        deadline = time.monotonic() + deadline_seconds
+        while True:
+            response = await self.get_operation_status(operation_id)
+            if response.state in {"ready", "failed", "conflict", "deadline_exceeded"}:
+                return response
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise NodeUnreachableError(
+                    f"Nœud '{self.node_id}' : opération '{operation_id}' toujours "
+                    "en cours à l'échéance négociée"
+                )
+            await asyncio.sleep(min(0.2, remaining))
+
+    def _with_trusted_url(self, resp: LoadResponse) -> LoadResponse:
+        if resp.port is None or not resp.llama_url:
+            raise NodeProtocolError(
+                f"Nœud '{self.node_id}' : réponse READY sans port/llama_url"
+            )
         trusted_url = self._trusted_llama_url(resp)
         return resp.model_copy(update={"llama_url": trusted_url})
 
@@ -287,6 +378,7 @@ class LocalNodeAdapter:
         self.node_id = node_id
         self.base_url = "in-process"
         self._backend = backend
+        self.supports_load_operations = hasattr(backend, "start_load_model")
 
     async def health(self) -> NodeHealth:
         return await self._backend.health()
@@ -303,6 +395,48 @@ class LocalNodeAdapter:
 
     async def load_model(self, model_dict: dict) -> LoadResponse:
         return await self._backend.load_model(model_dict)
+
+    async def start_load_model(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str,
+        generation_id: str,
+        operation_id: str,
+        deadline_seconds: float,
+    ) -> LoadResponse:
+        """Expose le nouveau contrat tout en gardant les backends de test legacy."""
+        starter = getattr(self._backend, "start_load_model", None)
+        if starter is not None:
+            return await starter(
+                model_dict,
+                deployment_digest=deployment_digest,
+                generation_id=generation_id,
+                operation_id=operation_id,
+                deadline_seconds=deadline_seconds,
+            )
+        # L'adaptateur local historique est synchrone du point de vue du
+        # contrôle : son résultat READY constitue déjà une opération terminée.
+        response = await self._backend.load_model(model_dict)
+        return response.model_copy(
+            update={
+                "deployment_digest": deployment_digest,
+                "generation_id": generation_id,
+                "operation_id": operation_id,
+                "state": "ready",
+                "progress": 1.0,
+                "deadline_seconds": deadline_seconds,
+            }
+        )
+
+    async def get_operation_status(self, operation_id: str) -> OperationStatusResponse:
+        getter = getattr(self._backend, "get_operation_status", None)
+        if getter is None:
+            raise NodeProtocolError(
+                f"Nœud local '{self.node_id}' ne fournit pas le statut d'opération"
+            )
+        response = await getter(operation_id)
+        return OperationStatusResponse.model_validate(response.model_dump())
 
     async def unload_model(self, model_id: str) -> UnloadResponse:
         return await self._backend.unload_model(model_id)
