@@ -17,11 +17,12 @@ import hashlib
 import os
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 import integrity
-from integrity import attest_gguf, reset_integrity_cache
+from integrity import attest_gguf, attest_model_artifacts, reset_integrity_cache
 from model_registry import IntegrityError
 
 # Tous les tests async de ce module tournent sur asyncio (backend forcé en conftest).
@@ -293,3 +294,58 @@ async def test_cache_is_bounded(tmp_path, monkeypatch):
     await attest_gguf(model_b)
     assert len(integrity._attested) <= 1
     assert not integrity._inflight
+
+
+# ── Artefacts vision (REG-002) ────────────────────────────────────────────────
+
+def _make_vision_model(
+    tmp_path,
+    *,
+    model_content: bytes = b"model",
+    projector_content: bytes = b"projector",
+    model_sha256: str | None = None,
+    projector_sha256: str | None = None,
+):
+    model_path = tmp_path / "vision.gguf"
+    projector_path = tmp_path / "vision-mmproj.gguf"
+    model_path.write_bytes(model_content)
+    projector_path.write_bytes(projector_content)
+    return SimpleNamespace(
+        id="vision",
+        path=model_path,
+        sha256=(
+            hashlib.sha256(model_content).hexdigest()
+            if model_sha256 == "auto"
+            else model_sha256
+        ),
+        capabilities=["text_generation", "vision"],
+        mmproj_path=projector_path,
+        mmproj_sha256=(
+            hashlib.sha256(projector_content).hexdigest()
+            if projector_sha256 == "auto"
+            else projector_sha256
+        ),
+    )
+
+
+async def test_vision_attests_projector_even_without_main_gguf_digest(tmp_path):
+    model = _make_vision_model(tmp_path, projector_sha256="auto")
+
+    assert await attest_model_artifacts(model) is None
+    assert (str(model.mmproj_path.resolve()), model.mmproj_sha256) in integrity._attested
+
+
+async def test_vision_projector_digest_mismatch_is_fail_closed(tmp_path):
+    model = _make_vision_model(tmp_path, projector_sha256="0" * 64)
+
+    with pytest.raises(IntegrityError, match="projecteur multimodal"):
+        await attest_model_artifacts(model)
+    assert not any(key[0] == str(model.mmproj_path.resolve()) for key in integrity._attested)
+
+
+async def test_vision_missing_projector_is_fail_closed(tmp_path):
+    model = _make_vision_model(tmp_path, projector_sha256="auto")
+    model.mmproj_path.unlink()
+
+    with pytest.raises(IntegrityError, match="projecteur multimodal"):
+        await attest_model_artifacts(model)

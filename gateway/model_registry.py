@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import os
 import re
 import logging
@@ -99,6 +100,53 @@ _CACHE_TYPES = {"f16", "bf16", "q8_0", "q5_0", "q4_0"}
 # Extensible plus tard (draft-simple, draft-eagle3, ngram-*…).
 _SPEC_TYPES = {"mtp"}
 
+# Capacités exposées par le registre public. Une valeur inconnue est presque
+# toujours une faute de frappe qui désactive silencieusement un garde-fou
+# (notamment ``vision``), donc le YAML et l'API admin partagent cette liste.
+MODEL_CAPABILITIES = frozenset({
+    "text_generation",
+    "streaming",
+    "tool_calls",
+    "vision",
+    "embeddings",
+})
+
+# Clés admises dans une entrée de ``models.yaml``. Les clés inconnues sont
+# refusées plutôt qu'ignorées : une faute de frappe dans un réglage ne doit pas
+# produire une définition apparemment valide avec une valeur par défaut.
+_MODEL_ENTRY_KEYS = frozenset({
+    "id",
+    "path",
+    "description",
+    "vram_gb",
+    "enabled",
+    "capabilities",
+    "llama_params",
+    "mmproj_path",
+    "mmproj_sha256",
+    "load_timeout_seconds",
+    "speculative",
+    "sha256",
+})
+
+
+def _strict_sha256(model_id: str, field_name: str, value: object) -> str | None:
+    """Valide une empreinte déclarée sans convertir les types YAML."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"[{model_id}] {field_name} doit être une chaîne de 64 caractères "
+            f"hexadécimaux, reçu : {value!r}"
+        )
+    normalized = value.strip()
+    if not _SHA256_RE.fullmatch(normalized):
+        raise ValueError(
+            f"[{model_id}] {field_name} invalide : {value!r}. "
+            "Attendu : 64 caractères hexadécimaux."
+        )
+    return normalized.lower()
+
 
 @dataclass
 class LlamaParams:
@@ -119,6 +167,34 @@ class LlamaParams:
     cpu_moe: bool = False
 
     def __post_init__(self) -> None:
+        for field_name in (
+            "n_gpu_layers",
+            "ctx_size",
+            "parallel",
+            "batch_size",
+            "ubatch_size",
+            "threads",
+            "threads_http",
+        ):
+            value = getattr(self, field_name)
+            if type(value) is not int:
+                raise ValueError(
+                    f"{field_name} doit être un entier YAML réel, reçu : {value!r}"
+                )
+        for field_name in ("cache_type_k", "cache_type_v"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"{field_name} doit être une chaîne, reçu : {value!r}"
+                )
+        if type(self.flash_attn) is not bool:
+            raise ValueError(
+                f"flash_attn doit être un booléen YAML réel, reçu : {self.flash_attn!r}"
+            )
+        if type(self.cpu_moe) is not bool:
+            raise ValueError(
+                f"cpu_moe doit être un booléen YAML réel, reçu : {self.cpu_moe!r}"
+            )
         if self.ubatch_size > self.batch_size:
             raise ValueError(
                 f"ubatch_size ({self.ubatch_size}) doit être ≤ batch_size ({self.batch_size})"
@@ -133,6 +209,14 @@ class LlamaParams:
             raise ValueError(f"ctx_size doit être ≥ 512, reçu : {self.ctx_size}")
         if self.parallel < 1:
             raise ValueError(f"parallel doit être ≥ 1, reçu : {self.parallel}")
+        if self.batch_size < 1:
+            raise ValueError(f"batch_size doit être ≥ 1, reçu : {self.batch_size}")
+        if self.ubatch_size < 1:
+            raise ValueError(f"ubatch_size doit être ≥ 1, reçu : {self.ubatch_size}")
+        if self.threads < 1:
+            raise ValueError(f"threads doit être ≥ 1, reçu : {self.threads}")
+        if self.threads_http < 1:
+            raise ValueError(f"threads_http doit être ≥ 1, reçu : {self.threads_http}")
 
 
 @dataclass
@@ -151,6 +235,27 @@ class SpeculativeParams:
     draft_p_min: float = 0.0  # --spec-draft-p-min : proba min d'acceptation (greedy)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.type, str):
+            raise ValueError(f"type doit être une chaîne, reçu : {self.type!r}")
+        if type(self.draft_max) is not int:
+            raise ValueError(
+                f"draft_max doit être un entier YAML réel, reçu : {self.draft_max!r}"
+            )
+        if type(self.draft_min) is not int:
+            raise ValueError(
+                f"draft_min doit être un entier YAML réel, reçu : {self.draft_min!r}"
+            )
+        if (
+            isinstance(self.draft_p_min, bool)
+            or not isinstance(self.draft_p_min, (int, float))
+        ):
+            raise ValueError(
+                f"draft_p_min doit être un nombre YAML réel, reçu : {self.draft_p_min!r}"
+            )
+        if not math.isfinite(float(self.draft_p_min)):
+            raise ValueError(
+                f"draft_p_min doit être un nombre fini, reçu : {self.draft_p_min!r}"
+            )
         if self.type not in _SPEC_TYPES:
             raise ValueError(
                 f"type de speculative invalide : {self.type!r}. Valeurs : {_SPEC_TYPES}"
@@ -165,6 +270,38 @@ class SpeculativeParams:
             )
         if not (0.0 <= self.draft_p_min <= 1.0):
             raise ValueError(f"draft_p_min doit être dans [0, 1], reçu : {self.draft_p_min}")
+
+
+def _verify_file_integrity(
+    model_id: str,
+    path: Path,
+    declared: str,
+    artifact_label: str,
+) -> None:
+    """Vérifie une empreinte SHA-256 de façon synchrone, hors event loop."""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(_HASH_CHUNK_SIZE), b""):
+                digest.update(chunk)
+    except FileNotFoundError as exc:
+        raise IntegrityError(
+            f"[{model_id}] Fichier {artifact_label} introuvable pour "
+            f"vérification d'intégrité : {path}"
+        ) from exc
+    except OSError as exc:
+        raise IntegrityError(
+            f"[{model_id}] Lecture impossible du fichier {artifact_label} "
+            f"pour vérification d'intégrité : {exc}"
+        ) from exc
+
+    actual = digest.hexdigest()
+    if actual.lower() != declared.lower():
+        raise IntegrityError(
+            f"[{model_id}] Empreinte SHA-256 non conforme pour {path} : "
+            f"attendu {declared.lower()}, obtenu {actual}. "
+            f"Fichier {artifact_label} potentiellement corrompu ou substitué."
+        )
 
 
 @dataclass
@@ -195,6 +332,10 @@ class ModelDefinition:
     # substitué ou corrompu (overflows de parsing GGUF → RCE). Vérifié hors du
     # chemin de construction de commande (I/O coûteuse).
     sha256: str | None = None
+    # Empreinte du projecteur multimodal. Obligatoire avec la capability
+    # ``vision`` afin que les deux artefacts servant l'inférence soient
+    # attestables avant le lancement de llama-server.
+    mmproj_sha256: str | None = None
 
     def verify_integrity(self) -> bool:
         """
@@ -208,29 +349,20 @@ class ModelDefinition:
         froid peut attendre cette attestation, tandis qu'un modèle déjà READY
         ne la recalcule pas.
         """
-        if self.sha256 is None:
-            return True
+        if self.sha256 is not None:
+            _verify_file_integrity(self.id, self.path, self.sha256, "GGUF")
 
-        try:
-            digest = hashlib.sha256()
-            with self.path.open("rb") as f:
-                for chunk in iter(lambda: f.read(_HASH_CHUNK_SIZE), b""):
-                    digest.update(chunk)
-        except FileNotFoundError as exc:
-            raise IntegrityError(
-                f"[{self.id}] Fichier GGUF introuvable pour vérification d'intégrité : {self.path}"
-            ) from exc
-        except OSError as exc:
-            raise IntegrityError(
-                f"[{self.id}] Lecture impossible pour vérification d'intégrité : {exc}"
-            ) from exc
-
-        actual = digest.hexdigest()
-        if actual.lower() != self.sha256.lower():
-            raise IntegrityError(
-                f"[{self.id}] Empreinte SHA-256 non conforme pour {self.path} : "
-                f"attendu {self.sha256.lower()}, obtenu {actual}. "
-                f"Fichier GGUF potentiellement corrompu ou substitué."
+        if "vision" in self.capabilities:
+            if self.mmproj_path is None or self.mmproj_sha256 is None:
+                raise IntegrityError(
+                    f"[{self.id}] Projecteur multimodal (mmproj) incomplet : "
+                    "chemin et empreinte SHA-256 requis pour la capability vision."
+                )
+            _verify_file_integrity(
+                self.id,
+                self.mmproj_path,
+                self.mmproj_sha256,
+                "projecteur multimodal (mmproj)",
             )
         return True
 
@@ -322,6 +454,8 @@ class ModelDefinition:
             d["load_timeout_seconds"] = self.load_timeout_seconds
         if self.sha256 is not None:
             d["sha256"] = self.sha256
+        if self.mmproj_sha256 is not None:
+            d["mmproj_sha256"] = self.mmproj_sha256
         if self.speculative is not None:
             s = self.speculative
             d["speculative"] = {
@@ -396,6 +530,12 @@ class ModelRegistry:
 
         if not isinstance(data, dict) or "models" not in data:
             raise ValueError(f"Format invalide dans {self._path} : clé 'models' manquante")
+        unknown_root_keys = sorted(set(data) - {"models"})
+        if unknown_root_keys:
+            raise ValueError(
+                f"Format invalide dans {self._path} : clés racine inconnues : "
+                f"{unknown_root_keys}"
+            )
         if not isinstance(data["models"], list):
             raise ValueError(
                 f"Format invalide dans {self._path} : 'models' doit être une liste"
@@ -456,40 +596,113 @@ class ModelRegistry:
 
     def _parse_entry(self, entry: dict) -> ModelDefinition:
         """Parse et valide une entrée du YAML. Lève ValueError si invalide."""
-        model_id = str(entry.get("id", ""))
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"Chaque modèle doit être un objet YAML, reçu : {type(entry).__name__}"
+            )
+        unknown_keys = sorted(set(entry) - _MODEL_ENTRY_KEYS)
+        if unknown_keys:
+            raise ValueError(f"Clés de modèle inconnues : {unknown_keys}")
+
+        raw_id = entry.get("id", "")
+        if not isinstance(raw_id, str):
+            raise ValueError(
+                f"L'ID de modèle doit être une chaîne, reçu : {raw_id!r}"
+            )
+        model_id = raw_id
         self._validate_model_id(model_id)
 
-        raw_path = str(entry.get("path", ""))
+        raw_path = entry.get("path", "")
+        if not isinstance(raw_path, str):
+            raise ValueError(
+                f"[{model_id}] path doit être une chaîne, reçu : {raw_path!r}"
+            )
         path = self._validate_model_path(raw_path)
 
-        vram_gb = float(entry.get("vram_gb", 0))
+        raw_vram = entry.get("vram_gb", 0)
+        if (
+            isinstance(raw_vram, bool)
+            or not isinstance(raw_vram, (int, float))
+            or not math.isfinite(float(raw_vram))
+        ):
+            raise ValueError(
+                f"[{model_id}] vram_gb doit être un nombre fini, reçu : {raw_vram!r}"
+            )
+        vram_gb = float(raw_vram)
         if vram_gb <= 0:
             raise ValueError(f"[{model_id}] vram_gb doit être > 0, reçu : {vram_gb}")
 
         llama_raw = entry.get("llama_params", {})
-        llama_params = LlamaParams(**llama_raw)
+        if not isinstance(llama_raw, dict):
+            raise ValueError(
+                f"[{model_id}] llama_params doit être un objet YAML, reçu : "
+                f"{llama_raw!r}"
+            )
+        try:
+            llama_params = LlamaParams(**llama_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"[{model_id}] llama_params invalide : {exc}") from exc
 
-        capabilities = list(entry.get("capabilities", ["text_generation"]))
+        raw_capabilities = entry.get("capabilities", ["text_generation"])
+        if not isinstance(raw_capabilities, list):
+            raise ValueError(
+                f"[{model_id}] capabilities doit être une liste, reçu : "
+                f"{raw_capabilities!r}"
+            )
+        if not raw_capabilities:
+            raise ValueError(f"[{model_id}] capabilities ne peut pas être vide")
+        if any(not isinstance(capability, str) or not capability for capability in raw_capabilities):
+            raise ValueError(
+                f"[{model_id}] capabilities doit contenir uniquement des chaînes "
+                "non vides"
+            )
+        unknown_capabilities = sorted(set(raw_capabilities) - MODEL_CAPABILITIES)
+        if unknown_capabilities:
+            raise ValueError(
+                f"[{model_id}] capabilities inconnues : {unknown_capabilities}. "
+                f"Valeurs admises : {sorted(MODEL_CAPABILITIES)}"
+            )
+        capabilities = list(raw_capabilities)
 
-        # mmproj_path — optionnel, mais obligatoire en pratique si 'vision' est déclaré.
-        # Sans lui, llama-server retourne HTTP 500 sur toute requête avec image.
+        # mmproj_path — obligatoire structurellement si 'vision' est déclaré.
         raw_mmproj = entry.get("mmproj_path")
         mmproj_path: Path | None = None
-        if raw_mmproj:
-            mmproj_path = self._validate_model_path(str(raw_mmproj))
+        if raw_mmproj is not None:
+            if not isinstance(raw_mmproj, str):
+                raise ValueError(
+                    f"[{model_id}] mmproj_path doit être une chaîne ou null, "
+                    f"reçu : {raw_mmproj!r}"
+                )
+            if not raw_mmproj:
+                raise ValueError(f"[{model_id}] mmproj_path ne peut pas être vide")
+            mmproj_path = self._validate_model_path(raw_mmproj)
 
-        if "vision" in capabilities and mmproj_path is None:
-            log.warning(
-                "[%s] La capability 'vision' est déclarée mais 'mmproj_path' est absent "
-                "— les requêtes avec images retourneront HTTP 500. "
-                "Ajoutez mmproj_path dans models.yaml.",
-                model_id,
+        mmproj_sha256 = _strict_sha256(
+            model_id, "mmproj_sha256", entry.get("mmproj_sha256")
+        )
+        if "vision" in capabilities:
+            if mmproj_path is None:
+                raise ValueError(
+                    f"[{model_id}] la capability 'vision' exige un projecteur multimodal (mmproj_path)"
+                )
+            if mmproj_sha256 is None:
+                raise ValueError(
+                    f"[{model_id}] la capability 'vision' exige un projecteur multimodal (mmproj_sha256)"
+                )
+        elif mmproj_sha256 is not None and mmproj_path is None:
+            raise ValueError(
+                f"[{model_id}] mmproj_sha256 ne peut pas être utilisé sans mmproj_path"
             )
 
         raw_timeout = entry.get("load_timeout_seconds")
         load_timeout_seconds: int | None = None
         if raw_timeout is not None:
-            load_timeout_seconds = int(raw_timeout)
+            if type(raw_timeout) is not int:
+                raise ValueError(
+                    f"[{model_id}] load_timeout_seconds doit être un entier YAML réel, "
+                    f"reçu : {raw_timeout!r}"
+                )
+            load_timeout_seconds = raw_timeout
             if load_timeout_seconds < 30:
                 raise ValueError(
                     f"[{model_id}] load_timeout_seconds doit être ≥ 30, reçu : {load_timeout_seconds}"
@@ -497,21 +710,17 @@ class ModelRegistry:
 
         # sha256 — empreinte GGUF optionnelle (opt-in supply-chain). Si présente,
         # doit être 64 caractères hexadécimaux. Normalisée en minuscules.
-        raw_sha256 = entry.get("sha256")
-        sha256: str | None = None
-        if raw_sha256 is not None:
-            sha256 = str(raw_sha256).strip()
-            if not _SHA256_RE.match(sha256):
-                raise ValueError(
-                    f"[{model_id}] sha256 invalide : {raw_sha256!r}. "
-                    f"Attendu : 64 caractères hexadécimaux."
-                )
-            sha256 = sha256.lower()
+        sha256 = _strict_sha256(model_id, "sha256", entry.get("sha256"))
 
         # speculative — bloc optionnel MTP. Absent = comportement inchangé.
         spec_raw = entry.get("speculative")
         speculative: SpeculativeParams | None = None
-        if spec_raw:
+        if spec_raw is not None:
+            if not isinstance(spec_raw, dict):
+                raise ValueError(
+                    f"[{model_id}] speculative doit être un objet YAML ou null, "
+                    f"reçu : {spec_raw!r}"
+                )
             try:
                 speculative = SpeculativeParams(**spec_raw)
             except (TypeError, ValueError) as exc:
@@ -524,10 +733,21 @@ class ModelRegistry:
                 f"(true ou false non quoté), reçu : {enabled!r}"
             )
 
+        description = entry.get("description", "")
+        if not isinstance(description, str):
+            raise ValueError(
+                f"[{model_id}] description doit être une chaîne, reçu : {description!r}"
+            )
+        if len(description) > 200:
+            raise ValueError(
+                f"[{model_id}] description ne peut pas dépasser 200 caractères, "
+                f"reçu : {len(description)}"
+            )
+
         return ModelDefinition(
             id=model_id,
             path=path,
-            description=str(entry.get("description", "")),
+            description=description,
             vram_gb=vram_gb,
             enabled=enabled,
             capabilities=capabilities,
@@ -536,6 +756,7 @@ class ModelRegistry:
             load_timeout_seconds=load_timeout_seconds,
             speculative=speculative,
             sha256=sha256,
+            mmproj_sha256=mmproj_sha256,
         )
 
     def _validate_model_id(self, model_id: str) -> None:
@@ -636,6 +857,7 @@ class ModelRegistry:
             load_timeout_seconds=model.load_timeout_seconds,
             speculative=model.speculative,
             sha256=model.sha256,
+            mmproj_sha256=model.mmproj_sha256,
         )
         precedent = dict(self._models)
         self._models[model_id] = updated
@@ -679,6 +901,7 @@ class ModelRegistry:
             load_timeout_seconds=model.load_timeout_seconds,
             speculative=model.speculative,
             sha256=model.sha256,
+            mmproj_sha256=model.mmproj_sha256,
         )
         if updated.vram_gb <= 0:
             raise ValueError(f"vram_gb doit être > 0, reçu : {updated.vram_gb}")

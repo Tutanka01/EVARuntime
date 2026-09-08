@@ -272,6 +272,7 @@ def test_ready_503_when_vision_mmproj_missing(client, monkeypatch, tmp_path):
         _gguf(tmp_path),
         capabilities=["text_generation", "vision"],
         mmproj_path=str(tmp_path / "absent-mmproj.gguf"),
+        mmproj_sha256="0" * 64,
     )
     manager = _FakeManager([model], _local_status())
     _wire(monkeypatch, manager, cfg)

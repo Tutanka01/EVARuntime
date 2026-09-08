@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import re
 from pathlib import Path
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+MAX_PORT = 65535
 
 
 class AgentSettings(BaseSettings):
@@ -75,10 +79,9 @@ class AgentSettings(BaseSettings):
     idle_check_interval_seconds: int = Field(default=30, gt=0)
 
     # ── Sécurité des chemins .gguf ────────────────────────────────────────────
-    # Chaîne volontairement simple : pydantic-settings tente sinon de décoder
-    # list[str] exclusivement comme JSON avant nos validators. On accepte ici
-    # l'ancien format `/models`, une liste CSV, ou un tableau JSON.
-    allowed_model_dirs: str = ""
+    # L'union conserve la syntaxe CSV de l'EnvironmentFile : une annotation
+    # `list[str]` seule ferait décoder la source comme JSON avant le validator.
+    allowed_model_dirs: str | list[str] = Field(default_factory=list)
 
     # ── Clé interne gateway ↔ llama-server ───────────────────────────────────
     # Cette clé est différente de agent_secret : elle protège le canal
@@ -93,11 +96,45 @@ class AgentSettings(BaseSettings):
     log_dir: Path = Path("/var/log/llm-gateway-agent")
     db_path: Path = Path(":memory:")  # pas de SQLite persistant côté agent
 
+    @field_validator(
+        "agent_port",
+        "base_llama_port",
+        "max_loaded_models",
+        "llama_server_min_build",
+        "total_vram_gb",
+        "vram_overhead_gb",
+        "vram_safety_margin",
+        "idle_timeout_seconds",
+        "model_load_timeout_seconds",
+        "idle_check_interval_seconds",
+        mode="before",
+    )
+    @classmethod
+    def _reject_boolean_numeric_settings(cls, v: object) -> object:
+        """Refuse `True`/`False` silently coerced to 1/0 par Pydantic."""
+        if isinstance(v, bool):
+            raise ValueError("une valeur booléenne n'est pas un nombre de configuration")
+        return v
+
     @field_validator("vram_safety_margin")
     @classmethod
     def _validate_margin(cls, v: float) -> float:
-        if not 0.0 <= v < 1.0:
+        if not math.isfinite(v) or not 0.0 <= v < 1.0:
             raise ValueError(f"vram_safety_margin doit être dans [0, 1), reçu : {v}")
+        return v
+
+    @field_validator("total_vram_gb")
+    @classmethod
+    def _validate_total_vram(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"total_vram_gb doit être un nombre fini > 0, reçu : {v}")
+        return v
+
+    @field_validator("vram_overhead_gb")
+    @classmethod
+    def _validate_vram_overhead(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"vram_overhead_gb doit être un nombre fini ≥ 0, reçu : {v}")
         return v
 
     @field_validator("max_loaded_models")
@@ -136,11 +173,19 @@ class AgentSettings(BaseSettings):
                 raise ValueError(f"hôte invalide : {v!r}")
         return value
 
-    def allowed_model_dirs_list(self) -> list[str]:
-        """Normalise ALLOWED_MODEL_DIRS depuis valeur simple, CSV ou JSON."""
-        raw = self.allowed_model_dirs.strip()
+    @field_validator("allowed_model_dirs", mode="before")
+    @classmethod
+    def _split_allowed_model_dirs(cls, v: object) -> object:
+        """Normalise la valeur d'environnement CSV ou tableau JSON."""
+        if not isinstance(v, str):
+            return v
+        raw = v.strip()
         if not raw:
             return []
+        if raw.startswith("{"):
+            raise ValueError(
+                "ALLOWED_MODEL_DIRS : attendu une liste CSV ou un tableau JSON, pas un objet"
+            )
         if raw.startswith("["):
             try:
                 decoded = json.loads(raw)
@@ -148,9 +193,16 @@ class AgentSettings(BaseSettings):
                 raise ValueError("ALLOWED_MODEL_DIRS JSON invalide") from exc
             if not isinstance(decoded, list) or not all(isinstance(v, str) for v in decoded):
                 raise ValueError("ALLOWED_MODEL_DIRS JSON doit être une liste de chaînes")
-            values = decoded
-        else:
-            values = [part.strip() for part in raw.split(",") if part.strip()]
+            return [item.strip() for item in decoded if item.strip()]
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    def allowed_model_dirs_list(self) -> list[str]:
+        """Normalise ALLOWED_MODEL_DIRS depuis valeur simple, CSV ou JSON."""
+        values = self.allowed_model_dirs
+        if isinstance(values, str):
+            values = self._split_allowed_model_dirs(values)
+        if not isinstance(values, list):
+            raise ValueError("ALLOWED_MODEL_DIRS doit être une liste de chaînes")
 
         normalized: list[str] = []
         for raw in values:
@@ -164,15 +216,26 @@ class AgentSettings(BaseSettings):
     def _validate_capacity_and_ports(self) -> "AgentSettings":
         # Force la validation du format même si aucun modèle n'est encore chargé.
         self.allowed_model_dirs_list()
-        if self.effective_vram_budget_gb() <= 0:
-            raise ValueError("le budget VRAM net doit être strictement positif")
+        errors: list[str] = []
+        if self.vram_overhead_gb >= self.total_vram_gb:
+            errors.append("VRAM_OVERHEAD_GB doit être strictement inférieur à TOTAL_VRAM_GB")
+        budget = self.effective_vram_budget_gb()
+        if not math.isfinite(budget) or budget <= 0:
+            errors.append("le budget VRAM net doit être strictement positif")
         last_llama_port = self.base_llama_port + self.max_loaded_models - 1
-        if last_llama_port > 65535:
-            raise ValueError("la plage BASE_LLAMA_PORT + MAX_LOADED_MODELS dépasse 65535")
+        if last_llama_port > MAX_PORT:
+            errors.append("la plage BASE_LLAMA_PORT + MAX_LOADED_MODELS dépasse 65535")
         if self.base_llama_port <= self.agent_port <= last_llama_port:
-            raise ValueError("AGENT_PORT ne doit pas chevaucher la plage de ports llama-server")
+            errors.append("AGENT_PORT ne doit pas chevaucher la plage de ports llama-server")
+        if self.idle_check_interval_seconds > self.idle_timeout_seconds:
+            errors.append(
+                "IDLE_CHECK_INTERVAL_SECONDS doit être inférieur ou égal à "
+                "IDLE_TIMEOUT_SECONDS"
+            )
         if (self.agent_tls_cert is None) != (self.agent_tls_key is None):
-            raise ValueError("AGENT_TLS_CERT et AGENT_TLS_KEY doivent être définis ensemble")
+            errors.append("AGENT_TLS_CERT et AGENT_TLS_KEY doivent être définis ensemble")
+        if errors:
+            raise ValueError("Configuration incohérente : " + "; ".join(errors))
         return self
 
     def effective_vram_budget_gb(self) -> float:

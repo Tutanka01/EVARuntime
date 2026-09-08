@@ -18,10 +18,10 @@
 # Champs optionnels :
 #   description : texte libre
 #   enabled     : true/false (défaut: true)
-#   capabilities: liste parmi [text_generation, tool_calls, streaming, vision, embedding]
+#   capabilities: liste non vide parmi [text_generation, tool_calls, streaming, vision, embeddings]
 #   mmproj_path : chemin absolu vers le fichier .gguf du projector multimodal (clip).
-#                 OBLIGATOIRE si 'vision' est dans capabilities — sans lui, llama-server
-#                 retourne HTTP 500 sur toute requête contenant une image.
+#   mmproj_sha256 : empreinte SHA-256 du projector. Les deux champs sont
+#                 OBLIGATOIRES si 'vision' est dans capabilities.
 #                 Exemple : /models/llava-v1.6-mistral-7b-mmproj-f16.gguf
 #   llama_params: paramètres llama-server (surcharge les défauts)
 #   speculative : speculative decoding MTP (Multi-Token Prediction). Bloc optionnel.

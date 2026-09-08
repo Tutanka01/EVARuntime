@@ -21,6 +21,7 @@ l'autre. On réutilise donc le pattern `file_db` de test_security_hardening.py :
 from __future__ import annotations
 
 import re
+import hashlib
 
 import pytest
 import yaml
@@ -318,6 +319,38 @@ def test_register_model_valid_entry_is_persisted(
     assert response.status_code == 201
     assert temp_registry.get("test-model") is not None
     assert temp_registry.get("test-model").vram_gb == 5.0
+
+
+def test_register_model_persists_vision_and_integrity_fields(
+    client, admin_headers, temp_registry, tmp_path,
+):
+    projector = tmp_path / "model-mmproj.gguf"
+    projector.write_bytes(b"projecteur vision")
+    model_path = tmp_path / "model.gguf"
+    model_path.write_bytes(b"poids vision")
+    entry = {
+        "id": "vision-model",
+        "path": str(model_path),
+        "vram_gb": 5.0,
+        "capabilities": ["text_generation", "vision"],
+        "mmproj_path": str(projector),
+        "mmproj_sha256": hashlib.sha256(projector.read_bytes()).hexdigest(),
+        "sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+        "load_timeout_seconds": 60,
+        "speculative": {"type": "mtp", "draft_max": 8},
+    }
+
+    response = client.post("/admin/models", json=entry, headers=admin_headers)
+
+    assert response.status_code == 201, response.text
+    model = temp_registry.get("vision-model")
+    assert model is not None
+    assert model.mmproj_path == projector
+    assert model.mmproj_sha256 == entry["mmproj_sha256"]
+    assert model.sha256 == entry["sha256"]
+    assert model.load_timeout_seconds == 60
+    assert model.speculative is not None
+    assert model.speculative.draft_max == 8
 
 
 # ── 4. update_model : llama_params invalides → 422, registre non corrompu ────

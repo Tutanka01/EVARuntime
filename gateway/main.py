@@ -25,7 +25,7 @@ from admin import router as admin_router
 from auth import get_current_user
 from background import drain_pending
 from config import SECRET_MIN_LENGTH, settings
-from integrity import attest_gguf
+from integrity import attest_model_artifacts
 from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
 from model_manager import model_manager
@@ -33,6 +33,11 @@ from model_registry import IntegrityError
 from proxy import aclose_http_client, init_http_client, models_response, proxy_request
 from rate_limiter import check_rate_limit
 from readiness import caller_is_privileged, evaluate_readiness
+
+# Alias conservé pour les intégrations et tests qui instrumentaient l'ancien
+# point d'entrée de l'attestation du GGUF principal. Le comportement inclut
+# désormais le projecteur requis par les modèles vision.
+attest_gguf = attest_model_artifacts
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -100,11 +105,14 @@ async def _validate_inference_runtime(enabled_models) -> None:
         )
 
     for model in enabled_models:
-        if model.sha256 is None:
+        if (
+            getattr(model, "sha256", None) is None
+            and "vision" not in (getattr(model, "capabilities", ()) or ())
+        ):
             continue
         try:
             await attest_gguf(model)
-            log.info("Intégrité SHA-256 vérifiée : %s", model.id)
+            log.info("Intégrité des artefacts vérifiée : %s", model.id)
         except IntegrityError as exc:
             log.critical("Intégrité GGUF compromise : %s", exc)
             raise RuntimeError(

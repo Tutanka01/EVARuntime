@@ -6,9 +6,15 @@ on ne les revalide pas pour éviter de casser la compatibilité avec les futurs 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from model_registry import MODEL_CAPABILITIES
+
+
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 # ── Utilisateurs ──────────────────────────────────────────────────────────────
@@ -16,16 +22,20 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=2, max_length=64, pattern=r"^[a-zA-Z0-9_.-]+$")
     email: Optional[str] = None
-    rpm_limit: Optional[int] = Field(None, ge=1, le=1000)
-    monthly_token_limit: Optional[int] = Field(None, ge=0)
+    rpm_limit: Optional[int] = Field(None, ge=1, le=1000, strict=True)
+    monthly_token_limit: Optional[int] = Field(
+        None, ge=0, le=MAX_SQLITE_INTEGER, strict=True
+    )
     notes: Optional[str] = Field(None, max_length=500)
 
 
 class UserUpdate(BaseModel):
     email: Optional[str] = None
     is_active: Optional[bool] = None
-    rpm_limit: Optional[int] = Field(None, ge=1, le=1000)
-    monthly_token_limit: Optional[int] = Field(None, ge=0)
+    rpm_limit: Optional[int] = Field(None, ge=1, le=1000, strict=True)
+    monthly_token_limit: Optional[int] = Field(
+        None, ge=0, le=MAX_SQLITE_INTEGER, strict=True
+    )
     notes: Optional[str] = Field(None, max_length=500)
 
 
@@ -145,6 +155,8 @@ class UsageSummaryEntry(BaseModel):
 
 class LlamaParamsSchema(BaseModel):
     """Paramètres llama-server configurables par modèle."""
+    model_config = ConfigDict(strict=True, extra="forbid")
+
     n_gpu_layers: int = Field(999, ge=0)
     ctx_size: int = Field(32768, ge=512)
     parallel: int = Field(4, ge=1)
@@ -166,8 +178,43 @@ class LlamaParamsSchema(BaseModel):
         return v
 
 
+class SpeculativeParamsSchema(BaseModel):
+    """Bloc MTP optionnel, avec les mêmes bornes que le registre YAML."""
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    type: Literal["mtp"] = "mtp"
+    draft_max: int = Field(16, ge=1)
+    draft_min: int = Field(0, ge=0)
+    draft_p_min: float = Field(0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def draft_min_lte_max(self):
+        if self.draft_min > self.draft_max:
+            raise ValueError(
+                f"draft_min ({self.draft_min}) doit être ≤ draft_max ({self.draft_max})"
+            )
+        return self
+
+
+_SHA256_SCHEMA_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _normalize_sha256(value: object) -> str | None:
+    """Aligne les champs d'empreinte admin sur le parseur du registre."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("l'empreinte SHA-256 doit être une chaîne")
+    normalized = value.strip().lower()
+    if not _SHA256_SCHEMA_RE.fullmatch(normalized):
+        raise ValueError("l'empreinte SHA-256 doit contenir 64 caractères hexadécimaux")
+    return normalized
+
+
 class ModelEntryCreate(BaseModel):
     """Corps de requête pour POST /admin/models."""
+    model_config = ConfigDict(strict=True, extra="forbid")
+
     id: str = Field(
         ...,
         pattern=r"^[a-z0-9][a-z0-9._-]{0,62}$",
@@ -177,8 +224,48 @@ class ModelEntryCreate(BaseModel):
     description: str = Field("", max_length=200)
     vram_gb: float = Field(..., gt=0.0, description="VRAM estimée en GB (poids + KV cache à charge nominale)")
     enabled: bool = True
-    capabilities: list[str] = Field(default_factory=lambda: ["text_generation"])
+    capabilities: list[str] = Field(
+        default_factory=lambda: ["text_generation"], min_length=1
+    )
     llama_params: LlamaParamsSchema = Field(default_factory=LlamaParamsSchema)
+    mmproj_path: Optional[str] = None
+    mmproj_sha256: Optional[str] = None
+    load_timeout_seconds: Optional[int] = Field(None, ge=30)
+    speculative: Optional[SpeculativeParamsSchema] = None
+    sha256: Optional[str] = None
+
+    @field_validator("capabilities")
+    @classmethod
+    def validate_capabilities(cls, value: list[str]) -> list[str]:
+        if any(not capability for capability in value):
+            raise ValueError("capabilities doit contenir uniquement des chaînes non vides")
+        unknown = sorted(set(value) - MODEL_CAPABILITIES)
+        if unknown:
+            raise ValueError(
+                f"capabilities inconnues : {unknown}. "
+                f"Valeurs admises : {sorted(MODEL_CAPABILITIES)}"
+            )
+        return value
+
+    @field_validator("sha256", "mmproj_sha256", mode="before")
+    @classmethod
+    def validate_sha256(cls, value: object) -> str | None:
+        return _normalize_sha256(value)
+
+    @model_validator(mode="after")
+    def validate_vision_artifacts(self):
+        if "vision" in self.capabilities:
+            if self.mmproj_path is None:
+                raise ValueError(
+                    "la capability 'vision' exige un projecteur multimodal (mmproj_path)"
+                )
+            if self.mmproj_sha256 is None:
+                raise ValueError(
+                    "la capability 'vision' exige un projecteur multimodal (mmproj_sha256)"
+                )
+        elif self.mmproj_sha256 is not None and self.mmproj_path is None:
+            raise ValueError("mmproj_sha256 ne peut pas être utilisé sans mmproj_path")
+        return self
 
 
 class ModelEntryUpdate(BaseModel):
@@ -189,6 +276,8 @@ class ModelEntryUpdate(BaseModel):
     Si fourni, le modèle est déchargé et rechargé à la prochaine requête
     pour prendre en compte les nouveaux paramètres de lancement.
     """
+    model_config = ConfigDict(strict=True, extra="forbid")
+
     enabled: Optional[bool] = None
     vram_gb: Optional[float] = Field(None, gt=0.0)
     description: Optional[str] = Field(None, max_length=200)
