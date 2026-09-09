@@ -1314,6 +1314,84 @@ def test_un_modele_exigeant_un_mmproj_sans_mmproj_est_refuse(atelier):
         )
 
 
+def test_un_modele_vision_sans_mmproj_est_refuse_meme_si_flag_incoherent(atelier):
+    catalogue = _catalog_dict()
+    catalogue["runtime"] = dict(
+        catalogue["runtime"],
+        capabilities=["text_generation", "vision"],
+        requires_mmproj=False,
+    )
+    with pytest.raises(rw.RegistryWriterError, match="projecteur multimodal"):
+        rw.build_registry_entry(
+            catalogue,
+            models_dir=atelier["models_dir"],
+            allowed_model_dirs=(atelier["models_dir"],),
+        )
+
+
+@pytest.mark.parametrize("role", ["weights", "mmproj"])
+def test_empreinte_artefact_invalide_est_refusee(atelier, role):
+    catalogue = _catalog_dict()
+    if role == "weights":
+        catalogue["source"]["files"][0]["sha256"] = "pas-un-sha"
+    else:
+        catalogue["runtime"] = dict(
+            catalogue["runtime"],
+            capabilities=["text_generation", "vision"],
+            requires_mmproj=True,
+        )
+        catalogue["source"] = dict(
+            catalogue["source"],
+            files=[
+                *catalogue["source"]["files"],
+                {
+                    "name": "mmproj-f16.gguf",
+                    "role": "mmproj",
+                    "sha256": "pas-un-sha",
+                    "size_bytes": 10,
+                    "pinned": True,
+                },
+            ],
+        )
+    with pytest.raises(rw.RegistryWriterError, match="SHA-256 invalide"):
+        rw.build_registry_entry(
+            catalogue,
+            models_dir=atelier["models_dir"],
+            allowed_model_dirs=(atelier["models_dir"],),
+        )
+
+
+def test_un_modele_vision_emet_l_empreinte_de_son_mmproj(atelier):
+    catalogue = _catalog_dict()
+    catalogue["runtime"] = dict(
+        catalogue["runtime"],
+        capabilities=["text_generation", "vision"],
+        requires_mmproj=True,
+    )
+    catalogue["source"] = dict(
+        catalogue["source"],
+        files=[
+            *catalogue["source"]["files"],
+            {
+                "name": "mmproj-f16.gguf",
+                "role": "mmproj",
+                "sha256": "b" * 64,
+                "size_bytes": 10,
+                "pinned": True,
+            },
+        ],
+    )
+
+    entry = rw.build_registry_entry(
+        catalogue,
+        models_dir=atelier["models_dir"],
+        allowed_model_dirs=(atelier["models_dir"],),
+    )
+
+    assert entry["mmproj_path"].endswith("mmproj-f16.gguf")
+    assert entry["mmproj_sha256"] == "b" * 64
+
+
 def test_un_modele_inconnu_du_catalogue_ne_produit_aucune_entree(atelier):
     change = rw.write_model_entry(_config(atelier), "modele-fantome", mode=ex.ExecutionMode.APPLY)
     assert change.status == ex.STEP_FAILED

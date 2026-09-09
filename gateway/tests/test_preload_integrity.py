@@ -54,6 +54,10 @@ class FakeModelDef:
         path: Path,
         sha256: str | None = None,
         vram: float = 10.0,
+        *,
+        capabilities: list[str] | None = None,
+        mmproj_path: Path | None = None,
+        mmproj_sha256: str | None = None,
     ):
         self.id = mid
         self.vram_gb = vram
@@ -61,7 +65,9 @@ class FakeModelDef:
         self.description = ""
         self.path = path
         self.sha256 = sha256
-        self.capabilities = ["text_generation"]
+        self.capabilities = capabilities or ["text_generation"]
+        self.mmproj_path = mmproj_path
+        self.mmproj_sha256 = mmproj_sha256
         self.llama_params = _FakeLlamaParams()
         self.speculative = None
         self.load_timeout_seconds = 5
@@ -285,3 +291,32 @@ async def test_startup_attestation_populates_shared_cache(monkeypatch, tmp_path)
     assert counter.calls == 1, "le pré-chargement réutilise l'attestation du démarrage"
     assert calls["start"] == 1
     await mgr.unload()
+
+
+@pytest.mark.anyio
+async def test_vision_projector_is_attested_before_local_load(monkeypatch, tmp_path):
+    """Un projecteur modifié après un cycle est refusé avant le sous-processus."""
+    path, _model_digest = make_gguf(tmp_path, content=b"poids vision")
+    projector = tmp_path / "modele-mmproj.gguf"
+    projector.write_bytes(b"projecteur conforme")
+    projector_digest = hashlib.sha256(projector.read_bytes()).hexdigest()
+    model = FakeModelDef(
+        "vision",
+        path,
+        capabilities=["text_generation", "vision"],
+        mmproj_path=projector,
+        mmproj_sha256=projector_digest,
+    )
+    calls = {"start": 0}
+    mgr = make_manager(model, monkeypatch, calls)
+
+    await mgr.ensure_loaded()
+    assert mgr.state == ModelState.READY
+    await mgr.unload()
+
+    projector.write_bytes(b"projecteur substitue")
+    with pytest.raises(RuntimeError, match="intégrité"):
+        await mgr.ensure_loaded()
+
+    assert calls["start"] == 1
+    assert mgr.state == ModelState.UNLOADED

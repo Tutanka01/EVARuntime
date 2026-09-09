@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 import database as db
 from auth import require_admin
+from cluster.cluster_manager import ClusterUnloadUncertainError
 from config import settings
 from model_registry import ModelDefinition, ModelRegistry, RegistrySnapshot
 from model_manager import (
@@ -155,6 +156,8 @@ async def _unload_for_admin(
             # déchargement normal — force=true n'a de conséquence que sur un
             # modèle occupé, cas traité ci-dessous.
             await target_manager.unload_model(model_id)
+    except ClusterUnloadUncertainError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except RuntimeError as exc:
         detail = _unload_conflict_detail(exc)
         if detail is None:
@@ -663,6 +666,15 @@ async def register_model(
             status_code=422,
             detail=f"Fichier introuvable sur le serveur : {body.path}",
         )
+    if (
+        settings.cluster_mode == "local"
+        and body.mmproj_path is not None
+        and not Path(body.mmproj_path).exists()
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Fichier projecteur multimodal introuvable sur le serveur : {body.mmproj_path}",
+        )
 
     # En cluster, comparer au plus grand budget EFFECTIF d'un seul nœud (pas à
     # la somme du cluster : un modèle ne peut pas être fractionné). Si aucun
@@ -690,6 +702,16 @@ async def register_model(
             "capabilities": body.capabilities,
             "llama_params": body.llama_params.model_dump(),
         }
+        if body.mmproj_path is not None:
+            entry_dict["mmproj_path"] = body.mmproj_path
+        if body.mmproj_sha256 is not None:
+            entry_dict["mmproj_sha256"] = body.mmproj_sha256
+        if body.load_timeout_seconds is not None:
+            entry_dict["load_timeout_seconds"] = body.load_timeout_seconds
+        if body.speculative is not None:
+            entry_dict["speculative"] = body.speculative.model_dump()
+        if body.sha256 is not None:
+            entry_dict["sha256"] = body.sha256
         model = model_manager.registry.add(entry_dict)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))

@@ -32,7 +32,7 @@ from enum import Enum
 import httpx
 
 from config import settings
-from integrity import attest_gguf
+from integrity import attest_model_artifacts
 from model_registry import IntegrityError, ModelDefinition
 from telemetry import MODEL_LOAD_SECONDS
 
@@ -287,12 +287,15 @@ class ServerManager:
         LocalModelManager._is_load_capacity_error (sinon la retry après
         éviction déchargerait d'autres modèles en pure perte).
         """
-        # No-op sans empreinte déclarée : les modèles sans sha256 restent
-        # chargeables (attestation opt-in, comme au démarrage).
-        if getattr(self._model, "sha256", None) is None:
+        # No-op pour un modèle texte sans empreinte déclarée. Une définition
+        # vision, elle, porte toujours l'empreinte de son projecteur (REG-002).
+        if (
+            getattr(self._model, "sha256", None) is None
+            and "vision" not in (getattr(self._model, "capabilities", ()) or ())
+        ):
             return
         try:
-            await attest_gguf(self._model)
+            await attest_model_artifacts(self._model)
         except IntegrityError as exc:
             log.critical("Intégrité GGUF compromise (SEC-ART-001) : %s", exc)
             raise RuntimeError(

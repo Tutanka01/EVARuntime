@@ -15,12 +15,15 @@ Deux familles de tests :
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import main
+from cluster.node_protocol import deployment_digest
 from server_manager import ModelState
 
 
@@ -378,6 +381,176 @@ class TestAgentStateLoadUnload:
         assert reloaded.port not in fake_state._port_pool
         assert len(fake_state._port_pool) == main.settings.max_loaded_models - 1
         assert len(fake_state._port_pool) == len(set(fake_state._port_pool))
+
+
+class TestLoadOperations:
+    def test_http_load_returns_202_and_status_can_be_polled(self, monkeypatch):
+        """Le POST ne bloque pas sur un contrôle d'artefact lent."""
+        monkeypatch.setattr(main, "ServerManager", FakeServerManager)
+        monkeypatch.setattr(main, "_validate_model_files", lambda model: None)
+        secret = "s3cret-fort-de-test-123456789-xyz"
+        monkeypatch.setattr(main.settings, "agent_secret", secret)
+        monkeypatch.setattr(main.settings, "internal_api_key", "b" * 32)
+        release = threading.Event()
+
+        async def slow_attestation(_model):
+            await asyncio.to_thread(release.wait, 2.0)
+
+        monkeypatch.setattr(main, "attest_model_artifacts", slow_attestation)
+        model = make_model_dict("http-operation")
+        model["sha256"] = "a" * 64
+        digest = deployment_digest(model)
+        payload = {
+            "model": model,
+            "deployment_digest": digest,
+            "generation_id": "generation-http",
+            "operation_id": "operation-http",
+            "deadline_seconds": 5.0,
+        }
+        with TestClient(main.app) as client:
+            accepted = client.post(
+                "/agent/models/load",
+                json=payload,
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+            assert accepted.status_code == 202, accepted.text
+            status = client.get(
+                "/agent/operations/operation-http",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+            assert status.status_code == 200, status.text
+            assert status.json()["state"] == "loading"
+            assert status.json()["progress"] < 1.0
+            release.set()
+
+    def test_start_returns_before_slow_attestation_and_is_idempotent(self, fake_state, monkeypatch):
+        """CLU-005 : le POST est accepté avant le hash et le polling observe la même op."""
+        model = make_model_dict("slow-attestation")
+        model["sha256"] = "a" * 64
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_attestation(_model):
+            entered.set()
+            await release.wait()
+
+        monkeypatch.setattr(main, "attest_model_artifacts", slow_attestation)
+
+        async def scenario():
+            digest = deployment_digest(model)
+            first = await fake_state.start_load(
+                model,
+                deployment_digest=digest,
+                generation_id="generation-1",
+                operation_id="operation-1",
+                deadline_seconds=5.0,
+            )
+            await entered.wait()
+            status = await fake_state.operation_status("operation-1")
+            second = await fake_state.start_load(
+                model,
+                deployment_digest=digest,
+                generation_id="generation-1",
+                operation_id="operation-1",
+                deadline_seconds=5.0,
+            )
+            release.set()
+            await fake_state._operations["operation-1"].task
+            ready = await fake_state.operation_status("operation-1")
+            return first, status, second, ready
+
+        first, status, second, ready = asyncio.run(scenario())
+        assert first.state == "accepted"
+        assert status.state == "loading"
+        assert 0.0 <= status.progress < 1.0
+        assert second.operation_id == first.operation_id
+        assert ready.state == "ready"
+        assert ready.generation_id == "generation-1"
+        assert len(fake_state._operations) == 1
+
+    def test_changed_digest_cannot_return_already_loaded(self, fake_state):
+        model = make_model_dict("generation-conflict")
+        digest = deployment_digest(model)
+
+        async def scenario():
+            first = await fake_state.load(
+                model,
+                deployment_digest=digest,
+                generation_id="generation-old",
+                operation_id="operation-old",
+            )
+            changed = dict(model)
+            changed["vram_gb"] = 2.0
+            with pytest.raises(HTTPException) as caught:
+                await fake_state.load(
+                    changed,
+                    deployment_digest=deployment_digest(changed),
+                    generation_id="generation-new",
+                    operation_id="operation-new",
+                )
+            return first, caught.value
+
+        first, exc = asyncio.run(scenario())
+        assert first.already_loaded is False
+        assert exc.status_code == 409
+        assert "autre" in exc.detail
+
+    def test_deadline_releases_manager_and_keeps_terminal_result(self, fake_state):
+        model_id = "deadline-model"
+        gate = asyncio.Event()
+        FakeServerManager.LOAD_GATES[model_id] = gate
+        model = make_model_dict(model_id)
+
+        async def scenario():
+            digest = deployment_digest(model)
+            accepted = await fake_state.start_load(
+                model,
+                deployment_digest=digest,
+                generation_id="generation-deadline",
+                operation_id="operation-deadline",
+                deadline_seconds=0.05,
+            )
+            await fake_state._operations["operation-deadline"].task
+            status = await fake_state.operation_status("operation-deadline")
+            return accepted, status
+
+        accepted, status = asyncio.run(scenario())
+        assert accepted.state == "accepted"
+        assert status.state == "deadline_exceeded"
+        assert model_id not in fake_state._managers
+        assert len(fake_state._port_pool) == main.settings.max_loaded_models
+
+    def test_terminal_operation_ttl_starts_at_completion(self, fake_state):
+        """Une opération lente reste observable pendant sa rétention terminale."""
+        model = make_model_dict("retained-operation")
+
+        async def scenario():
+            digest = deployment_digest(model)
+            await fake_state.load(
+                model,
+                deployment_digest=digest,
+                generation_id="generation-retained",
+                operation_id="operation-retained",
+            )
+            operation = fake_state._operations["operation-retained"]
+            # La création est ancienne, mais l'opération vient de se terminer.
+            operation.created_at = (
+                time.monotonic() - main._OPERATION_RETENTION_SECONDS - 100.0
+            )
+            operation.completed_at = time.monotonic()
+            retained = await fake_state.operation_status("operation-retained")
+
+            # Elle est supprimée une fois le délai calculé depuis la fin dépassé.
+            operation.completed_at = (
+                time.monotonic() - main._OPERATION_RETENTION_SECONDS - 1.0
+            )
+            with pytest.raises(HTTPException) as caught:
+                await fake_state.operation_status("operation-retained")
+            return retained, caught.value
+
+        retained, exc = asyncio.run(scenario())
+        assert retained.state == "ready"
+        assert exc.status_code == 404
 
 
 class TestModelFilesFailFast:

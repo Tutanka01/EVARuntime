@@ -931,7 +931,7 @@ Le `mmproj_path` est déclaré dans `models.yaml` — voir section 6 pour la str
 
 > **Note :** Avec llama.cpp ≥ mai 2025, le flag `-hf org/repo` télécharge le mmproj
 > automatiquement depuis HuggingFace. Pour les fichiers locaux (notre cas), le champ
-> `mmproj_path` est **toujours obligatoire**.
+> `mmproj_path` et son `mmproj_sha256` sont **toujours obligatoires** pour vision.
 
 ### Budget VRAM — planification
 
@@ -1404,6 +1404,7 @@ models:
   - id: "llava-7b"
     path: "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf"
     mmproj_path: "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf"   # OBLIGATOIRE si vision
+    mmproj_sha256: "<64 caractères hexadécimaux>"                  # OBLIGATOIRE si vision
     description: "LLaVA 1.6 Mistral 7B — vision + texte"
     vram_gb: 6.0
     enabled: false
@@ -1431,15 +1432,14 @@ models:
 > [§15.1](#151-couple-modelsyaml--limites-mémoire-systemd). `minimax-m2.7` est
 > livré `enabled: false` pour cette raison (~236 Go de RAM hôte requis).
 
-> **Modèles vision — règle absolue :** si `vision` est dans `capabilities`, le champ
-> `mmproj_path` doit pointer vers le fichier projecteur CLIP (`.gguf`). Sans lui,
-> llama-server démarre correctement mais retourne **HTTP 500** sur toute requête avec
-> image. La gateway émet un avertissement dans les logs au démarrage si `mmproj_path`
-> est absent pour un modèle vision.
+> **Modèles vision — règle absolue :** si `vision` est dans `capabilities`,
+> `mmproj_path` doit pointer vers le projecteur CLIP et `mmproj_sha256` doit porter
+> son empreinte SHA-256. Le registre refuse toute définition vision incomplète.
 
-### Vérification d'intégrité `sha256` (optionnel — supply-chain)
+### Vérification d'intégrité des artefacts
 
-Champ optionnel par modèle : l'empreinte SHA-256 attendue du fichier GGUF.
+`sha256` reste optionnel pour le GGUF principal. `mmproj_sha256` est obligatoire
+pour un projecteur utilisé par une capability `vision`.
 
 ```yaml
   - id: "llama-3.3-70b-instruct"
@@ -1452,18 +1452,20 @@ Calculer l'empreinte d'un GGUF :
 
 ```bash
 sha256sum /models/Llama-3.3-70B-Instruct-Q4_K_M.gguf
+sha256sum /models/llava-v1.6-mistral-7b-mmproj-f16.gguf
 ```
 
 Comportement :
 
-- **absent** (défaut) → aucune vérification (rétro-compatible) ;
+- **`sha256` absent sur un modèle texte** → aucune vérification du GGUF principal ;
 - **présent** → au démarrage, puis **à chaque transition vers LOADING**
   (gateway, fail-closed juste avant le lancement de llama-server — SEC-ART-001),
   l'attestation du SHA-256 réel du fichier est contrôlée. Un écart bloque le
   chargement du modèle : RuntimeError 503 côté gateway — le détail (chemin,
   empreintes) reste dans les journaux, le message client ne les expose pas —
   et HTTP 422 côté node-agent avant réservation de port. Protection contre un
-  GGUF substitué ou corrompu après le démarrage.
+  artefact substitué ou corrompu après le démarrage. Le même mécanisme couvre
+  obligatoirement le projecteur des modèles vision.
 
 > **Coût :** hacher un GGUF de plusieurs Go prend plusieurs secondes. Le hachage
 > est exécuté hors event loop et un **cache attesté** (identité fichier :
@@ -2365,8 +2367,7 @@ Causes fréquentes :
 | `llama-server: command not found` | llama.cpp non installé | Refaire l'étape 2 |
 | Timeout après 180s | Modèle trop lent à charger | Augmenter `MODEL_LOAD_TIMEOUT_SECONDS=300` dans `env` |
 | `Port already in use` | Deux modèles sur le même port | Vérifier `BASE_LLAMA_PORT` et `MAX_LOADED_MODELS` |
-| HTTP 500 sur requête avec image | `mmproj_path` absent dans `models.yaml` | Ajouter `mmproj_path` pointant vers le fichier projecteur CLIP (`.gguf`) |
-| Warning `mmproj_path absent` dans les logs | Modèle vision sans projecteur | Télécharger le fichier `mmproj` sur HuggingFace et configurer `mmproj_path` |
+| Démarrage refusé pour un modèle vision | `mmproj_path` ou `mmproj_sha256` absent/invalide | Configurer le projecteur CLIP (`.gguf`) et son empreinte SHA-256 |
 | Génération très lente, TTFT de plusieurs dizaines de secondes, **aucune erreur** ; `pgmajfault` grimpe dans `/sys/fs/cgroup/system.slice/llm-gateway.service/memory.stat` ; disque à 100 % | Le working set RAM hôte d'un modèle `cpu_moe: true` dépasse `MemoryHigh`/`MemoryMax` (ou la RAM installée) : le noyau recycle en boucle les pages `mmap` propres des experts FFN → refault NVMe à chaque token | Désactiver le modèle ou l'exécuter sur un hôte plus grand. Vérifier la table de dimensionnement [§15.1](#151-couple-modelsyaml--limites-mémoire-systemd). Ne pas se contenter de relever `MemoryMax` au-delà de la RAM physique |
 | `Failed to set up mount namespacing`, l'unité ne démarre pas | Un chemin de `ReadWritePaths` n'existe pas (ex. `/data/models` non provisionné) | Créer le répertoire, ou le préfixer par `-` dans l'unité (déjà fait pour les répertoires de modèles) |
 
@@ -2606,6 +2607,16 @@ Mettre les agents à jour un par un et attendre leur retour `online` avant de
 continuer maintient la capacité si le cluster possède au moins un autre nœud
 capable d'héberger les modèles. L'orchestrateur ne fait aucune mise à jour SSH
 ou distante implicite.
+
+> **Cohérence orchestrateur ↔ agents obligatoire.** Depuis l'introduction du
+> protocole de chargement identifié, `POST /agent/models/load` transporte des
+> champs requis (`deployment_digest`, `generation_id`, `operation_id`,
+> `deadline_seconds`). Une version d'orchestrateur ou d'agent qui ignore ces
+> champs rejette la requête : un couple de versions mixtes refuse donc tout
+> chargement (et non plus seulement dégrade des garanties d'idempotence).
+> Enchaînez `update.sh --mode cluster` puis `update-agent.sh` sur **tous** les
+> nœuds dans la même fenêtre de maintenance, et validez par un chargement réel
+> (`smoke_test.sh`) avant de considérer le cluster cohérent.
 
 #### Stratégie de venv du node-agent
 
@@ -3235,6 +3246,13 @@ principale/orchestrateur) et, pour le cluster, sur chaque node-agent dans
 consolide les réglages **récemment ajoutés** ; les paramètres historiques
 (`TOTAL_VRAM_GB`, `BASE_LLAMA_PORT`, `MAX_LOADED_MODELS`, `IDLE_TIMEOUT_SECONDS`,
 `CAPACITY_QUEUE_*`, secrets…) sont couverts en [section 5](#5-configuration).
+
+La gateway et le node-agent valident ces valeurs avant d'ouvrir le service.
+Ils refusent notamment les budgets VRAM non finis ou non positifs, un budget net
+négatif, une plage de ports hors de `1..65535` ou en collision, les quotas hors
+des bornes de l'API/SQLite, les timeouts non positifs et les combinaisons de pool
+HTTP ou de polling incompatibles. Une erreur de configuration échoue donc au
+démarrage avec le nom de l'invariant concerné.
 
 ### Intégrité et version llama-server (supply-chain)
 

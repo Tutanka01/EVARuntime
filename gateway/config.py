@@ -6,10 +6,11 @@ jamais dans le code source.
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +23,13 @@ def secret_is_placeholder(secret: str) -> bool:
 # node_agent.validate_runtime_security() et le garde cluster AGENT_SECRET de
 # model_manager._build_manager().
 SECRET_MIN_LENGTH = 32
+
+# Bornes imposées par les interfaces utilisées au runtime. Le plafond SQLite
+# évite qu'un quota par défaut ne soit accepté au démarrage puis refusé lors de
+# la première insertion d'un utilisateur.
+MAX_PORT = 65535
+MAX_DEFAULT_RPM = 1000
+MAX_SQLITE_INTEGER = 2**63 - 1
 
 
 def secret_is_weak(secret: str) -> bool:
@@ -260,6 +268,48 @@ class Settings(BaseSettings):
     # Échecs consécutifs avant de marquer un nœud offline
     cluster_health_failures_to_offline: int = 3
 
+    @field_validator(
+        "llama_server_min_build",
+        "base_llama_port",
+        "max_loaded_models",
+        "total_vram_gb",
+        "vram_overhead_gb",
+        "vram_safety_margin",
+        "idle_timeout_seconds",
+        "model_load_timeout_seconds",
+        "idle_check_interval_seconds",
+        "shutdown_drain_timeout_seconds",
+        "shutdown_drain_poll_seconds",
+        "admin_unload_drain_timeout_seconds",
+        "shutdown_background_flush_seconds",
+        "vram_reconcile_interval_seconds",
+        "vram_reconcile_probe_timeout_seconds",
+        "vram_reconcile_drift_threshold",
+        "capacity_queue_timeout_seconds",
+        "capacity_queue_max_waiters",
+        "capacity_queue_retry_after_seconds",
+        "httpx_max_connections",
+        "httpx_max_keepalive",
+        "httpx_keepalive_expiry",
+        "readiness_cache_ttl_seconds",
+        "usage_retention_days",
+        "migration_backups_to_keep",
+        "gateway_port",
+        "default_rpm_limit",
+        "default_monthly_token_limit",
+        "cluster_request_timeout",
+        "cluster_load_timeout",
+        "cluster_health_interval",
+        "cluster_health_failures_to_offline",
+        mode="before",
+    )
+    @classmethod
+    def reject_boolean_numeric_settings(cls, v: object) -> object:
+        """Refuse `True`/`False` silently coerced to 1/0 par Pydantic."""
+        if isinstance(v, bool):
+            raise ValueError("une valeur booléenne n'est pas un nombre de configuration")
+        return v
+
     @field_validator("models_config_path", "llama_server_bin", mode="before")
     @classmethod
     def coerce_path(cls, v: object) -> Path:
@@ -268,8 +318,36 @@ class Settings(BaseSettings):
     @field_validator("vram_safety_margin")
     @classmethod
     def validate_safety_margin(cls, v: float) -> float:
-        if not 0.0 <= v < 1.0:
+        if not math.isfinite(v) or not 0.0 <= v < 1.0:
             raise ValueError(f"vram_safety_margin doit être dans [0, 1), reçu : {v}")
+        return v
+
+    @field_validator("total_vram_gb")
+    @classmethod
+    def validate_total_vram(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"total_vram_gb doit être un nombre fini > 0, reçu : {v}")
+        return v
+
+    @field_validator("vram_overhead_gb")
+    @classmethod
+    def validate_vram_overhead(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError(f"vram_overhead_gb doit être un nombre fini ≥ 0, reçu : {v}")
+        return v
+
+    @field_validator("llama_server_min_build")
+    @classmethod
+    def validate_min_build(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError(f"llama_server_min_build doit être ≥ 0, reçu : {v}")
+        return v
+
+    @field_validator("base_llama_port", "gateway_port")
+    @classmethod
+    def validate_port(cls, v: int) -> int:
+        if not 1 <= v <= MAX_PORT:
+            raise ValueError(f"port doit être compris entre 1 et {MAX_PORT}, reçu : {v}")
         return v
 
     @field_validator("max_loaded_models")
@@ -277,6 +355,17 @@ class Settings(BaseSettings):
     def validate_max_models(cls, v: int) -> int:
         if v < 1:
             raise ValueError(f"max_loaded_models doit être ≥ 1, reçu : {v}")
+        return v
+
+    @field_validator(
+        "idle_timeout_seconds",
+        "model_load_timeout_seconds",
+        "idle_check_interval_seconds",
+    )
+    @classmethod
+    def validate_lifecycle_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError(f"Timeout lifecycle doit être ≥ 1, reçu : {v}")
         return v
 
     @field_validator("usage_retention_days")
@@ -304,6 +393,25 @@ class Settings(BaseSettings):
             raise ValueError(f"Valeur capacity_queue doit être ≥ 1, reçu : {v}")
         return v
 
+    @field_validator("default_rpm_limit")
+    @classmethod
+    def validate_default_rpm(cls, v: int) -> int:
+        if not 1 <= v <= MAX_DEFAULT_RPM:
+            raise ValueError(
+                f"default_rpm_limit doit être compris entre 1 et {MAX_DEFAULT_RPM}, reçu : {v}"
+            )
+        return v
+
+    @field_validator("default_monthly_token_limit")
+    @classmethod
+    def validate_default_monthly_tokens(cls, v: int) -> int:
+        if not 0 <= v <= MAX_SQLITE_INTEGER:
+            raise ValueError(
+                "default_monthly_token_limit doit être compris entre 0 et "
+                f"{MAX_SQLITE_INTEGER}, reçu : {v}"
+            )
+        return v
+
     @field_validator("cluster_nodes_path", mode="before")
     @classmethod
     def coerce_cluster_path(cls, v: object) -> Path:
@@ -329,7 +437,7 @@ class Settings(BaseSettings):
     @field_validator("cluster_request_timeout", "cluster_load_timeout")
     @classmethod
     def validate_cluster_timeout_positive(cls, v: float) -> float:
-        if v <= 0:
+        if not math.isfinite(v) or v <= 0:
             raise ValueError(f"Timeout cluster doit être > 0, reçu : {v}")
         return v
 
@@ -344,26 +452,99 @@ class Settings(BaseSettings):
     @field_validator("httpx_keepalive_expiry")
     @classmethod
     def validate_httpx_keepalive_expiry(cls, v: float) -> float:
-        if v < 0:
+        if not math.isfinite(v) or v < 0:
             raise ValueError(f"httpx_keepalive_expiry doit être ≥ 0, reçu : {v}")
+        return v
+
+    @field_validator("shutdown_drain_poll_seconds")
+    @classmethod
+    def validate_shutdown_poll_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(f"shutdown_drain_poll_seconds doit être > 0, reçu : {v}")
+        return v
+
+    @field_validator("vram_reconcile_probe_timeout_seconds")
+    @classmethod
+    def validate_vram_probe_timeout_positive(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError(
+                f"vram_reconcile_probe_timeout_seconds doit être > 0, reçu : {v}"
+            )
         return v
 
     @field_validator(
         "shutdown_drain_timeout_seconds",
-        "shutdown_drain_poll_seconds",
         "admin_unload_drain_timeout_seconds",
         "shutdown_background_flush_seconds",
         "vram_reconcile_interval_seconds",
-        "vram_reconcile_probe_timeout_seconds",
         "vram_reconcile_drift_threshold",
         "readiness_cache_ttl_seconds",
     )
     @classmethod
     def validate_robustness_non_negative(cls, v: float) -> float:
         # 0 est autorisé (désactivation). Négatif interdit.
-        if v < 0:
+        if not math.isfinite(v) or v < 0:
             raise ValueError(f"Valeur robustesse doit être ≥ 0, reçu : {v}")
         return v
+
+    @model_validator(mode="after")
+    def validate_cross_field_invariants(self) -> "Settings":
+        """Refuse les combinaisons qui casseraient le runtime après le boot."""
+        errors: list[str] = []
+        last_llama_port = self.base_llama_port + self.max_loaded_models - 1
+
+        if last_llama_port > MAX_PORT:
+            errors.append(
+                "la plage BASE_LLAMA_PORT + MAX_LOADED_MODELS dépasse 65535"
+            )
+        if self.gateway_port in range(self.base_llama_port, last_llama_port + 1):
+            errors.append(
+                "GATEWAY_PORT ne doit pas chevaucher la plage de ports llama-server"
+            )
+
+        budget = self.effective_vram_budget_gb()
+        if self.vram_overhead_gb >= self.total_vram_gb:
+            errors.append("VRAM_OVERHEAD_GB doit être strictement inférieur à TOTAL_VRAM_GB")
+        if not math.isfinite(budget) or budget <= 0:
+            errors.append("le budget VRAM net doit être strictement positif")
+
+        if self.idle_check_interval_seconds > self.idle_timeout_seconds:
+            errors.append(
+                "IDLE_CHECK_INTERVAL_SECONDS doit être inférieur ou égal à "
+                "IDLE_TIMEOUT_SECONDS"
+            )
+        if self.cluster_mode == "cluster":
+            if self.cluster_load_timeout < self.cluster_request_timeout:
+                errors.append(
+                    "CLUSTER_LOAD_TIMEOUT doit être supérieur ou égal à "
+                    "CLUSTER_REQUEST_TIMEOUT"
+                )
+            if self.cluster_load_timeout < self.model_load_timeout_seconds:
+                errors.append(
+                    "CLUSTER_LOAD_TIMEOUT doit couvrir MODEL_LOAD_TIMEOUT_SECONDS"
+                )
+
+        if self.httpx_max_connections > 0 and (
+            self.httpx_max_keepalive > self.httpx_max_connections
+        ):
+            errors.append(
+                "HTTPX_MAX_KEEPALIVE ne doit pas dépasser "
+                "HTTPX_MAX_CONNECTIONS quand ce dernier est limité"
+            )
+
+        for name, timeout in (
+            ("SHUTDOWN_DRAIN_TIMEOUT_SECONDS", self.shutdown_drain_timeout_seconds),
+            ("ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS", self.admin_unload_drain_timeout_seconds),
+        ):
+            if timeout > 0 and self.shutdown_drain_poll_seconds > timeout:
+                errors.append(
+                    "SHUTDOWN_DRAIN_POLL_SECONDS doit être inférieur ou égal à "
+                    f"{name}"
+                )
+
+        if errors:
+            raise ValueError("Configuration incohérente : " + "; ".join(errors))
+        return self
 
     def effective_vram_budget_gb(self) -> float:
         """Budget VRAM net disponible pour les modèles (après overhead et marge)."""

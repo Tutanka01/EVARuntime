@@ -21,7 +21,12 @@ from unittest.mock import AsyncMock
 import pytest
 import telemetry
 
-from cluster.cluster_manager import ClusterManager, ClusterModelHandle
+from cluster.cluster_manager import (
+    ClusterManager,
+    ClusterLoadUncertainError,
+    ClusterModelHandle,
+    ClusterUnloadUncertainError,
+)
 from cluster.node_client import (
     LocalNodeAdapter,
     NodeProtocolError,
@@ -33,6 +38,7 @@ from cluster.node_protocol import (
     NodeHealth,
     NodeStatus,
     UnloadResponse,
+    deployment_digest,
 )
 
 
@@ -114,6 +120,9 @@ class FakeNodeBackend:
         self.load_calls: list[dict] = []
         self.unload_calls: list[str] = []
         self.unload_all_called = False
+        # Réponse explicite de l'agent, utile pour vérifier que l'orchestrateur
+        # ne traite pas `unloaded=False` comme une confirmation.
+        self.unload_response: UnloadResponse | None = None
 
     @property
     def _used(self) -> float:
@@ -167,6 +176,11 @@ class FakeNodeBackend:
         if self.fail_unload:
             # Nœud flaky : l'appel réseau échoue et le modèle reste chargé.
             raise NodeUnreachableError("simulated unload failure")
+        if self.unload_response is not None:
+            response = self.unload_response.model_copy(update={"model_id": model_id})
+            if response.unloaded:
+                self._loaded.pop(model_id, None)
+            return response
         freed = self._loaded.pop(model_id, 0.0)
         return UnloadResponse(model_id=model_id, unloaded=True, freed_vram_gb=freed)
 
@@ -175,6 +189,78 @@ class FakeNodeBackend:
             raise NodeUnreachableError("simulated unload-all failure")
         self.unload_all_called = True
         self._loaded.clear()
+
+
+class OperationNodeBackend(FakeNodeBackend):
+    """Backend CLU-005 : POST accepté, puis résultat observable par operation_id."""
+
+    def __init__(self, node_id: str, *, ready_after: int | None = 2, **kwargs):
+        super().__init__(node_id, **kwargs)
+        self.ready_after = ready_after
+        self.start_requests: list[dict] = []
+        self.operation_status_calls = 0
+        self.operation: dict | None = None
+        self.fail_initial_request = False
+
+    async def start_load_model(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str,
+        generation_id: str,
+        operation_id: str,
+        deadline_seconds: float,
+    ) -> LoadResponse:
+        request = {
+            "model": model_dict,
+            "deployment_digest": deployment_digest,
+            "generation_id": generation_id,
+            "operation_id": operation_id,
+            "deadline_seconds": deadline_seconds,
+        }
+        self.start_requests.append(request)
+        self.operation = request
+        if self.fail_initial_request:
+            raise NodeUnreachableError("réponse POST perdue")
+        return LoadResponse(
+            model_id=model_dict["id"],
+            deployment_digest=deployment_digest,
+            generation_id=generation_id,
+            operation_id=operation_id,
+            state="accepted",
+            progress=0.1,
+            deadline_seconds=deadline_seconds,
+        )
+
+    async def get_operation_status(self, operation_id: str) -> LoadResponse:
+        assert self.operation is not None
+        assert operation_id == self.operation["operation_id"]
+        self.operation_status_calls += 1
+        request = self.operation
+        if self.ready_after is None or self.operation_status_calls < self.ready_after:
+            return LoadResponse(
+                model_id=request["model"]["id"],
+                deployment_digest=request["deployment_digest"],
+                generation_id=request["generation_id"],
+                operation_id=operation_id,
+                state="loading",
+                progress=0.5,
+                deadline_seconds=request["deadline_seconds"],
+            )
+        model_id = request["model"]["id"]
+        self._loaded[model_id] = float(request["model"].get("vram_gb", 0.0))
+        return LoadResponse(
+            model_id=model_id,
+            deployment_digest=request["deployment_digest"],
+            generation_id=request["generation_id"],
+            operation_id=operation_id,
+            state="ready",
+            progress=1.0,
+            llama_url=f"http://{self._nid}:8081",
+            internal_api_key="internal-key",
+            port=8081,
+            deadline_seconds=request["deadline_seconds"],
+        )
 
 
 def make_adapter(backend: FakeNodeBackend) -> LocalNodeAdapter:
@@ -664,11 +750,25 @@ class TestFlakyUnload:
             # Rendre le nœud flaky : unload lèvera, mais health() confirme que
             # m1 est toujours chargé → l'entrée doit être conservée.
             backend.fail_unload = True
-            await mgr.unload_model("m1")
+            with pytest.raises(ClusterUnloadUncertainError) as caught:
+                await mgr.unload_model("m1")
 
             # Non purgé : placement + comptabilité VRAM conservés.
+            assert caught.value.model_id == "m1"
+            assert caught.value.node_id == "a"
             assert mgr._placement.get("m1") == "a"
             assert "m1" in mgr._nodes["a"].loaded
+            assert mgr._nodes["a"].loaded["m1"].unload_uncertain is True
+            assert mgr.status()["models"][0]["state"] == "unload_uncertain"
+
+            # Tant que l'incertitude n'est pas résolue, l'admission est
+            # fail-closed : aucun handle potentiellement périmé et aucun
+            # doublon sur un autre nœud.
+            load_calls = len(backend.load_calls)
+            with pytest.raises(ClusterUnloadUncertainError):
+                await mgr.ensure_model_loaded("m1")
+            assert len(backend.load_calls) == load_calls
+            assert mgr._placement.get("m1") == "a"
         finally:
             backend.fail_unload = False
             await mgr.shutdown()
@@ -693,6 +793,49 @@ class TestFlakyUnload:
             assert "m1" not in mgr._nodes["a"].loaded
         finally:
             backend.fail_unload = False
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_unloaded_false_resync_keeps_state_and_raises_typed_error(self):
+        """Une réponse `unloaded=False` conserve placement et VRAM."""
+        backend = FakeNodeBackend("a", total_vram=48.0)
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        try:
+            await mgr.ensure_model_loaded("m1")
+            before = mgr._nodes["a"].last_health
+            backend.unload_response = UnloadResponse(
+                model_id="m1", unloaded=False, message="encore chargé"
+            )
+
+            with pytest.raises(ClusterUnloadUncertainError):
+                await mgr.unload_model("m1")
+
+            assert mgr._placement.get("m1") == "a"
+            assert "m1" in mgr._nodes["a"].loaded
+            assert mgr._nodes["a"].loaded["m1"].unload_uncertain is True
+            assert mgr._nodes["a"].last_health.used_vram_gb == before.used_vram_gb
+            assert mgr.status()["models"][0]["state"] == "unload_uncertain"
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_unloaded_false_resync_confirms_gone_and_succeeds(self):
+        """`unloaded=False` est accepté si health confirme ensuite l'absence."""
+        backend = FakeNodeBackend("a", total_vram=48.0)
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        try:
+            await mgr.ensure_model_loaded("m1")
+            backend.unload_response = UnloadResponse(model_id="m1", unloaded=False)
+            backend._loaded.pop("m1")
+
+            await mgr.unload_model("m1")
+
+            assert "m1" not in mgr._placement
+            assert "m1" not in mgr._nodes["a"].loaded
+            assert mgr.status()["models"][0]["state"] == "unloaded"
+        finally:
             await mgr.shutdown()
 
 
@@ -785,6 +928,65 @@ class TestLoadFailover:
             backend.release_load.set()
         await load_task
         await mgr.shutdown()
+
+
+class TestLoadOperations:
+    @pytest.mark.anyio
+    async def test_timeout_then_polling_adopts_same_operation_without_failover(self):
+        first = OperationNodeBackend("a", ready_after=2)
+        first.fail_initial_request = True
+        fallback = OperationNodeBackend("b", ready_after=1)
+        mgr = make_manager([first, fallback])
+        await mgr.start_health_monitor()
+        try:
+            handle = await mgr.ensure_model_loaded("m1")
+        finally:
+            await mgr.shutdown()
+
+        assert handle._info.node_id == "a"
+        assert len(first.start_requests) == 1
+        assert first.operation_status_calls >= 2
+        assert fallback.start_requests == []
+        assert mgr._placement["m1"] == "a"
+
+    @pytest.mark.anyio
+    async def test_unknown_operation_blocks_duplicate_failover(self):
+        first = OperationNodeBackend("a", ready_after=None)
+        first.fail_initial_request = True
+        fallback = OperationNodeBackend("b", ready_after=1)
+        model = FakeModelDef("m1", 20.0)
+        mgr = make_manager([first, fallback], models=[model])
+        # Le registre réel impose un timeout minimal de 30 s ; réduire le
+        # budget ici garde le test d'incertitude instantané.
+        mgr._load_deadline_seconds = lambda *_args: 0.05
+        await mgr.start_health_monitor()
+        try:
+            with pytest.raises(ClusterLoadUncertainError):
+                await mgr.ensure_model_loaded("m1")
+            assert fallback.start_requests == []
+            with pytest.raises(ClusterLoadUncertainError):
+                await mgr.ensure_model_loaded("m1")
+            assert fallback.start_requests == []
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_model_specific_deadline_is_sent_to_agent(self):
+        backend = OperationNodeBackend("a", ready_after=1)
+        model = FakeModelDef("m1", 20.0)
+        model.load_timeout_seconds = 37
+        mgr = make_manager([backend], models=[model])
+        await mgr.start_health_monitor()
+        try:
+            await mgr.ensure_model_loaded("m1")
+        finally:
+            await mgr.shutdown()
+
+        request = backend.start_requests[0]
+        assert request["deployment_digest"] == deployment_digest(model.to_dict())
+        assert request["generation_id"]
+        assert request["operation_id"]
+        assert request["deadline_seconds"] == 47.0
 
 
 class TestContinuousReconciliation:

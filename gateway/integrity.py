@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,7 @@ _HASH_CHUNK_SIZE = 1024 * 1024
 # deviennent obsolètes dès que l'identité fichier change ; on évacue alors les
 # plus anciennes pour borner la mémoire sur des hôtes très volatils.
 _CACHE_MAX_ENTRIES = 512
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 @dataclass(frozen=True)
@@ -75,7 +77,7 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _hash_and_restat(path: Path) -> tuple[str, _FileIdentity]:
+def _hash_and_restat(path: Path, artifact_label: str = "GGUF") -> tuple[str, _FileIdentity]:
     """
     Hache le fichier par blocs puis revérifie son identité (thread worker).
 
@@ -87,7 +89,8 @@ def _hash_and_restat(path: Path) -> tuple[str, _FileIdentity]:
     after = _identity(path.stat())
     if after != before:
         raise IntegrityError(
-            f"Fichier GGUF muté pendant le hachage : {path} — attestation refusée."
+            f"Fichier {artifact_label} muté pendant le hachage : {path} — "
+            "attestation refusée."
         )
     return digest, after
 
@@ -126,14 +129,17 @@ async def _run_attestation(
     declared: str,
     model_id: str,
     path: Path,
+    artifact_label: str,
     fut: asyncio.Future,
 ) -> None:
     """Exécute un hachage single-flight indépendamment de ses appelants."""
     try:
-        digest, attested = await asyncio.to_thread(_hash_and_restat, path)
+        digest, attested = await asyncio.to_thread(
+            _hash_and_restat, path, artifact_label
+        )
     except OSError:
         error = IntegrityError(
-            f"[{model_id}] Fichier GGUF introuvable ou illisible pour "
+            f"[{model_id}] Fichier {artifact_label} introuvable ou illisible pour "
             f"vérification d'intégrité : {path}"
         )
         with _guard:
@@ -150,7 +156,7 @@ async def _run_attestation(
         if digest != declared:
             error = IntegrityError(
                 f"[{model_id}] Empreinte SHA-256 non conforme pour {path} : "
-                f"attendu {declared}, obtenu {digest}. Fichier GGUF "
+                f"attendu {declared}, obtenu {digest}. Fichier {artifact_label} "
                 "potentiellement corrompu ou substitué (SEC-ART-001)."
             )
             with _guard:
@@ -169,11 +175,17 @@ async def _run_attestation(
                 _inflight.pop(key, None)
 
 
-async def attest_gguf(model) -> str:
+async def attest_file(
+    path: Path | str,
+    declared: str | None,
+    *,
+    model_id: str = "?",
+    artifact_label: str = "GGUF",
+) -> str:
     """
-    Vérifie fail-closed l'empreinte SHA-256 du GGUF d'un modèle.
+    Vérifie fail-closed l'empreinte SHA-256 d'un artefact.
 
-    No-op (retourne "") si le modèle ne déclare pas d'empreinte. Sinon :
+    No-op (retourne "") si aucune empreinte n'est déclarée. Sinon :
 
     1. stat hors event loop → identité fichier courante ;
     2. cache attesté conforme → attestation déjà valable, aucun I/O lourd ;
@@ -184,12 +196,21 @@ async def attest_gguf(model) -> str:
     Lève IntegrityError si le fichier est absent, illisible, mute pendant le
     hachage ou ne correspond pas à l'empreinte déclarée.
     """
-    declared = getattr(model, "sha256", None)
-    if not declared:
+    if declared is None:
         return ""
-    declared = str(declared).lower()
-    model_id = getattr(model, "id", "?")
-    path = Path(model.path).resolve()
+    if not isinstance(declared, str):
+        raise IntegrityError(
+            f"[{model_id}] empreinte SHA-256 invalide pour le fichier "
+            f"{artifact_label} : une chaîne de 64 caractères hexadécimaux est requise."
+        )
+    declared = declared.strip()
+    if not _SHA256_RE.fullmatch(declared):
+        raise IntegrityError(
+            f"[{model_id}] empreinte SHA-256 invalide pour le fichier "
+            f"{artifact_label} : 64 caractères hexadécimaux attendus."
+        )
+    declared = declared.lower()
+    path = Path(path).resolve()
     key = (str(path), declared)
     loop = asyncio.get_running_loop()
 
@@ -197,7 +218,7 @@ async def attest_gguf(model) -> str:
         current = await asyncio.to_thread(path.stat)
     except OSError as exc:
         raise IntegrityError(
-            f"[{model_id}] Fichier GGUF introuvable ou illisible pour "
+            f"[{model_id}] Fichier {artifact_label} introuvable ou illisible pour "
             f"vérification d'intégrité : {path}"
         ) from exc
     identity = _identity(current)
@@ -223,6 +244,7 @@ async def attest_gguf(model) -> str:
                     declared=declared,
                     model_id=model_id,
                     path=path,
+                    artifact_label=artifact_label,
                     fut=fut,
                 )
             )
@@ -231,3 +253,44 @@ async def attest_gguf(model) -> str:
     # shield : l'annulation d'un appelant ne doit pas annuler le résultat
     # partagé ni le worker de hachage dont dépendent les autres appelants.
     return await asyncio.shield(fut)
+
+
+async def attest_gguf(model) -> str:
+    """Vérifie l'empreinte SHA-256 du GGUF principal d'un modèle."""
+    return await attest_file(
+        model.path,
+        getattr(model, "sha256", None),
+        model_id=getattr(model, "id", "?"),
+        artifact_label="GGUF",
+    )
+
+
+async def attest_model_artifacts(model) -> None:
+    """
+    Atteste tous les artefacts nécessaires au modèle avant son chargement.
+
+    Les modèles texte gardent le comportement historique : un ``sha256`` absent
+    signifie que l'attestation du GGUF est opt-in. Une définition ``vision`` est
+    toutefois structurellement tenue de fournir un projecteur et son empreinte;
+    le parseur du registre l'impose, et cette fonction conserve le garde-fou pour
+    les objets construits hors registre (tests, adaptateurs ou code tiers).
+    """
+    await attest_gguf(model)
+
+    capabilities = getattr(model, "capabilities", ()) or ()
+    if "vision" not in capabilities:
+        return
+
+    mmproj_path = getattr(model, "mmproj_path", None)
+    mmproj_sha256 = getattr(model, "mmproj_sha256", None)
+    if mmproj_path is None or mmproj_sha256 is None:
+        raise IntegrityError(
+            f"[{getattr(model, 'id', '?')}] Projecteur multimodal (mmproj) incomplet : "
+            "chemin et empreinte SHA-256 requis pour la capability vision."
+        )
+    await attest_file(
+        mmproj_path,
+        mmproj_sha256,
+        model_id=getattr(model, "id", "?"),
+        artifact_label="projecteur multimodal (mmproj)",
+    )

@@ -205,6 +205,55 @@ class TestIntegrityFailClosed:
         assert fake_state._allocated_ports == {}
         assert len(fake_state._port_pool) == main.settings.max_loaded_models
 
+
+class TestVisionIntegrity:
+    def test_valid_projector_is_attested_before_node_load(self, fake_state, tmp_path):
+        """Le node-agent cluster charge une vision seulement après attestation du mmproj."""
+        gguf, _model_digest = make_gguf(tmp_path, "vision.gguf", b"poids vision")
+        projector, projector_digest = make_gguf(
+            tmp_path, "vision-mmproj.gguf", b"projecteur conforme"
+        )
+        model_dict = make_model_dict("vision", gguf)
+        model_dict.update(
+            {
+                "capabilities": ["text_generation", "vision"],
+                "mmproj_path": str(projector),
+                "mmproj_sha256": projector_digest,
+            }
+        )
+
+        response = asyncio.run(fake_state.load(model_dict))
+
+        assert response.already_loaded is False
+        assert FakeServerManager.ENSURE_CALLS["vision"] == 1
+        assert fake_state._allocated_ports["vision"] == response.port
+
+    def test_tampered_projector_is_422_before_node_port_reservation(
+        self, fake_state, tmp_path
+    ):
+        """Un mmproj substitué est refusé côté agent avant toute réservation."""
+        gguf, _model_digest = make_gguf(tmp_path, "vision.gguf", b"poids vision")
+        projector, _projector_digest = make_gguf(
+            tmp_path, "vision-mmproj.gguf", b"projecteur conforme"
+        )
+        model_dict = make_model_dict("vision-tampered", gguf)
+        model_dict.update(
+            {
+                "capabilities": ["text_generation", "vision"],
+                "mmproj_path": str(projector),
+                "mmproj_sha256": "0" * 64,
+            }
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(fake_state.load(model_dict))
+
+        assert exc_info.value.status_code == 422
+        assert "projecteur multimodal" in exc_info.value.detail
+        assert FakeServerManager.INSTANCES == []
+        assert fake_state._allocated_ports == {}
+        assert len(fake_state._port_pool) == main.settings.max_loaded_models
+
     def test_missing_gguf_with_declared_sha256_is_422(self, fake_state, tmp_path):
         """
         Fichier absent + empreinte déclarée → 422 fail-closed. (`_validate_model_files`
@@ -266,12 +315,14 @@ class TestAttestedCache:
 
         async def scenario():
             await fake_state.load(model_dict)  # hachage n°1, charge OK
+            await fake_state.unload("mute")
 
             # Contenu remplacé + empreinte déclarée mise à jour → re-hachage, OK.
             content2 = b"contenu v2 - plus long"
             gguf.write_bytes(content2)
             model_dict["sha256"] = hashlib.sha256(content2).hexdigest()
             reloaded = await fake_state.load(model_dict)  # hachage n°2
+            await fake_state.unload("mute")
 
             # Contenu remplacé SANS mettre à jour l'empreinte déclarée → 422.
             gguf.write_bytes(b"contenu v3 - encore plus long, taille differente")
@@ -281,9 +332,7 @@ class TestAttestedCache:
 
         reloaded, exc = asyncio.run(scenario())
 
-        # Le modèle était READY → already_loaded=True ; l'attestation a malgré
-        # tout re-couru (elle précède le court-circuit READY).
-        assert reloaded.already_loaded is True
+        assert reloaded.already_loaded is False
         assert probe.calls == 3, "toute identité fichier nouvelle doit être re-hachée"
         assert exc.status_code == 422
         assert "non conforme" in exc.detail
@@ -314,7 +363,9 @@ class TestSingleFlight:
 
         assert probe.calls == 1, "les chargements concurrents partagent le même hachage"
         assert first.already_loaded is False
-        assert second.already_loaded is True
+        # Les deux appelants observent le même résultat terminal : le processus
+        # n'était pas préexistant au démarrage de cette opération.
+        assert second.already_loaded is False
         assert first.port == second.port
         assert FakeServerManager.ENSURE_CALLS["partage"] == 1
         assert len(fake_state._port_pool) == main.settings.max_loaded_models - 1
@@ -338,6 +389,7 @@ class TestNoSha256Noop:
         async def scenario():
             resp = await fake_state.load(model_dict)
             noop_calls = probe.calls
+            await fake_state.unload("non-signe")
             # Contrôle positif : empreinte déclarée (fausse) → l'attestation hache.
             model_dict["sha256"] = "0" * 64
             with pytest.raises(HTTPException) as exc_info:

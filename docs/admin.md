@@ -816,7 +816,11 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 ```
 
 Un `503` sur ces routes garde son sens habituel : échec technique du
-déchargement (en cluster, un agent qui n'a pas confirmé), pas un conflit.
+déchargement, pas un conflit. En cluster, un agent qui ne confirme pas la
+disparition du modèle fait passer celui-ci à l'état `unload_uncertain` (visible
+dans le statut cluster) : la VRAM reste comptée comme occupée et toute nouvelle
+tentative de chargement est refusée jusqu'à confirmation par heartbeat — jamais
+de copie du modèle sur un autre nœud tant que le doute subsiste.
 
 #### Forcer (`?force=true`)
 
@@ -1118,19 +1122,19 @@ curl -s -X POST "$GW/admin/models" \
 - Le fichier `.gguf` doit exister sur disque
 - Si `ALLOWED_MODEL_DIRS` est configuré, le chemin doit être sous ces répertoires
 - `vram_gb` doit être strictement supérieur à 0 et au plus le budget VRAM net
+- les types sont stricts, les champs inconnus sont refusés et `capabilities` ne
+  peut contenir que `text_generation`, `streaming`, `tool_calls`, `vision`, `embeddings`
+- `sha256`, `load_timeout_seconds`, `speculative`, `mmproj_path` et
+  `mmproj_sha256` sont acceptés et persistés comme dans `models.yaml`
 
-> **Modèles vision (`mmproj_path`) :** l'API `POST /admin/models` n'accepte **pas**
-> le champ `mmproj_path` (il est absent du corps de requête et serait ignoré). Pour
-> enregistrer un modèle vision avec son projecteur multimodal, il faut définir
-> `mmproj_path` directement dans `models.yaml` (édition YAML + reload du registre),
-> et **non** via l'API d'enregistrement.
-
-**Pour un modèle vision**, ajouter l'entrée dans `models.yaml` avec `mmproj_path` :
+**Pour un modèle vision**, fournir le projecteur et son empreinte via l'API ou
+dans `models.yaml` :
 
 ```yaml
   - id: "llava-7b"
     path: "/models/llava-v1.6-mistral-7b-Q4_K_M.gguf"
     mmproj_path: "/models/llava-v1.6-mistral-7b-mmproj-f16.gguf"
+    mmproj_sha256: "<64 caractères hexadécimaux>"
     description: "LLaVA 1.6 Mistral 7B — vision + texte"
     vram_gb: 6.0
     enabled: true
@@ -1148,9 +1152,9 @@ curl -s -X POST "$GW/admin/models" \
       threads_http: 2
 ```
 
-> **Important :** `mmproj_path` est **obligatoire** en pratique si `vision` est dans
-> `capabilities`. Sans lui, llama-server retourne HTTP 500 sur toute requête avec image.
-> La gateway émet un warning dans les logs au démarrage si ce champ est absent.
+> **Important :** `mmproj_path` et `mmproj_sha256` sont structurellement
+> obligatoires si `vision` est dans `capabilities`; une requête d'enregistrement
+> incomplète répond 422 et un registre incomplet empêche le démarrage.
 
 ### Supprimer un modèle du registre
 

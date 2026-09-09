@@ -29,12 +29,18 @@ import logging
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from model_registry import ModelDefinition, ModelRegistry
 from telemetry import MODEL_LOAD_SECONDS
 
 from .node_client import NodeClient, NodeUnreachableError, NodeProtocolError
-from .node_protocol import ModelStateOnNode, NodeHealth
+from .node_protocol import (
+    LoadResponse,
+    ModelStateOnNode,
+    NodeHealth,
+    deployment_digest,
+)
 from .scheduler import (
     EvictionPlan,
     LoadedModelSnapshot,
@@ -46,6 +52,35 @@ from .scheduler import (
 
 log = logging.getLogger(__name__)
 
+
+class ClusterUnloadUncertainError(RuntimeError):
+    """Le nœud n'a pas confirmé la disparition d'un modèle déchargé."""
+
+    def __init__(self, model_id: str, node_id: str) -> None:
+        self.model_id = model_id
+        self.node_id = node_id
+        super().__init__(
+            f"Le déchargement du modèle '{model_id}' sur le nœud '{node_id}' "
+            "n'a pas été confirmé ; placement et VRAM conservés."
+        )
+
+
+class ClusterLoadUncertainError(RuntimeError):
+    """Le résultat d'un chargement distant ne peut pas encore être établi."""
+
+    def __init__(self, model_id: str, node_id: str, operation_id: str) -> None:
+        self.model_id = model_id
+        self.node_id = node_id
+        self.operation_id = operation_id
+        super().__init__(
+            f"Le chargement du modèle '{model_id}' sur le nœud '{node_id}' "
+            f"reste incertain (opération {operation_id}) ; aucun failover "
+            "ne sera tenté avant réconciliation."
+        )
+
+
+class ClusterLoadConflictError(RuntimeError):
+    """Le nœud possède une autre génération de la définition demandée."""
 
 # ── État interne par modèle chargé sur un nœud ───────────────────────────────
 
@@ -64,6 +99,15 @@ class _LoadedInfo:
     # Empêche le fast-path de distribuer un nouveau handle pendant une
     # éviction déjà décidée.
     evicting: bool = False
+    # Le nœud n'a pas confirmé un unload précédent. L'inventaire et la VRAM
+    # restent conservés jusqu'à une confirmation ultérieure.
+    unload_uncertain: bool = False
+    # Identité de la définition réellement servie par ce handle. Les entrées
+    # reconstruites depuis un ancien status peuvent rester vides jusqu'au
+    # refresh idempotent sur le nœud.
+    deployment_digest: str = ""
+    generation_id: str = ""
+    operation_id: str | None = None
 
     def touch(self) -> None:
         self._last_request = time.monotonic()
@@ -77,6 +121,17 @@ class _LoadedInfo:
         return self._active_requests
 
 
+@dataclass
+class _PendingLoad:
+    model_id: str
+    deployment_digest: str
+    generation_id: str
+    operation_id: str
+    vram_gb: float
+    progress: float = 0.0
+    deadline_seconds: float | None = None
+
+
 # ── État interne par nœud ─────────────────────────────────────────────────────
 
 @dataclass
@@ -88,6 +143,9 @@ class _NodeState:
     last_health: NodeHealth | None = None
     # model_id → info sur ce modèle sur CE nœud
     loaded: dict[str, _LoadedInfo] = field(default_factory=dict)
+    # Chargements acceptés mais pas encore READY. Ces réservations restent
+    # visibles au scheduler même si le RPC initial a expiré.
+    pending_loads: dict[str, _PendingLoad] = field(default_factory=dict)
     # Les mutations distantes (load/unload) sont sérialisées par nœud sans
     # immobiliser le lock global du cluster pendant les I/O.
     operation_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -118,15 +176,31 @@ class _NodeState:
             )
             for mid, info in self.loaded.items()
         )
+        pending_snapshots = tuple(
+            LoadedModelSnapshot(
+                id=mid,
+                vram_gb=pending.vram_gb,
+                # Une opération en cours n'est jamais évictable par une autre
+                # demande : son résultat peut encore apparaître côté agent.
+                active_requests=1,
+            )
+            for mid, pending in self.pending_loads.items()
+            if mid not in self.loaded
+        )
+        all_loaded = loaded_snapshots + pending_snapshots
+        pending_vram = sum(p.vram_gb for p in self.pending_loads.values())
+        pending_ports = len(self.pending_loads)
         return NodeSnapshot(
             node_id=self.node_id,
             online=self.online,
             draining=False,
             total_vram_gb=h.total_vram_gb,
             used_vram_gb=h.used_vram_gb,
-            reported_available_vram_gb=h.available_vram_gb,
-            free_ports=h.free_ports,
-            loaded_models=loaded_snapshots,
+            reported_available_vram_gb=max(
+                0.0, h.available_vram_gb - pending_vram
+            ),
+            free_ports=max(0, h.free_ports - pending_ports),
+            loaded_models=all_loaded,
         )
 
 
@@ -228,6 +302,9 @@ class ClusterManager:
         # Un seul chargement/replacement concurrent par modèle. Les locks par
         # nœud protègent, eux, la capacité et l'ordre unload -> load.
         self._model_locks: dict[str, asyncio.Lock] = {}
+        # Identité stable d'une définition tant que le digest du registre ne
+        # change pas. Les retries réutilisent la même génération.
+        self._desired_identities: dict[str, tuple[str, str]] = {}
         self._bootstrap_blocked: set[str] = set()
         self._unloading_all = False
 
@@ -317,6 +394,11 @@ class ClusterManager:
         placement primaire sain sur un autre nœud.
         """
         ready: dict[str, tuple[object, str]] = {}
+        loading = {
+            model.id: model
+            for model in models
+            if model.state in {"loading", "accepted"}
+        }
         for model in models:
             if model.state != "ready":
                 continue
@@ -324,7 +406,7 @@ class ClusterManager:
             if llama_url is not None:
                 ready[model.id] = (model, llama_url)
 
-        for model_id in set(state.loaded) - set(ready):
+        for model_id in set(state.loaded) - set(ready) - set(loading):
             info = state.loaded.pop(model_id)
             if self._placement.get(model_id) == state.node_id:
                 self._placement.pop(model_id, None)
@@ -343,12 +425,21 @@ class ClusterManager:
                     llama_url=llama_url,
                     internal_api_key="",
                     vram_gb=model.vram_gb,
+                    deployment_digest=model.deployment_digest,
+                    generation_id=model.generation_id,
+                    operation_id=model.operation_id,
                 )
                 state.loaded[model_id] = info
             else:
                 # Préserver clé, compteurs actifs et LRU d'une entrée connue.
                 info.llama_url = llama_url
                 info.vram_gb = model.vram_gb
+                if model.deployment_digest:
+                    info.deployment_digest = model.deployment_digest
+                if model.generation_id:
+                    info.generation_id = model.generation_id
+                if model.operation_id:
+                    info.operation_id = model.operation_id
 
             current_node_id = self._placement.get(model_id)
             current_state = self._nodes.get(current_node_id) if current_node_id else None
@@ -358,12 +449,62 @@ class ClusterManager:
                 and model_id in current_state.loaded
                 and model_id not in current_state.suspect_models
             )
-            if (
+            desired = self._registry.get(model_id)
+            desired_matches = bool(
+                desired is not None
+                and (
+                    not model.deployment_digest
+                    or model.deployment_digest
+                    == deployment_digest(desired.to_dict())
+                )
+            )
+            if not desired_matches:
+                state.suspect_models.add(model_id)
+                if self._placement.get(model_id) == state.node_id:
+                    self._placement.pop(model_id, None)
+            elif (
+                model.deployment_digest
+                and model.generation_id
+                and desired is not None
+                and model.deployment_digest == deployment_digest(desired.to_dict())
+            ):
+                # Après redémarrage de l'orchestrateur, la génération live du
+                # nœud fait autorité pour éviter un rechargement redondant.
+                self._desired_identities[model_id] = (
+                    model.deployment_digest,
+                    model.generation_id,
+                )
+                if self._placement.get(model_id) is None:
+                    self._placement[model_id] = state.node_id
+            elif (
                 self._registry.get(model_id) is not None
                 and model_id not in state.suspect_models
                 and not current_is_healthy
             ):
                 self._placement[model_id] = state.node_id
+
+        for model_id, model in loading.items():
+            if not (
+                model.deployment_digest
+                and model.generation_id
+                and model.operation_id
+            ):
+                continue
+            registry_model = self._registry.get(model_id)
+            if registry_model is None:
+                continue
+            if model.deployment_digest != deployment_digest(registry_model.to_dict()):
+                state.suspect_models.add(model_id)
+                continue
+            state.pending_loads[model_id] = _PendingLoad(
+                model_id=model_id,
+                deployment_digest=model.deployment_digest,
+                generation_id=model.generation_id,
+                operation_id=model.operation_id,
+                vram_gb=registry_model.vram_gb,
+                progress=model.progress,
+                deadline_seconds=model.deadline_seconds,
+            )
 
         # Un status READY du control-plane ne prouve pas que le port data-plane
         # est routable (pare-feu, route, bind). Conserver ces suspects ; un
@@ -531,6 +672,16 @@ class ClusterManager:
             )
         return model
 
+    def _identity_for_model_locked(
+        self, model_id: str, digest: str
+    ) -> tuple[str, str]:
+        """Retourne (digest, génération) stable pour une définition donnée."""
+        current = self._desired_identities.get(model_id)
+        if current is None or current[0] != digest:
+            current = (digest, uuid4().hex)
+            self._desired_identities[model_id] = current
+        return current
+
     async def ensure_model_loaded(self, model_id: str) -> ClusterModelHandle:
         """
         Garantit qu'un modèle est chargé quelque part dans le cluster.
@@ -548,15 +699,62 @@ class ClusterManager:
             # Le registre ou le gate bootstrap peuvent changer pendant l'attente
             # du lock. Ce recheck ferme la course rollback/admission.
             model = self._admitted_model(model_id)
+            model_digest = deployment_digest(model.to_dict())
             refresh_state: _NodeState | None = None
+            pending_to_resume: tuple[_NodeState, _PendingLoad] | None = None
             async with self._lock:
+                self._identity_for_model_locked(model.id, model_digest)
                 if self._unloading_all:
                     raise RuntimeError("Déchargement global en cours, réessayer.")
+                pending_node = next(
+                    (
+                        state
+                        for state in self._nodes.values()
+                        if model_id in state.pending_loads
+                    ),
+                    None,
+                )
+                pending = (
+                    pending_node.pending_loads.get(model_id)
+                    if pending_node is not None
+                    else None
+                )
+                if pending is not None:
+                    if pending.deployment_digest != model_digest:
+                        raise ClusterLoadConflictError(
+                            f"Le modèle '{model_id}' possède déjà une opération "
+                            "de chargement pour une autre définition."
+                        )
+                    if pending_node is not None:
+                        pending_to_resume = (pending_node, pending)
                 node_id = self._placement.get(model_id)
                 node_state = self._nodes.get(node_id) if node_id else None
                 info = node_state.loaded.get(model_id) if node_state else None
-                if info and node_state:
-                    if not node_state.online or model_id in node_state.suspect_models:
+                if pending_to_resume is None and info and node_state:
+                    if info.unload_uncertain:
+                        # L'unload précédent n'est toujours pas résolu. Ne pas
+                        # router vers une URL potentiellement disparue et ne
+                        # pas créer une copie sur un autre nœud avant que le
+                        # prochain heartbeat/retry confirme la disparition.
+                        raise ClusterUnloadUncertainError(
+                            model_id, node_state.node_id
+                        )
+                    if (
+                        info.deployment_digest
+                        and info.deployment_digest != model_digest
+                    ):
+                        # L'ancienne génération reste comptée/évictable sur le
+                        # nœud, mais elle ne peut jamais être servie pour la
+                        # nouvelle définition.
+                        if self._placement.get(model_id) == node_state.node_id:
+                            self._placement.pop(model_id, None)
+                        node_state.suspect_models.add(model_id)
+                        node_state.inventory_revision += 1
+                        node_state = None
+                        info = None
+                    if info is None:
+                        pass
+                    elif not node_state.online or model_id in node_state.suspect_models:
                         # On retire uniquement la route primaire : l'inventaire
                         # reste suivi pour compter/faire évincer la VRAM si le
                         # nœud revient avec une copie ancienne ou dupliquée.
@@ -580,6 +778,18 @@ class ClusterManager:
                         self._admitted_model(model_id)
                         return ClusterModelHandle(info, model, self)
 
+            if pending_to_resume is not None:
+                pending_node, pending = pending_to_resume
+                async with pending_node.operation_lock:
+                    response = await self._poll_load_operation(
+                        pending_node, pending, None
+                    )
+                if response.state == "ready":
+                    return await self._finish_pending_load(
+                        pending_node, model, pending, response
+                    )
+                await self._clear_pending_load(pending_node, pending)
+
             if refresh_state is not None:
                 refreshed = await self._refresh_reconciled(refresh_state, model)
                 if refreshed is not None:
@@ -590,13 +800,197 @@ class ClusterManager:
             self._admitted_model(model_id)
             return handle
 
+    @staticmethod
+    def _load_deadline_seconds(model: ModelDefinition, client: NodeClient) -> float:
+        """Calcule le budget négocié à partir de la définition du modèle."""
+        model_timeout = getattr(model, "load_timeout_seconds", None)
+        if model_timeout is None:
+            model_timeout = getattr(client, "_load_timeout", 300.0)
+        # Marge pour la création du process et le dernier health probe, bornée
+        # par le maximum accepté par LoadRequest.
+        return min(86_400.0, max(1.0, float(model_timeout) + 10.0))
+
+    @staticmethod
+    def _validate_load_identity(
+        response: LoadResponse, pending: _PendingLoad
+    ) -> LoadResponse:
+        values = (
+            response.model_id,
+            response.deployment_digest,
+            response.generation_id,
+            response.operation_id,
+        )
+        expected = (
+            pending.model_id,
+            pending.deployment_digest,
+            pending.generation_id,
+            pending.operation_id,
+        )
+        # Les réponses legacy ne passent jamais par le polling moderne. Une
+        # réponse moderne partielle est donc une erreur de protocole, jamais un
+        # succès à rattacher à la génération courante.
+        if values != expected:
+            raise NodeProtocolError(
+                "Réponse load ne correspondant pas à l'opération demandée"
+            )
+        return response
+
+    async def _poll_load_operation(
+        self,
+        node_state: _NodeState,
+        pending: _PendingLoad,
+        initial: LoadResponse | None,
+    ) -> LoadResponse:
+        """Résout le résultat d'un load accepté, sans changer d'opération."""
+        response = initial
+        if response is not None:
+            self._validate_load_identity(response, pending)
+            if response.state in {
+                "ready", "failed", "conflict", "deadline_exceeded"
+            }:
+                return response
+
+        getter = getattr(node_state.client, "get_operation_status", None)
+        if getter is None:
+            raise ClusterLoadUncertainError(
+                pending.model_id, node_state.node_id, pending.operation_id
+            )
+
+        deadline = time.monotonic() + (pending.deadline_seconds or 300.0)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ClusterLoadUncertainError(
+                    pending.model_id, node_state.node_id, pending.operation_id
+                )
+            try:
+                response = await asyncio.wait_for(
+                    getter(pending.operation_id), timeout=min(remaining, 1.0)
+                )
+            except asyncio.CancelledError:
+                # L'opération distante continue ; pending_loads conserve la
+                # réservation et interdit tout failover concurrent.
+                raise
+            except (NodeUnreachableError, asyncio.TimeoutError):
+                # Une réponse tardive/une coupure ne prouve pas l'échec. On
+                # retente le même operation_id jusqu'à son échéancier.
+                await asyncio.sleep(min(0.2, max(0.0, remaining)))
+                continue
+            except NodeProtocolError as exc:
+                raise ClusterLoadUncertainError(
+                    pending.model_id, node_state.node_id, pending.operation_id
+                ) from exc
+
+            self._validate_load_identity(response, pending)
+            async with self._lock:
+                current = node_state.pending_loads.get(pending.model_id)
+                if current is pending:
+                    current.progress = response.progress
+            if response.state in {
+                "ready", "failed", "conflict", "deadline_exceeded"
+            }:
+                return response
+            await asyncio.sleep(min(0.2, max(0.0, remaining)))
+
+    async def _start_load_operation(
+        self,
+        node_state: _NodeState,
+        model: ModelDefinition,
+        pending: _PendingLoad,
+    ) -> LoadResponse:
+        """Démarre le nouveau contrat ou adapte un client local legacy."""
+        model_dict = model.to_dict()
+        if getattr(node_state.client, "supports_load_operations", False):
+            try:
+                initial = await node_state.client.start_load_model(
+                    model_dict,
+                    deployment_digest=pending.deployment_digest,
+                    generation_id=pending.generation_id,
+                    operation_id=pending.operation_id,
+                    deadline_seconds=pending.deadline_seconds or 300.0,
+                )
+            except asyncio.CancelledError:
+                raise
+            except (NodeUnreachableError, NodeProtocolError):
+                # Le POST a peut-être été reçu. Résoudre avec le même identifiant
+                # avant de considérer un échec ou un failover.
+                return await self._poll_load_operation(node_state, pending, None)
+            return await self._poll_load_operation(node_state, pending, initial)
+
+        # Les adaptateurs de tests/backends pré-CLU-005 restent synchrones et
+        # renvoient directement READY ; ils ne peuvent pas avoir de réponse
+        # tardive indépendante du processus appelant.
+        return await node_state.client.load_model(model_dict)
+
+    async def _clear_pending_load(
+        self, node_state: _NodeState, pending: _PendingLoad
+    ) -> None:
+        async with self._lock:
+            if node_state.pending_loads.get(pending.model_id) is pending:
+                node_state.pending_loads.pop(pending.model_id, None)
+                node_state.inventory_revision += 1
+
+    async def _finish_pending_load(
+        self,
+        node_state: _NodeState,
+        model: ModelDefinition,
+        pending: _PendingLoad,
+        response: LoadResponse,
+        *,
+        load_seconds: float | None = None,
+    ) -> ClusterModelHandle:
+        self._validate_load_identity(response, pending)
+        if response.state != "ready" or not response.llama_url:
+            raise NodeProtocolError(
+                f"Réponse READY incomplète pour '{model.id}'"
+            )
+        info = _LoadedInfo(
+            node_id=node_state.node_id,
+            llama_url=response.llama_url,
+            internal_api_key=response.internal_api_key or "",
+            vram_gb=model.vram_gb,
+            last_load_seconds=(
+                None
+                if response.already_loaded
+                else load_seconds
+            ),
+            deployment_digest=pending.deployment_digest,
+            generation_id=pending.generation_id,
+            operation_id=pending.operation_id,
+        )
+        async with self._lock:
+            if self._unloading_all:
+                raise RuntimeError(
+                    "Déchargement global en cours, chargement annulé."
+                )
+            if node_state.pending_loads.get(model.id) is pending:
+                node_state.pending_loads.pop(model.id, None)
+            node_state.loaded[model.id] = info
+            node_state.suspect_models.discard(model.id)
+            self._placement[model.id] = node_state.node_id
+            self._account_load_locked(
+                node_state, model, already_loaded=response.already_loaded
+            )
+            node_state.inventory_revision += 1
+        log.info(
+            "Modèle '%s' chargé sur nœud '%s' (%.1f GB VRAM, url=%s)",
+            model.id,
+            node_state.node_id,
+            model.vram_gb,
+            response.llama_url,
+        )
+        return ClusterModelHandle(info, model, self)
+
     async def _place_and_load(self, model: ModelDefinition) -> ClusterModelHandle:
         """Placement + chargement avec failover, sans I/O sous le lock global."""
         failed_nodes: set[str] = set()
         failures: list[str] = []
         suspect_exclusions: set[str] = set()
+        model_dict = model.to_dict()
+        model_digest = deployment_digest(model_dict)
 
         async with self._lock:
+            _, generation_id = self._identity_for_model_locked(model.id, model_digest)
             suspects = {
                 state.node_id
                 for state in self._nodes.values()
@@ -701,20 +1095,74 @@ class ClusterManager:
                     )
                     continue
 
+                operation_id = uuid4().hex
+                pending = _PendingLoad(
+                    model_id=model.id,
+                    deployment_digest=model_digest,
+                    generation_id=generation_id,
+                    operation_id=operation_id,
+                    vram_gb=model.vram_gb,
+                    deadline_seconds=self._load_deadline_seconds(
+                        model, chosen_state.client
+                    ),
+                )
+                async with self._lock:
+                    chosen_state.pending_loads[model.id] = pending
+                    chosen_state.inventory_revision += 1
+
                 load_started_at = time.monotonic()
                 load_outcome = "success"
+                modern_operation = getattr(
+                    chosen_state.client, "supports_load_operations", False
+                )
                 try:
-                    resp = await chosen_state.client.load_model(model.to_dict())
-                    if resp.model_id != model.id:
+                    resp = await self._start_load_operation(
+                        chosen_state, model, pending
+                    )
+                    if modern_operation:
+                        self._validate_load_identity(resp, pending)
+                    elif resp.model_id != model.id:
                         raise NodeProtocolError(
                             f"réponse load incohérente : demandé '{model.id}', "
                             f"reçu '{resp.model_id}'"
                         )
+                    if not modern_operation:
+                        resp = resp.model_copy(
+                            update={
+                                "deployment_digest": model_digest,
+                                "generation_id": generation_id,
+                                "operation_id": operation_id,
+                                "state": "ready",
+                                "progress": 1.0,
+                                "deadline_seconds": pending.deadline_seconds,
+                            }
+                        )
+                    if resp.state == "conflict":
+                        raise ClusterLoadConflictError(
+                            resp.message
+                            or f"Génération incompatible pour '{model.id}'"
+                        )
+                    if resp.state in {"failed", "deadline_exceeded"}:
+                        raise NodeProtocolError(
+                            resp.message
+                            or f"Échec de chargement de '{model.id}'"
+                        )
                 except asyncio.CancelledError:
                     load_outcome = "cancelled"
+                    # Le pending reste volontairement en place : le nœud peut
+                    # encore terminer le chargement après la déconnexion du
+                    # demandeur.
+                    raise
+                except ClusterLoadUncertainError:
+                    load_outcome = "uncertain"
+                    raise
+                except ClusterLoadConflictError:
+                    load_outcome = "conflict"
+                    await self._clear_pending_load(chosen_state, pending)
                     raise
                 except Exception as exc:
                     load_outcome = "error"
+                    await self._clear_pending_load(chosen_state, pending)
                     async with self._lock:
                         self._record_failure_locked(chosen_state, exc)
                     failed_nodes.add(chosen_state.node_id)
@@ -735,36 +1183,13 @@ class ClusterManager:
                         outcome=load_outcome,
                     )
 
-                info = _LoadedInfo(
-                    node_id=chosen_state.node_id,
-                    llama_url=resp.llama_url,
-                    internal_api_key=resp.internal_api_key,
-                    vram_gb=model.vram_gb,
-                    # already_loaded=True : le modèle tournait déjà sur le nœud,
-                    # la durée réelle du chargement d'origine est inconnue — on
-                    # n'invente pas une valeur à partir du seul aller-retour RPC.
-                    last_load_seconds=(
-                        None if resp.already_loaded else load_seconds
-                    ),
+                return await self._finish_pending_load(
+                    chosen_state,
+                    model,
+                    pending,
+                    resp,
+                    load_seconds=load_seconds,
                 )
-                async with self._lock:
-                    if self._unloading_all:
-                        raise RuntimeError(
-                            "Déchargement global en cours, chargement annulé."
-                        )
-                    chosen_state.loaded[model.id] = info
-                    chosen_state.suspect_models.discard(model.id)
-                    self._placement[model.id] = chosen_state.node_id
-                    self._account_load_locked(
-                        chosen_state, model, already_loaded=resp.already_loaded
-                    )
-                    chosen_state.inventory_revision += 1
-
-                log.info(
-                    "Modèle '%s' chargé sur nœud '%s' (%.1f GB VRAM, url=%s)",
-                    model.id, chosen_state.node_id, model.vram_gb, resp.llama_url,
-                )
-                return ClusterModelHandle(info, model, self)
 
     def _pick_locked(
         self, model: ModelDefinition, excluded_nodes: set[str]
@@ -814,16 +1239,49 @@ class ClusterManager:
         clé interne + l'URL de confiance. En cas d'échec, on invalide l'entrée et
         on retombe sur un placement frais sur un autre nœud.
         """
+        model_digest = deployment_digest(model.to_dict())
+        async with self._lock:
+            _, generation_id = self._identity_for_model_locked(model.id, model_digest)
+        pending = _PendingLoad(
+            model_id=model.id,
+            deployment_digest=model_digest,
+            generation_id=generation_id,
+            operation_id=uuid4().hex,
+            vram_gb=model.vram_gb,
+            deadline_seconds=self._load_deadline_seconds(model, node_state.client),
+        )
         async with node_state.operation_lock:
             try:
-                resp = await node_state.client.load_model(model.to_dict())
-                if resp.model_id != model.id:
+                async with self._lock:
+                    node_state.pending_loads[model.id] = pending
+                    node_state.inventory_revision += 1
+                resp = await self._start_load_operation(node_state, model, pending)
+                if not getattr(node_state.client, "supports_load_operations", False):
+                    if resp.model_id != model.id:
+                        raise NodeProtocolError(
+                            f"réponse load incohérente pour '{model.id}'"
+                        )
+                    resp = resp.model_copy(
+                        update={
+                            "deployment_digest": model_digest,
+                            "generation_id": generation_id,
+                            "operation_id": pending.operation_id,
+                            "state": "ready",
+                            "progress": 1.0,
+                            "deadline_seconds": pending.deadline_seconds,
+                        }
+                    )
+                self._validate_load_identity(resp, pending)
+                if resp.state != "ready":
                     raise NodeProtocolError(
-                        f"réponse load incohérente pour '{model.id}'"
+                        resp.message or f"Rafraîchissement de '{model.id}' incomplet"
                     )
             except asyncio.CancelledError:
                 raise
+            except ClusterLoadUncertainError:
+                raise
             except Exception as exc:
+                await self._clear_pending_load(node_state, pending)
                 async with self._lock:
                     self._record_failure_locked(node_state, exc)
                     if self._placement.get(model.id) == node_state.node_id:
@@ -834,6 +1292,7 @@ class ClusterManager:
                 )
                 return None
 
+            await self._clear_pending_load(node_state, pending)
             async with self._lock:
                 if self._unloading_all:
                     raise RuntimeError(
@@ -843,14 +1302,19 @@ class ClusterManager:
                 if info is None:
                     info = _LoadedInfo(
                         node_id=node_state.node_id,
-                        llama_url=resp.llama_url,
-                        internal_api_key=resp.internal_api_key,
+                        llama_url=resp.llama_url or "",
+                        internal_api_key=resp.internal_api_key or "",
                         vram_gb=model.vram_gb,
                     )
                     node_state.loaded[model.id] = info
                 else:
-                    info.llama_url = resp.llama_url
-                    info.internal_api_key = resp.internal_api_key
+                    info.llama_url = resp.llama_url or info.llama_url
+                    info.internal_api_key = (
+                        resp.internal_api_key or info.internal_api_key
+                    )
+                info.deployment_digest = model_digest
+                info.generation_id = generation_id
+                info.operation_id = pending.operation_id
                 node_state.suspect_models.discard(model.id)
                 self._placement[model.id] = node_state.node_id
                 node_state.inventory_revision += 1
@@ -882,7 +1346,11 @@ class ClusterManager:
                             f"{info.active_requests} requête(s) et ne peut pas être déchargé."
                         )
                     info.evicting = True
-                await self._do_unload(node_state, model_id, info)
+                confirmed = await self._do_unload(node_state, model_id, info)
+                if not confirmed:
+                    raise ClusterUnloadUncertainError(
+                        model_id, node_state.node_id
+                    )
 
     async def _do_unload(
         self,
@@ -925,8 +1393,38 @@ class ClusterManager:
             )
             async with self._lock:
                 expected_info.evicting = False
+                if node_state.loaded.get(model_id) is expected_info:
+                    expected_info.unload_uncertain = True
                 self._record_failure_locked(node_state, exc)
             return False
+
+        if resp.model_id != model_id:
+            log.warning(
+                "Déchargement incohérent sur '%s' : demandé '%s', reçu '%s' — "
+                "placement conservé.",
+                node_state.node_id,
+                model_id,
+                resp.model_id,
+            )
+            async with self._lock:
+                expected_info.evicting = False
+                if node_state.loaded.get(model_id) is expected_info:
+                    expected_info.unload_uncertain = True
+            return False
+
+        if not resp.unloaded:
+            # `unloaded=False` signifie que l'agent n'a pas confirmé la
+            # disparition. Une re-synchronisation peut encore établir que le
+            # modèle est parti entre-temps ; sinon l'état reste conservé.
+            log.warning(
+                "Déchargement de '%s' sur '%s' non confirmé par l'agent "
+                "(re-synchronisation health()).",
+                model_id,
+                node_state.node_id,
+            )
+            return await self._resync_after_failed_unload(
+                node_state, model_id, expected_info
+            )
 
         log.info(
             "Modèle '%s' déchargé de '%s' (libéré %.1f GB VRAM)",
@@ -988,6 +1486,8 @@ class ClusterManager:
             )
             async with self._lock:
                 expected_info.evicting = False
+                if node_state.loaded.get(model_id) is expected_info:
+                    expected_info.unload_uncertain = True
                 self._record_failure_locked(node_state, exc)
             return False
 
@@ -1006,6 +1506,8 @@ class ClusterManager:
                     model_id, node_state.node_id,
                 )
                 return True
+            if node_state.loaded.get(model_id) is expected_info:
+                expected_info.unload_uncertain = True
 
         log.warning(
             "Re-sync '%s' sur '%s' : modèle TOUJOURS chargé côté nœud — "
@@ -1164,6 +1666,15 @@ class ClusterManager:
                         "model_id": mid,
                         "llama_url": info.llama_url,
                         "vram_gb": info.vram_gb,
+                        "state": (
+                            "unload_uncertain"
+                            if info.unload_uncertain
+                            else "ready"
+                        ),
+                        "deployment_digest": info.deployment_digest,
+                        "generation_id": info.generation_id,
+                        "operation_id": info.operation_id,
+                        "progress": 1.0,
                         "idle_seconds": round(info.idle_seconds, 1),
                         "active_requests": info.active_requests,
                     }
@@ -1257,7 +1768,15 @@ class ClusterManager:
                     "enabled": model.enabled,
                     "vram_gb": model.vram_gb,
                     "capabilities": model.capabilities,
-                    "state": "ready",
+                    "state": (
+                        "unload_uncertain"
+                        if info.unload_uncertain
+                        else "ready"
+                    ),
+                    "deployment_digest": info.deployment_digest,
+                    "generation_id": info.generation_id,
+                    "operation_id": info.operation_id,
+                    "progress": 1.0,
                     "path": str(model.path),
                     "node": node_id,
                     "llama_url": info.llama_url,
@@ -1281,6 +1800,10 @@ class ClusterManager:
                     "vram_gb": model.vram_gb,
                     "capabilities": model.capabilities,
                     "state": "unloaded",
+                    "deployment_digest": "",
+                    "generation_id": "",
+                    "operation_id": None,
+                    "progress": 0.0,
                     "path": str(model.path),
                     "node": None,
                     "llama_url": None,

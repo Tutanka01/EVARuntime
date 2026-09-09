@@ -22,8 +22,11 @@ import os
 import secrets
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 
@@ -42,11 +45,12 @@ if str(_GATEWAY_DIR.parent) not in sys.path:
     sys.path.insert(2, str(_GATEWAY_DIR.parent))
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Chargé APRÈS avoir ajusté sys.path
 from config import settings  # → node_agent/config.py
-from integrity import attest_gguf
+from integrity import attest_model_artifacts
 from llama_version import enforce_llama_min_build
 from model_registry import IntegrityError, ModelRegistry
 from server_manager import ModelState, ServerManager, format_url_host
@@ -56,7 +60,9 @@ from cluster.node_protocol import (
     ModelStateOnNode,
     NodeHealth,
     NodeStatus,
+    OperationStatusResponse,
     UnloadResponse,
+    deployment_digest as compute_deployment_digest,
 )
 
 log = logging.getLogger(__name__)
@@ -130,6 +136,30 @@ def _validate_model_files(model) -> None:
 
 # ── État de l'agent ───────────────────────────────────────────────────────────
 
+
+_LOAD_DEADLINE_MAX_SECONDS = 86_400.0
+_OPERATION_RETENTION_SECONDS = 600.0
+_MAX_RETAINED_OPERATIONS = 256
+
+
+@dataclass
+class _LoadOperation:
+    model_id: str
+    model: object
+    deployment_digest: str
+    generation_id: str
+    operation_id: str
+    deadline_seconds: float
+    created_at: float = field(default_factory=time.monotonic)
+    state: str = "accepted"
+    progress: float = 0.0
+    task: asyncio.Task | None = None
+    response: LoadResponse | None = None
+    error_status: int = 500
+    error_detail: str = ""
+    completed_at: float | None = None
+
+
 class _AgentState:
     """
     Singleton local : pool de ServerManager + pool de ports + budget VRAM.
@@ -148,6 +178,13 @@ class _AgentState:
             settings.base_llama_port + settings.max_loaded_models,
         ))
         self._lock = asyncio.Lock()
+        # L'opération est la clé d'idempotence du plan de contrôle. Les tâches
+        # continuent après une déconnexion HTTP et leur résultat terminal est
+        # conservé pour les réponses tardives/polling.
+        self._operations: dict[str, _LoadOperation] = {}
+        self._active_operations: dict[str, str] = {}
+        self._manager_identity: dict[str, tuple[str, str, str]] = {}
+        self._closing = False
 
     def _used_vram(self) -> float:
         return sum(
@@ -163,45 +200,446 @@ class _AgentState:
     def _reported_llama_url(port: int) -> str:
         return f"http://{format_url_host(settings.llama_server_host)}:{port}"
 
-    async def load(self, model_dict: dict) -> LoadResponse:
-        """
-        Charge un modèle depuis sa définition YAML. Idempotent.
+    @staticmethod
+    def _effective_load_deadline(model) -> float:
+        timeout = getattr(model, "load_timeout_seconds", None)
+        if timeout is None:
+            timeout = settings.model_load_timeout_seconds
+        return min(_LOAD_DEADLINE_MAX_SECONDS, max(1.0, float(timeout) + 10.0))
 
-        Lève 422 si l'attestation d'intégrité du GGUF (empreinte `sha256`
-        déclarée) échoue — avant toute réservation de port.
-        """
-        # Valider via le même parseur que la gateway — mêmes règles de sécurité.
+    def _parse_model(self, model_dict: dict):
+        """Parse sans I/O la définition avant d'enregistrer l'opération."""
         try:
             model = self._validator._parse_entry(model_dict)
         except (ValueError, KeyError) as exc:
-            raise HTTPException(status_code=422, detail=f"Définition de modèle invalide : {exc}") from exc
+            raise HTTPException(
+                status_code=422,
+                detail=f"Définition de modèle invalide : {exc}",
+            ) from exc
 
+        return model
+
+    async def _validate_model_runtime(self, model) -> None:
+        """Contrôles coûteux exécutés après l'acceptation HTTP."""
         _validate_model_files(model)
-
-        # Garde-fou supply-chain (opt-in) : si le modèle déclare un `sha256`, on
-        # vérifie l'intégrité du GGUF AVANT de lancer le sous-processus.
-        # CLU-002 : le hachage est exécuté hors event loop (asyncio.to_thread via
-        # integrity.attest_gguf) — /health, unload et heartbeat restent réactifs
-        # pendant l'empreinte d'un GGUF de plusieurs Go — et s'appuie sur un
-        # cache attesté : recharger idempotemment un modèle READY ne re-hache
-        # pas (O(stat)), et le single-flight par clé partage un seul hachage
-        # entre chargements concurrents. La vérification « juste avant le
-        # lancement du sous-processus » reste assurée par
-        # ServerManager._load_and_signal (module partagé) ; l'appel ici garantit
-        # le 422 AVANT toute réservation de port (fail-fast). Inerte si
-        # `sha256` absent.
-        if model.sha256 is not None:
+        if (
+            model.sha256 is not None
+            or "vision" in getattr(model, "capabilities", ())
+        ):
             try:
-                await attest_gguf(model)
+                await attest_model_artifacts(model)
             except IntegrityError as exc:
                 raise HTTPException(
                     status_code=422,
                     detail=f"Vérification d'intégrité échouée : {exc}",
                 ) from exc
 
+    def _snapshot_operation(self, operation: _LoadOperation) -> LoadResponse:
+        if operation.response is not None:
+            return operation.response.model_copy(
+                update={
+                    "state": operation.state,
+                    "progress": operation.progress,
+                    "deadline_seconds": operation.deadline_seconds,
+                }
+            )
+        return LoadResponse(
+            model_id=operation.model_id,
+            deployment_digest=operation.deployment_digest,
+            generation_id=operation.generation_id,
+            operation_id=operation.operation_id,
+            state=operation.state,
+            progress=operation.progress,
+            deadline_seconds=operation.deadline_seconds,
+        )
+
+    def _prune_operations_locked(self) -> None:
+        now = time.monotonic()
+        terminal = {"ready", "failed", "conflict", "deadline_exceeded"}
+        for operation_id, operation in list(self._operations.items()):
+            finished_at = operation.completed_at
+            if (
+                operation.state in terminal
+                and operation_id not in self._active_operations.values()
+                and finished_at is not None
+                and now - finished_at > _OPERATION_RETENTION_SECONDS
+            ):
+                self._operations.pop(operation_id, None)
+        if len(self._operations) <= _MAX_RETAINED_OPERATIONS:
+            return
+        candidates = sorted(
+            (
+                operation
+                for operation in self._operations.values()
+                if operation.state in terminal
+                and operation.operation_id not in self._active_operations.values()
+            ),
+            key=lambda operation: operation.created_at,
+        )
+        for operation in candidates:
+            if len(self._operations) <= _MAX_RETAINED_OPERATIONS:
+                break
+            self._operations.pop(operation.operation_id, None)
+
+    @staticmethod
+    def _identity_conflict(model_id: str) -> HTTPException:
+        return HTTPException(
+            status_code=409,
+            detail=(
+                f"Le modèle '{model_id}' est déjà associé à une autre "
+                "génération ou définition de déploiement."
+            ),
+        )
+
+    async def start_load(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str | None = None,
+        generation_id: str | None = None,
+        operation_id: str | None = None,
+        deadline_seconds: float | None = None,
+    ) -> LoadResponse:
+        """Accepte un chargement et retourne sans attendre llama-server READY."""
+        if self._closing:
+            raise HTTPException(status_code=503, detail="Agent en cours d'arrêt.")
+        # Rejouer la même opération doit être un simple observe, même si la
+        # première requête était encore en train d'attester un GGUF volumineux.
+        if operation_id is not None:
+            async with self._lock:
+                existing = self._operations.get(operation_id)
+                if existing is not None:
+                    if (
+                        model_dict.get("id") != existing.model_id
+                        or (
+                            deployment_digest is not None
+                            and deployment_digest != existing.deployment_digest
+                        )
+                        or (
+                            generation_id is not None
+                            and generation_id != existing.generation_id
+                        )
+                    ):
+                        raise self._identity_conflict(existing.model_id)
+                    return self._snapshot_operation(existing)
+
+        model = self._parse_model(model_dict)
+        computed_digest = compute_deployment_digest(model_dict)
+        if (
+            deployment_digest is not None
+            and deployment_digest != computed_digest
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Digest de déploiement incohérent pour '{model.id}'.",
+            )
+        digest = deployment_digest or computed_digest
         model_lock = self._model_locks.setdefault(model.id, asyncio.Lock())
         async with model_lock:
-            return await self._load_serialized(model)
+            async with self._lock:
+                self._prune_operations_locked()
+                identity = self._manager_identity.get(model.id)
+                active_id = self._active_operations.get(model.id)
+                active = self._operations.get(active_id) if active_id else None
+                if generation_id is None:
+                    if active is not None and active.deployment_digest == digest:
+                        generation_id = active.generation_id
+                    elif identity is not None and identity[0] == digest:
+                        generation_id = identity[1]
+                    else:
+                        generation_id = uuid4().hex
+                if operation_id is None:
+                    operation_id = uuid4().hex
+                deadline = (
+                    self._effective_load_deadline(model)
+                    if deadline_seconds is None
+                    else float(deadline_seconds)
+                )
+                if not 0 < deadline <= _LOAD_DEADLINE_MAX_SECONDS:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="deadline_seconds doit être strictement positive et bornée.",
+                    )
+
+                existing_operation = self._operations.get(operation_id)
+                if existing_operation is not None:
+                    if (
+                        existing_operation.model_id != model.id
+                        or existing_operation.deployment_digest != digest
+                        or existing_operation.generation_id != generation_id
+                    ):
+                        raise self._identity_conflict(model.id)
+                    return self._snapshot_operation(existing_operation)
+
+                if active is not None:
+                    if (
+                        active.deployment_digest != digest
+                        or active.generation_id != generation_id
+                    ):
+                        raise self._identity_conflict(model.id)
+                    return self._snapshot_operation(active)
+
+                manager = self._managers.get(model.id)
+                if manager is not None and manager.state == ModelState.READY:
+                    if identity is not None and identity[0] != digest:
+                        raise self._identity_conflict(model.id)
+                    port = self._allocated_ports[model.id]
+                    response = LoadResponse(
+                        model_id=model.id,
+                        deployment_digest=digest,
+                        generation_id=generation_id,
+                        operation_id=operation_id,
+                        state="ready",
+                        progress=1.0,
+                        llama_url=self._reported_llama_url(port),
+                        internal_api_key=settings.internal_api_key,
+                        port=port,
+                        pid=manager._process.pid if manager._process else None,
+                        already_loaded=True,
+                        deadline_seconds=deadline,
+                    )
+                    self._operations[operation_id] = _LoadOperation(
+                        model_id=model.id,
+                        model=model,
+                        deployment_digest=digest,
+                        generation_id=generation_id,
+                        operation_id=operation_id,
+                        deadline_seconds=deadline,
+                        state="ready",
+                        progress=1.0,
+                        response=response,
+                        completed_at=time.monotonic(),
+                    )
+                    return response
+                if manager is not None and manager.state == ModelState.UNLOADING:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Le modèle '{model.id}' est en cours de déchargement; réessayez.",
+                    )
+
+                operation = _LoadOperation(
+                    model_id=model.id,
+                    model=model,
+                    deployment_digest=digest,
+                    generation_id=generation_id,
+                    operation_id=operation_id,
+                    deadline_seconds=deadline,
+                )
+                self._operations[operation_id] = operation
+                self._active_operations[model.id] = operation_id
+                operation.task = asyncio.create_task(self._run_load(operation))
+                operation.task.add_done_callback(self._consume_operation_task)
+                return self._snapshot_operation(operation)
+
+    async def load(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str | None = None,
+        generation_id: str | None = None,
+        operation_id: str | None = None,
+        deadline_seconds: float | None = None,
+    ) -> LoadResponse:
+        """Compatibilité locale : démarre puis attend l'opération terminale."""
+        response = await self.start_load(
+            model_dict,
+            deployment_digest=deployment_digest,
+            generation_id=generation_id,
+            operation_id=operation_id,
+            deadline_seconds=deadline_seconds,
+        )
+        if response.state in {"ready", "failed", "conflict", "deadline_exceeded"}:
+            operation = self._operations.get(response.operation_id)
+            if operation is not None and operation.state in {
+                "failed", "conflict", "deadline_exceeded"
+            }:
+                raise HTTPException(
+                    status_code=operation.error_status,
+                    detail=operation.error_detail,
+                )
+            return response
+        operation = self._operations.get(response.operation_id)
+        if operation is None or operation.task is None:
+            return response
+        await asyncio.shield(operation.task)
+        async with self._lock:
+            result = self._snapshot_operation(operation)
+        if result.state in {"failed", "conflict", "deadline_exceeded"}:
+            raise HTTPException(
+                status_code=operation.error_status,
+                detail=operation.error_detail,
+            )
+        return result
+
+    @staticmethod
+    def _consume_operation_task(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        # Lire exception() empêche « Task exception was never retrieved » même
+        # lorsqu'aucun client ne repolle l'opération.
+        task.exception()
+
+    async def _cancel_model_load(self, model_id: str) -> None:
+        async with self._lock:
+            manager = self._managers.get(model_id)
+        if manager is None:
+            return
+        try:
+            await manager.unload(reason="deadline d'opération")
+        except Exception as exc:
+            log.warning("Nettoyage du chargement '%s' échoué : %s", model_id, exc)
+        async with self._lock:
+            self._release_manager(model_id, manager)
+
+    async def _run_load(self, operation: _LoadOperation) -> None:
+        load_task: asyncio.Task | None = None
+        deadline_at = operation.created_at + operation.deadline_seconds
+        try:
+            async with self._lock:
+                operation.state = "loading"
+                operation.progress = 0.05
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        f"Le chargement du modèle '{operation.model_id}' "
+                        "a dépassé l'échéance négociée."
+                    ),
+                )
+            try:
+                await asyncio.wait_for(
+                    self._validate_model_runtime(operation.model), timeout=remaining
+                )
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(
+                    status_code=504,
+                    detail=(
+                        f"Le chargement du modèle '{operation.model_id}' "
+                        "a dépassé l'échéance négociée."
+                    ),
+                ) from exc
+            async with self._lock:
+                operation.progress = 0.25
+            model_lock = self._model_locks.setdefault(operation.model_id, asyncio.Lock())
+            async with model_lock:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            f"Le chargement du modèle '{operation.model_id}' "
+                            "a dépassé l'échéance négociée."
+                        ),
+                    )
+                load_task = asyncio.create_task(self._load_serialized(operation.model))
+                try:
+                    response = await asyncio.wait_for(
+                        asyncio.shield(load_task),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError as exc:
+                    load_task.cancel()
+                    await asyncio.gather(load_task, return_exceptions=True)
+                    await self._cancel_model_load(operation.model_id)
+                    raise HTTPException(
+                        status_code=504,
+                        detail=(
+                            f"Le chargement du modèle '{operation.model_id}' "
+                            "a dépassé l'échéance négociée."
+                        ),
+                    ) from exc
+                except asyncio.CancelledError:
+                    load_task.cancel()
+                    await asyncio.gather(load_task, return_exceptions=True)
+                    await self._cancel_model_load(operation.model_id)
+                    raise
+
+            response = response.model_copy(
+                update={
+                    "deployment_digest": operation.deployment_digest,
+                    "generation_id": operation.generation_id,
+                    "operation_id": operation.operation_id,
+                    "state": "ready",
+                    "progress": 1.0,
+                    "deadline_seconds": operation.deadline_seconds,
+                }
+            )
+            async with self._lock:
+                operation.response = response
+                operation.state = "ready"
+                operation.progress = 1.0
+                operation.completed_at = time.monotonic()
+                self._manager_identity[operation.model_id] = (
+                    operation.deployment_digest,
+                    operation.generation_id,
+                    operation.operation_id,
+                )
+                if self._active_operations.get(operation.model_id) == operation.operation_id:
+                    self._active_operations.pop(operation.model_id, None)
+        except asyncio.CancelledError:
+            async with self._lock:
+                if self._active_operations.get(operation.model_id) == operation.operation_id:
+                    self._active_operations.pop(operation.model_id, None)
+                operation.state = "failed"
+                operation.completed_at = time.monotonic()
+                operation.error_status = 503
+                operation.error_detail = "Opération interrompue pendant l'arrêt de l'agent."
+            raise
+        except HTTPException as exc:
+            async with self._lock:
+                operation.state = (
+                    "deadline_exceeded" if exc.status_code == 504 else "failed"
+                )
+                operation.completed_at = time.monotonic()
+                operation.progress = 1.0 if operation.state == "deadline_exceeded" else operation.progress
+                operation.error_status = exc.status_code
+                operation.error_detail = str(exc.detail)
+                operation.response = LoadResponse(
+                    model_id=operation.model_id,
+                    deployment_digest=operation.deployment_digest,
+                    generation_id=operation.generation_id,
+                    operation_id=operation.operation_id,
+                    state=operation.state,
+                    progress=operation.progress,
+                    deadline_seconds=operation.deadline_seconds,
+                    error_code=operation.state,
+                    message=operation.error_detail,
+                )
+                if self._active_operations.get(operation.model_id) == operation.operation_id:
+                    self._active_operations.pop(operation.model_id, None)
+        except Exception as exc:
+            log.error("Échec du chargement de '%s' : %s", operation.model_id, exc)
+            async with self._lock:
+                operation.state = "failed"
+                operation.completed_at = time.monotonic()
+                operation.error_status = 500
+                operation.error_detail = (
+                    f"Échec du chargement du modèle '{operation.model_id}' sur le nœud."
+                )
+                operation.response = LoadResponse(
+                    model_id=operation.model_id,
+                    deployment_digest=operation.deployment_digest,
+                    generation_id=operation.generation_id,
+                    operation_id=operation.operation_id,
+                    state="failed",
+                    progress=operation.progress,
+                    deadline_seconds=operation.deadline_seconds,
+                    error_code="load_failed",
+                    message=operation.error_detail,
+                )
+                if self._active_operations.get(operation.model_id) == operation.operation_id:
+                    self._active_operations.pop(operation.model_id, None)
+
+    async def operation_status(self, operation_id: str) -> OperationStatusResponse:
+        async with self._lock:
+            self._prune_operations_locked()
+            operation = self._operations.get(operation_id)
+            if operation is None:
+                raise HTTPException(status_code=404, detail="Opération inconnue.")
+            return OperationStatusResponse.model_validate(
+                self._snapshot_operation(operation).model_dump()
+            )
 
     async def _load_serialized(self, model) -> LoadResponse:
         """Charge sous verrou par modèle; n'expose jamais une URL encore LOADING."""
@@ -310,6 +748,22 @@ class _AgentState:
                 self._release_manager(model_id, mgr)
             return UnloadResponse(model_id=model_id, unloaded=True, freed_vram_gb=vram)
 
+    async def shutdown(self) -> None:
+        """Arrête les opérations acceptées avant de libérer les processus."""
+        self._closing = True
+        async with self._lock:
+            tasks = [
+                operation.task
+                for operation in self._operations.values()
+                if operation.task is not None
+                and not operation.task.done()
+            ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.unload_all()
+
     async def unload_all(self) -> None:
         for mid in list(self._managers):
             await self.unload(mid)
@@ -327,6 +781,7 @@ class _AgentState:
             self._port_pool.append(port)
             self._port_pool.sort()
         self._managers.pop(model_id, None)
+        self._manager_identity.pop(model_id, None)
 
     def health(self) -> NodeHealth:
         used = self._used_vram()
@@ -402,19 +857,65 @@ class _AgentState:
         return result
 
     def node_status(self) -> NodeStatus:
-        models = [
-            ModelStateOnNode(
-                id=mid,
-                state=mgr.state.value,
-                port=mgr.port,
-                pid=mgr._process.pid if mgr._process else None,
-                uptime_seconds=mgr.uptime_seconds,
-                idle_seconds=round(mgr.idle_seconds, 1) if mgr._last_request_time else None,
-                active_requests=mgr.active_requests,
-                vram_gb=mgr.model.vram_gb,
+        models = []
+        for mid, mgr in self._managers.items():
+            identity = self._manager_identity.get(mid)
+            active_operation_id = self._active_operations.get(mid)
+            operation = (
+                self._operations.get(
+                    identity[2] if identity is not None else active_operation_id
+                )
+                if identity is not None or active_operation_id is not None
+                else None
             )
-            for mid, mgr in self._managers.items()
-        ]
+            models.append(
+                ModelStateOnNode(
+                    id=mid,
+                    state=mgr.state.value,
+                    port=mgr.port,
+                    pid=mgr._process.pid if mgr._process else None,
+                    uptime_seconds=mgr.uptime_seconds,
+                    idle_seconds=round(mgr.idle_seconds, 1) if mgr._last_request_time else None,
+                    active_requests=mgr.active_requests,
+                    vram_gb=mgr.model.vram_gb,
+                    deployment_digest=(
+                        identity[0]
+                        if identity
+                        else operation.deployment_digest if operation else ""
+                    ),
+                    generation_id=(
+                        identity[1]
+                        if identity
+                        else operation.generation_id if operation else ""
+                    ),
+                    operation_id=(
+                        identity[2]
+                        if identity
+                        else operation.operation_id if operation else None
+                    ),
+                    progress=operation.progress if operation else (1.0 if mgr.state == ModelState.READY else 0.0),
+                    deadline_seconds=operation.deadline_seconds if operation else None,
+                )
+            )
+        represented = {model.id for model in models}
+        for operation in self._operations.values():
+            if (
+                operation.model_id in represented
+                or operation.state not in {"accepted", "loading"}
+            ):
+                continue
+            models.append(
+                ModelStateOnNode(
+                    id=operation.model_id,
+                    state="loading",
+                    vram_gb=getattr(operation.model, "vram_gb", 0.0),
+                    deployment_digest=operation.deployment_digest,
+                    generation_id=operation.generation_id,
+                    operation_id=operation.operation_id,
+                    progress=operation.progress,
+                    deadline_seconds=operation.deadline_seconds,
+                )
+            )
         return NodeStatus(node_id=settings.node_id, health=self.health(), models=models)
 
 
@@ -455,7 +956,7 @@ async def lifespan(app: FastAPI):
     yield
     log.info("Arrêt de l'agent — déchargement de tous les modèles…")
     if _state:
-        await _state.unload_all()
+        await _state.shutdown()
     log.info("=== Node Agent arrêt propre ===")
 
 
@@ -522,7 +1023,28 @@ async def load_model(
     _: None = Depends(require_agent_secret),
     state: _AgentState = Depends(_get_state),
 ) -> LoadResponse:
-    return await state.load(body.model)
+    response = await state.start_load(
+        body.model,
+        deployment_digest=body.deployment_digest,
+        generation_id=body.generation_id,
+        operation_id=body.operation_id,
+        deadline_seconds=body.deadline_seconds,
+    )
+    if response.state in {"accepted", "loading"}:
+        return JSONResponse(
+            status_code=202,
+            content=response.model_dump(mode="json"),
+        )
+    return response
+
+
+@app.get("/agent/operations/{operation_id}", response_model=OperationStatusResponse)
+async def operation_status(
+    operation_id: str,
+    _: None = Depends(require_agent_secret),
+    state: _AgentState = Depends(_get_state),
+) -> OperationStatusResponse:
+    return await state.operation_status(operation_id)
 
 
 @app.post("/agent/models/{model_id}/unload", response_model=UnloadResponse)

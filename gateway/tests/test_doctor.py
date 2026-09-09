@@ -980,10 +980,12 @@ def test_invalid_models_yaml_is_blocking_without_cascade(tmp_path, monkeypatch):
 
 def test_gateway_port_inside_the_pool_is_blocking(tmp_path, monkeypatch):
     host = healthy_host(tmp_path, monkeypatch, GATEWAY_PORT=18081)
-    result = check(run(host.options()), "port_pool")
+    result = check(run(host.options()), "config_load")
     assert result.status == "fail"
-    assert result.code == "port_pool_conflicts_with_gateway"
+    assert result.code == "config_load_failed"
     assert result.is_blocking is True
+    assert "GATEWAY_PORT" in result.message
+    assert "chevaucher" in result.message
 
 
 def test_occupied_pool_port_only_warns(tmp_path, monkeypatch):

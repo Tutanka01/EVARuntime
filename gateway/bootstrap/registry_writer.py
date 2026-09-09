@@ -165,6 +165,7 @@ _MUTABLE_BY_ACTIVATION: tuple[str, ...] = ("enabled", "vram_gb")
 # plutôt qu'après. La règle de vérité reste celle du registre : le candidat lui
 # est soumis en entier avant tout renommage.
 _MODEL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 _SHARD_FIRST_RE = re.compile(r"-00001-of-\d{5}\.gguf$")
 
@@ -761,7 +762,7 @@ def build_registry_entry(
     if any(not isinstance(c, str) or not c for c in capabilities):
         raise RegistryWriterError(f"« {entry_id} » : runtime.capabilities contient une valeur non textuelle")
 
-    if runtime.get("requires_mmproj") is True and mmproj is None:
+    if (runtime.get("requires_mmproj") is True or "vision" in capabilities) and mmproj is None:
         raise RegistryWriterError(
             f"« {entry_id} » exige un projecteur multimodal mais n'en déclare aucun : "
             "l'entrée servirait des HTTP 500 sur toute requête avec image"
@@ -823,9 +824,19 @@ def build_registry_entry(
         entry["mmproj_path"] = str(
             _resolve_model_file(models_dir, str(mmproj.get("name", "")), allowed_model_dirs)
         )
+        mmproj_sha = mmproj.get("sha256")
+        if not isinstance(mmproj_sha, str) or not _SHA256_RE.fullmatch(mmproj_sha):
+            raise RegistryWriterError(
+                f"« {entry_id} » : SHA-256 invalide pour le projecteur multimodal"
+            )
+        entry["mmproj_sha256"] = mmproj_sha.lower()
 
     sha = principal.get("sha256")
-    if isinstance(sha, str) and sha:
+    if not isinstance(sha, str) or not _SHA256_RE.fullmatch(sha):
+        raise RegistryWriterError(
+            f"« {entry_id} » : SHA-256 invalide pour le fichier de poids principal"
+        )
+    if sha:
         # Épingle l'artefact servi : `ModelDefinition.verify_integrity()` s'en sert
         # comme garde-fou supply-chain.
         entry["sha256"] = sha.lower()

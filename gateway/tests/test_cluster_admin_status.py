@@ -137,6 +137,22 @@ async def test_admin_status_cluster_reports_hosting_node(
 
 
 @pytest.mark.anyio
+async def test_admin_unload_cluster_returns_503_when_unload_is_uncertain(
+    client, admin_headers, as_cluster,
+):
+    """Une confirmation manquante ne doit jamais être annoncée comme 200."""
+    backend = as_cluster._nodes["node-a"].client._backend
+    backend.fail_unload = True
+
+    response = client.post("/admin/models/m1/unload", headers=admin_headers)
+
+    assert response.status_code == 503, response.text
+    assert "pas été confirmé" in response.json()["detail"]
+    assert as_cluster._placement.get("m1") == "node-a"
+    assert as_cluster.status()["models"][0]["state"] == "unload_uncertain"
+
+
+@pytest.mark.anyio
 async def test_admin_status_cluster_all_nodes_offline_still_200(
     client, admin_headers, as_cluster,
 ):
