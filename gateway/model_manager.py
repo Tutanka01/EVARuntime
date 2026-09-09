@@ -26,6 +26,7 @@ import time
 from collections import deque
 
 from config import settings
+from gpu_inventory import GpuVramMeasurement, probe_gpu_memory
 from model_registry import ModelDefinition, ModelRegistry
 from server_manager import LOAD_CAPACITY_MARKERS, ModelState, ServerManager
 from telemetry import CAPACITY_QUEUE_SECONDS
@@ -37,48 +38,68 @@ log = logging.getLogger(__name__)
 
 async def probe_gpu_used_mb() -> float | None:
     """
-    Interroge nvidia-smi pour la VRAM utilisée totale (Mo), best-effort.
+    Compatibilité : renvoie la VRAM utilisée des devices visibles (Mo).
 
-    Retourne le total des Mo utilisés sur tous les GPU, ou None si nvidia-smi est
-    absent / renvoie une erreur / dépasse le timeout. Attrape TOUT — en test (pas
-    de nvidia-smi) le résultat est None et aucun warning n'est émis.
+    Le chemin de mesure réel conserve les UUID dans ``probe_gpu_memory`` et ne
+    somme que les devices gouvernés par ``CUDA_VISIBLE_DEVICES``. Ce wrapper
+    garde l'ancienne API scalaire pour les intégrations/tests internes ; aucune
+    nouvelle décision de capacité ne doit l'utiliser pour perdre l'identité des
+    devices.
     """
     timeout = settings.vram_reconcile_probe_timeout_seconds
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "nvidia-smi",
-            "--query-gpu=memory.used",
-            "--format=csv,noheader,nounits",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+        measurement = await probe_gpu_memory(
+            timeout,
+            cuda_visible_devices=settings.cuda_visible_devices,
         )
     except Exception:
-        # nvidia-smi introuvable (FileNotFoundError) ou autre — non fatal.
+        # L'API historique promettait un best-effort silencieux. Le nouveau
+        # chemin expose l'état détaillé au réconciliateur, mais ce wrapper doit
+        # continuer à renvoyer ``None`` si un intégrateur remplace la sonde.
         return None
+    if not isinstance(measurement, GpuVramMeasurement):
+        return None
+    return measurement.visible_used_mb
 
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+
+# Les tests et quelques intégrations historiques remplacent le wrapper scalaire
+# ci-dessus. Le réconciliateur détecte ce cas pour ne pas casser leur contrat,
+# tout en empruntant systématiquement la sonde UUID dans le chemin par défaut.
+_DEFAULT_PROBE_GPU_USED_MB = probe_gpu_used_mb
+
+
+async def _probe_gpu_measurement() -> GpuVramMeasurement:
+    """Obtient un résultat UUID, avec un repli de compatibilité injectable."""
+    if probe_gpu_used_mb is not _DEFAULT_PROBE_GPU_USED_MB:
         try:
-            proc.kill()
-        except Exception:
-            pass
-        return None
-    except Exception:
-        return None
-
-    if proc.returncode != 0:
-        return None
-
+            used_mb = await probe_gpu_used_mb()
+        except Exception as exc:
+            return GpuVramMeasurement.unavailable(
+                "legacy_probe_error", settings.cuda_visible_devices,
+                detail=type(exc).__name__,
+            )
+        if used_mb is None:
+            return GpuVramMeasurement.unavailable(
+                "legacy_probe_unavailable", settings.cuda_visible_devices
+            )
+        return GpuVramMeasurement.measured_aggregate(
+            used_mb, settings.cuda_visible_devices
+        )
     try:
-        total_mb = 0.0
-        for line in stdout.decode(errors="replace").splitlines():
-            line = line.strip()
-            if line:
-                total_mb += float(line)
-        return total_mb
-    except Exception:
-        return None
+        measurement = await probe_gpu_memory(
+            settings.vram_reconcile_probe_timeout_seconds,
+            cuda_visible_devices=settings.cuda_visible_devices,
+        )
+    except Exception as exc:
+        return GpuVramMeasurement.unavailable(
+            "gpu_probe_error", settings.cuda_visible_devices,
+            detail=type(exc).__name__,
+        )
+    if not isinstance(measurement, GpuVramMeasurement):
+        return GpuVramMeasurement.unavailable(
+            "gpu_probe_invalid", settings.cuda_visible_devices
+        )
+    return measurement
 
 
 def _port_is_occupied(port: int, host: str = "127.0.0.1", connect_timeout: float = 0.2) -> bool:
@@ -172,11 +193,16 @@ class LocalModelManager:
         # le protocole bootstrap explicite peut rouvrir l'admission.
         self._bootstrap_blocked: set[str] = set()
 
-        # Réconciliation VRAM (nvidia-smi) — additif dans status(). None tant
-        # qu'aucune sonde réussie n'a eu lieu (cas des tests sans GPU).
+        # Réconciliation VRAM (nvidia-smi) — additif dans status(). Le résultat
+        # conserve l'identité UUID de chaque device et l'état explicite d'une
+        # mesure indisponible ; aucun agrégat stale ne doit survivre à un échec
+        # de sonde ultérieur.
         self._vram_reconcile_task: asyncio.Task | None = None
         self._last_gpu_used_mb: float | None = None
         self._last_vram_drift_mb: float | None = None
+        self._last_gpu_measurement = GpuVramMeasurement.not_measured(
+            settings.cuda_visible_devices
+        )
 
     # ── Point d'entrée principal ──────────────────────────────────────────────
 
@@ -300,7 +326,14 @@ class LocalModelManager:
         return total
 
     def _available_vram_gb(self) -> float:
-        return settings.effective_vram_budget_gb() - self._used_vram_gb()
+        configured = settings.effective_vram_budget_gb() - self._used_vram_gb()
+        measurement = self._last_gpu_measurement
+        measured_used_mb = measurement.visible_used_mb
+        measured_total_mb = measurement.visible_total_mb
+        if measured_used_mb is None or measured_total_mb is None:
+            return configured
+        measured_free_gb = max(0.0, measured_total_mb - measured_used_mb) / 1024.0
+        return min(configured, measured_free_gb)
 
     async def _ensure_capacity(
         self,
@@ -755,6 +788,10 @@ class LocalModelManager:
             return
         if self._vram_reconcile_task and not self._vram_reconcile_task.done():
             return
+        # La première admission doit profiter de la capacité physique si elle
+        # est disponible. Une sonde absente/échouée reste non fatale et le
+        # calcul retombe alors sur le budget configuré historique.
+        await self._reconcile_vram_once()
         self._vram_reconcile_task = asyncio.create_task(self._vram_reconcile_loop())
 
     async def _stop_vram_reconcile(self) -> None:
@@ -783,13 +820,18 @@ class LocalModelManager:
 
     async def _reconcile_vram_once(self) -> None:
         """
-        Compare la VRAM réelle (nvidia-smi) à la somme des vram_gb déclarés des
-        modèles READY. Log un warning si dérive significative. Best-effort :
-        si nvidia-smi absent → None → aucune action, aucun champ trompeur.
+        Compare la VRAM réelle visible (nvidia-smi, par UUID) à la somme des
+        vram_gb déclarés des modèles READY. Log un warning si dérive
+        significative. Une sonde indisponible reste visible dans le statut et
+        n'est jamais transformée en zéro ou en ancienne mesure.
         """
-        used_mb = await probe_gpu_used_mb()
-        if used_mb is None:
-            return  # pas de GPU/nvidia-smi (cas des tests) — inerte
+        measurement = await _probe_gpu_measurement()
+        self._last_gpu_measurement = measurement
+        used_mb = measurement.visible_used_mb
+        if measurement.status != "measured" or used_mb is None:
+            self._last_gpu_used_mb = None
+            self._last_vram_drift_mb = None
+            return
 
         declared_gb = self._used_vram_gb()
         declared_mb = declared_gb * 1024.0
@@ -803,9 +845,11 @@ class LocalModelManager:
         # On ignore le bruit sous 512 Mo (contexte CUDA résiduel, mesures).
         if declared_mb > 0 and used_mb > declared_mb * (1.0 + threshold) and drift_mb > 512:
             log.warning(
-                "Dérive VRAM détectée : nvidia-smi rapporte %.0f Mo utilisés, "
+                "Dérive VRAM détectée sur les devices CUDA visibles (%s) : "
+                "nvidia-smi rapporte %.0f Mo utilisés, "
                 "mais le budget déclaré des modèles READY est %.0f Mo (+%.0f Mo, seuil +%.0f%%). "
                 "Vérifiez d'éventuels processus GPU orphelins : pgrep -af llama-server",
+                ",".join(measurement.visible_uuids) or "aucun",
                 used_mb, declared_mb, drift_mb, threshold * 100,
             )
 
@@ -922,9 +966,10 @@ class LocalModelManager:
             "available_gb": round(self._available_vram_gb(), 2),
             "budget_net_gb": round(settings.effective_vram_budget_gb(), 2),
         }
-        # Champs additifs de réconciliation VRAM — présents uniquement si une
-        # sonde nvidia-smi a réussi (None en test / sans GPU → clés absentes,
-        # aucune régression de format).
+        # Le détail par UUID et le statut sont toujours présents : une mesure
+        # absente doit être explicite. Les anciens champs scalaires restent
+        # additifs et ne sont présents que pour une mesure réussie.
+        vram_budget["gpu_measurement"] = self._last_gpu_measurement.to_dict()
         if self._last_gpu_used_mb is not None:
             vram_budget["gpu_used_mb_measured"] = self._last_gpu_used_mb
             vram_budget["vram_drift_mb"] = self._last_vram_drift_mb

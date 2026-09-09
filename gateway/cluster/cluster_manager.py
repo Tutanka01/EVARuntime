@@ -1661,6 +1661,11 @@ class ClusterManager:
                 "used_vram_gb": h.used_vram_gb if h else None,
                 "available_vram_gb": h.available_vram_gb if h else None,
                 "free_ports": h.free_ports if h else None,
+                "gpu_measurement": (
+                    h.gpu_measurement.model_dump(mode="json")
+                    if h and h.gpu_measurement is not None
+                    else None
+                ),
                 "loaded_models": [
                     {
                         "model_id": mid,

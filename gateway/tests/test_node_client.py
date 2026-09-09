@@ -79,6 +79,46 @@ class TestRemoteClientHappyPath:
         assert isinstance(h, NodeHealth)
         assert h.total_vram_gb == 120.0
         assert h.free_ports == 5
+        # Compatibilité ascendante : un ancien agent sans inventaire reste lu.
+        assert h.gpu_measurement is None
+
+    @pytest.mark.anyio
+    async def test_health_parses_optional_gpu_measurement(self):
+        body = {
+            **HEALTH_OK,
+            "gpu_measurement": {
+                "status": "measured",
+                "reason": "ok",
+                "visible_uuids": ["GPU-visible"],
+                "visible_used_mb": 256.0,
+                "visible_total_mb": 2048.0,
+                "devices": [
+                    {
+                        "index": 1,
+                        "uuid": "GPU-visible",
+                        "name": "NVIDIA Test",
+                        "memory_used_mb": 256.0,
+                        "memory_total_mb": 2048.0,
+                        "memory_used_bytes": 268435456,
+                        "memory_total_bytes": 2147483648,
+                        "visible": True,
+                    }
+                ],
+            },
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=body)
+
+        client = make_client(handler)
+        try:
+            health = await client.health()
+        finally:
+            await client.close()
+
+        assert health.gpu_measurement is not None
+        assert health.gpu_measurement.visible_uuids == ["GPU-visible"]
+        assert health.gpu_measurement.devices[0].uuid == "GPU-visible"
 
     @pytest.mark.anyio
     async def test_status_parses_response(self):

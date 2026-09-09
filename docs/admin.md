@@ -479,9 +479,10 @@ mode et valent `null` quand ils ne s'appliquent pas.
 | `overhead_gb` | `VRAM_OVERHEAD_GB` | Réserve agrégée des nœuds (leur overhead **et** leur marge, en GB) |
 | `safety_margin` | `VRAM_SAFETY_MARGIN` (ratio) | `null` — ratio mono-hôte, déjà agrégé en GB dans `overhead_gb` |
 | `used_gb` | VRAM des modèles chargés localement | Somme des `used_vram_gb` des nœuds ONLINE |
-| `available_gb` | Budget net − utilisé | Somme des `available_vram_gb` annoncés par les agents |
+| `available_gb` | Minimum entre budget net restant et VRAM physique libre lorsque la sonde est valide ; sinon budget net − utilisé | Somme des `available_vram_gb` annoncés par les agents, chacun borné de la même façon |
 | `budget_net_gb` | `total_gb − overhead_gb − marge` | `used_gb + available_gb` (budget allouable annoncé) |
 | `nodes` / `nodes_online` | `null` | Nœuds configurés / actuellement ONLINE |
+| `gpu_measurement` | Dernier inventaire local par UUID, avec statut explicite | `null` — voir `nodes[].gpu_measurement` dans `GET /admin/cluster` |
 | `gpu_used_mb_measured`, `vram_drift_mb` | Présents si une sonde `nvidia-smi` a réussi | `null` |
 
 En cluster, `total_gb - overhead_gb == budget_net_gb` exactement ; en local il
@@ -610,6 +611,8 @@ Métriques exposées (noms exacts) :
 | `eva_tokens_total` | counter | `model`, `type` (`prompt`/`completion`) | Tokens par modèle et type (fenêtre 24h) |
 | `eva_request_latency_seconds` | gauge | `quantile` (0.5/0.95/0.99) | Percentiles de latence (fenêtre 7j) |
 | `eva_vram_used_gb` / `eva_vram_total_gb` / `eva_vram_available_gb` | gauge | — | Budget VRAM comptabilisé — mêmes champs que `vram_budget` de `/admin/status` ; en cluster, `eva_vram_total_gb` est la VRAM **physique** des nœuds ONLINE (le budget allouable est `budget_net_gb`) |
+| `eva_gpu_probe_success` | gauge | `node` | Dernier inventaire GPU exploitable (`1`) ou indisponible (`0`) |
+| `eva_gpu_memory_total_bytes` / `eva_gpu_memory_used_bytes` / `eva_gpu_memory_available_bytes` | gauge | `node`, `gpu_uuid` | Mémoire des seuls GPU sélectionnés par `CUDA_VISIBLE_DEVICES` |
 | `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
 | `eva_llama_kv_cache_usage_ratio` | gauge | `model` (+ `node` en cluster) | Occupation du KV cache (0–1) |
 | `eva_llama_tokens_per_second` | gauge | `model` (+ `node`) | Débit de génération |
@@ -617,9 +620,11 @@ Métriques exposées (noms exacts) :
 | `eva_llama_requests_deferred` | gauge | `model` (+ `node`) | Requêtes en attente de slot |
 
 Robuste par construction : chaque source indisponible (aucun modèle, pas de
-`nvidia-smi`, mode cluster, DB vide) est silencieusement omise, jamais de 500.
-Ne divulgue aucun contenu de prompt. Voir [observability.md](observability.md)
-pour un exemple de job de scrape et des règles d'alerte.
+`nvidia-smi`, mode cluster, DB vide) est silencieusement omise, sauf le statut
+de sonde `eva_gpu_probe_success{node}=0` qui distingue explicitement l'absence
+de mesure d'une VRAM réellement nulle ; jamais de 500. Ne divulgue aucun
+contenu de prompt. Voir [observability.md](observability.md) pour un exemple de
+job de scrape et des règles d'alerte.
 
 ### Readiness `/ready` (distincte de `/health`)
 

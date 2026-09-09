@@ -126,6 +126,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 [[ -f "$REPO_ROOT/node_agent/main.py" && \
    -f "$REPO_ROOT/node_agent/requirements.lock" && \
    -f "$REPO_ROOT/gateway/server_manager.py" && \
+   -f "$REPO_ROOT/gateway/gpu_inventory.py" && \
    -f "$REPO_ROOT/gateway/llama_version.py" ]] || \
     die "Dépôt EVARuntime incomplet autour de $SCRIPT_DIR."
 
@@ -247,6 +248,8 @@ VRAM_OVERHEAD_GB=4.0
 VRAM_SAFETY_MARGIN=0.03
 ALLOWED_MODEL_DIRS=/models
 CUDA_VISIBLE_DEVICES=0
+GPU_PROBE_TIMEOUT_SECONDS=5.0
+GPU_PROBE_INTERVAL_SECONDS=60.0
 LOG_DIR=$LOG_DIR
 EOF
     info "Configuration créée; deux secrets forts ont été générés."
@@ -269,6 +272,8 @@ else
     append_env_if_missing LLAMA_SERVER_HOST "$LLAMA_SERVER_HOST"
     append_env_if_missing LLAMA_SERVER_HEALTH_HOST 127.0.0.1
     append_env_if_missing IDLE_CHECK_INTERVAL_SECONDS 10
+    append_env_if_missing GPU_PROBE_TIMEOUT_SECONDS 5.0
+    append_env_if_missing GPU_PROBE_INTERVAL_SECONDS 60.0
     if [[ -n "$PROVIDED_AGENT_SECRET" ]]; then
         if grep -q '^AGENT_SECRET=' "$ENV_FILE"; then
             replace_env_value AGENT_SECRET "$PROVIDED_AGENT_SECRET"

@@ -91,6 +91,11 @@ class AgentSettings(BaseSettings):
 
     # ── GPU ────────────────────────────────────────────────────────────────────
     cuda_visible_devices: str = "0"
+    # La sonde est best-effort : un hôte CPU-only démarre avec un statut
+    # `unavailable`, mais une commande NVIDIA bloquée ne doit pas monopoliser
+    # l'event loop de l'agent.
+    gpu_probe_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    gpu_probe_interval_seconds: float = Field(default=60.0, ge=0, le=3600)
 
     # ── Logging ────────────────────────────────────────────────────────────────
     log_dir: Path = Path("/var/log/llm-gateway-agent")
@@ -104,6 +109,8 @@ class AgentSettings(BaseSettings):
         "total_vram_gb",
         "vram_overhead_gb",
         "vram_safety_margin",
+        "gpu_probe_timeout_seconds",
+        "gpu_probe_interval_seconds",
         "idle_timeout_seconds",
         "model_load_timeout_seconds",
         "idle_check_interval_seconds",

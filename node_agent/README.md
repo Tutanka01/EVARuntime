@@ -70,6 +70,27 @@ sudo /opt/llm-gateway/venv-agent/bin/python \
 `ALLOWED_MODEL_DIRS` accepte `/models`, une liste CSV
 (`/models,/srv/gguf`) ou un tableau JSON. Tous les chemins doivent être absolus.
 
+## Inventaire GPU et VRAM
+
+Le node-agent sonde `nvidia-smi` de façon best-effort. `GET /agent/health`
+conserve les champs VRAM historiques (capacité configurée et estimations des
+modèles) et, quand le protocole le supporte, ajoute `gpu_measurement`. La route
+protégée `GET /agent/gpus` expose le même objet détaillé : chaque carte garde
+son UUID, son index, son modèle et ses valeurs de VRAM, avec `visible_uuids`
+et `cuda_visible_devices` pour le périmètre effectivement utilisé.
+
+Une réponse `status: unavailable` accompagnée de `reason` (par exemple
+`nvidia_smi_unavailable`, `nvidia_smi_timeout` ou `mig_unsupported`) signifie
+qu’aucune mesure exploitable n’est disponible : les agrégats sont `null`, pas
+`0`. L’agent continue néanmoins à démarrer et à servir les environnements
+CPU-only. `GPU_PROBE_TIMEOUT_SECONDS` borne le temps d’attente de la sonde.
+`GPU_PROBE_INTERVAL_SECONDS` règle son rafraîchissement en arrière-plan
+(60 secondes par défaut, `0` pour le désactiver). Les heartbeats ne lancent
+jamais directement `nvidia-smi`. Quand la mesure est valide, la capacité
+d'admission est le minimum entre le budget configuré restant et la VRAM
+physique libre ; une sonde indisponible conserve le comportement configuré.
+Un GPU parent en mode MIG est refusé explicitement avec `mig_unsupported`.
+
 ## Mise à jour sûre
 
 Sur chaque nœud, depuis son checkout EVARuntime :

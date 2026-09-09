@@ -458,6 +458,72 @@ async def metrics_prometheus(
     w.sample("eva_vram_total_gb", budget.get("total_gb"))
     w.sample("eva_vram_available_gb", budget.get("available_gb"))
 
+    # Mesures par UUID. En local elles viennent du budget ; en cluster elles
+    # viennent du snapshot de chaque nœud. Les GPU hors périmètre CUDA restent
+    # diagnosticables dans le JSON admin mais n'entrent jamais dans les séries.
+    gpu_measurements: list[tuple[str, dict]] = []
+    local_measurement = budget.get("gpu_measurement")
+    if isinstance(local_measurement, dict):
+        gpu_measurements.append(("local", local_measurement))
+    cluster_status = getattr(model_manager, "cluster_status", None)
+    if cluster_status is not None:
+        try:
+            for node in cluster_status():
+                measurement = node.get("gpu_measurement")
+                if isinstance(measurement, dict):
+                    node_id = str(node.get("node_id") or "unknown")
+                    if node.get("online") is False:
+                        gpu_measurements.append((node_id, {"status": "unavailable"}))
+                    else:
+                        gpu_measurements.append((node_id, measurement))
+        except Exception:
+            log.exception("Inventaire GPU cluster indisponible")
+
+    if gpu_measurements:
+        w.declare(
+            "eva_gpu_probe_success", "gauge",
+            "Dernière sonde GPU exploitable (1) ou indisponible (0).",
+        )
+        w.declare(
+            "eva_gpu_memory_used_bytes", "gauge",
+            "VRAM utilisée mesurée par GPU visible (octets).",
+        )
+        w.declare(
+            "eva_gpu_memory_total_bytes", "gauge",
+            "VRAM totale mesurée par GPU visible (octets).",
+        )
+        w.declare(
+            "eva_gpu_memory_available_bytes", "gauge",
+            "VRAM disponible mesurée par GPU visible (octets).",
+        )
+        for node_id, measurement in gpu_measurements:
+            measured = measurement.get("status") == "measured"
+            w.sample(
+                "eva_gpu_probe_success",
+                1 if measured else 0,
+                {"node": node_id},
+            )
+            if not measured:
+                continue
+            for device in measurement.get("devices", []):
+                if (
+                    not isinstance(device, dict)
+                    or not device.get("uuid")
+                    or not device.get("visible")
+                ):
+                    continue
+                labels = {"node": node_id, "gpu_uuid": str(device["uuid"])}
+                used = device.get("memory_used_bytes")
+                total = device.get("memory_total_bytes")
+                available = (
+                    max(0, int(total) - int(used))
+                    if isinstance(total, int) and isinstance(used, int)
+                    else None
+                )
+                w.sample("eva_gpu_memory_used_bytes", used, labels)
+                w.sample("eva_gpu_memory_total_bytes", total, labels)
+                w.sample("eva_gpu_memory_available_bytes", available, labels)
+
     models = status.get("models") or []
     ready = sum(1 for m in models if m.get("state") == "ready")
     w.declare("eva_models_loaded", "gauge", "Nombre de modèles à l'état ready.")

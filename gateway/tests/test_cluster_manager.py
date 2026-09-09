@@ -605,6 +605,39 @@ class TestStatus:
         assert cluster[0]["online"] is True
         assert cluster[0]["total_vram_gb"] == 48.0
 
+    @pytest.mark.anyio
+    async def test_cluster_status_exposes_optional_gpu_measurement(self):
+        backend = FakeNodeBackend("a", total_vram=48.0)
+        mgr = make_manager([backend])
+        await mgr.start_health_monitor()
+        mgr._nodes["a"].last_health = NodeHealth(
+            total_vram_gb=48.0,
+            used_vram_gb=1.0,
+            available_vram_gb=43.0,
+            gpu_measurement={
+                "status": "measured",
+                "reason": "ok",
+                "visible_uuids": ["GPU-a"],
+                "devices": [
+                    {
+                        "index": 0,
+                        "uuid": "GPU-a",
+                        "memory_used_mb": 1024.0,
+                        "memory_total_mb": 49152.0,
+                        "visible": True,
+                    }
+                ],
+            },
+        )
+
+        try:
+            measurement = mgr.cluster_status()[0]["gpu_measurement"]
+        finally:
+            await mgr.shutdown()
+
+        assert measurement["status"] == "measured"
+        assert measurement["visible_uuids"] == ["GPU-a"]
+
 
 # ── Réconciliation d'état au démarrage ────────────────────────────────────────
 

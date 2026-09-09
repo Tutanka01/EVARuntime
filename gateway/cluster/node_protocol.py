@@ -110,6 +110,35 @@ class UnloadResponse(BaseModel):
 
 # ── Health & Status ───────────────────────────────────────────────────────────
 
+class GpuVramSample(BaseModel):
+    """Mesure matérielle d'un GPU, identifié durablement par son UUID."""
+
+    index: Optional[int] = None
+    uuid: str = Field(..., min_length=1, max_length=160)
+    name: str = Field(default="", max_length=160)
+    memory_used_mb: Optional[float] = Field(default=None, ge=0)
+    memory_total_mb: Optional[float] = Field(default=None, ge=0)
+    memory_used_bytes: Optional[int] = Field(default=None, ge=0)
+    memory_total_bytes: Optional[int] = Field(default=None, ge=0)
+    driver_version: str = Field(default="", max_length=80)
+    compute_capability: str = Field(default="", max_length=40)
+    mig_mode_current: str = Field(default="", max_length=40)
+    visible: bool = True
+
+
+class GpuVramMeasurement(BaseModel):
+    """Snapshot GPU additif ; ``unavailable`` n'est jamais assimilé à zéro."""
+
+    status: Literal["measured", "unavailable"]
+    reason: str = Field(..., min_length=1, max_length=80)
+    measured_at: Optional[str] = Field(default=None, max_length=64)
+    cuda_visible_devices: Optional[str] = Field(default=None, max_length=4096)
+    visible_uuids: list[str] = Field(default_factory=list, max_length=128)
+    devices: list[GpuVramSample] = Field(default_factory=list, max_length=128)
+    visible_used_mb: Optional[float] = Field(default=None, ge=0)
+    visible_total_mb: Optional[float] = Field(default=None, ge=0)
+    detail: Optional[str] = Field(default=None, max_length=256)
+
 class NodeHealth(BaseModel):
     """
     GET /agent/health — réponse compacte utilisée par le heartbeat.
@@ -124,6 +153,10 @@ class NodeHealth(BaseModel):
     # Capacité du pool de ports résiduel (utile au scheduler pour rejeter
     # un nœud saturé même s'il a de la VRAM)
     free_ports: int = 0
+    # Additif et optionnel pour permettre une mise à jour progressive des
+    # orchestrateurs et agents. Les trois agrégats historiques ci-dessus
+    # restent disponibles, mais ne sont jamais présentés comme « mesurés ».
+    gpu_measurement: Optional[GpuVramMeasurement] = None
 
 
 class ModelStateOnNode(BaseModel):
