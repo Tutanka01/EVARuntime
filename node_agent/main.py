@@ -50,6 +50,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 # Chargé APRÈS avoir ajusté sys.path
 from config import settings  # → node_agent/config.py
+from gpu_inventory import GpuVramMeasurement, probe_gpu_memory
 from integrity import attest_model_artifacts
 from llama_version import enforce_llama_min_build
 from model_registry import IntegrityError, ModelRegistry
@@ -140,6 +141,7 @@ def _validate_model_files(model) -> None:
 _LOAD_DEADLINE_MAX_SECONDS = 86_400.0
 _OPERATION_RETENTION_SECONDS = 600.0
 _MAX_RETAINED_OPERATIONS = 256
+_GPU_MEASUREMENT_CACHE_SECONDS = 5.0
 
 
 @dataclass
@@ -185,6 +187,89 @@ class _AgentState:
         self._active_operations: dict[str, str] = {}
         self._manager_identity: dict[str, tuple[str, str, str]] = {}
         self._closing = False
+        # La mesure matérielle est indépendante des estimations de modèles
+        # utilisées pour l'admission. Elle reste disponible dans /health même
+        # lorsque nvidia-smi est absent : l'état `unavailable` est publié au
+        # lieu de convertir cette absence en zéro.
+        self._gpu_measurement = GpuVramMeasurement.not_measured(
+            settings.cuda_visible_devices
+        )
+        self._gpu_measurement_refreshed_at = 0.0
+        self._gpu_measurement_lock = asyncio.Lock()
+        self._gpu_measurement_task: asyncio.Task | None = None
+
+    def start_gpu_measurement_monitor(self) -> None:
+        """Lance le rafraîchissement hors du chemin synchrone de ``/health``."""
+        if settings.gpu_probe_interval_seconds <= 0:
+            return
+        if self._gpu_measurement_task is None or self._gpu_measurement_task.done():
+            self._gpu_measurement_task = asyncio.create_task(
+                self._gpu_measurement_loop()
+            )
+
+    async def _gpu_measurement_loop(self) -> None:
+        """Actualise périodiquement le snapshot consommé par les heartbeats."""
+        try:
+            while not self._closing:
+                try:
+                    await self.refresh_gpu_measurement(force=True)
+                except Exception:
+                    # Un backend de sonde remplacé ou défectueux ne doit pas
+                    # tuer définitivement le monitor : réessayer au prochain
+                    # intervalle en gardant un état explicitement indisponible.
+                    log.exception("Mesure GPU périodique indisponible")
+                await asyncio.sleep(settings.gpu_probe_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
+    async def refresh_gpu_measurement(
+        self, *, force: bool = False
+    ) -> GpuVramMeasurement:
+        """Actualise la mesure UUID avec un cache court et sans bloquer l'agent."""
+        configured_scope = settings.cuda_visible_devices
+        now = time.monotonic()
+        if (
+            not force
+            and self._gpu_measurement.cuda_visible_devices == configured_scope
+            and now - self._gpu_measurement_refreshed_at
+            < _GPU_MEASUREMENT_CACHE_SECONDS
+        ):
+            return self._gpu_measurement
+
+        async with self._gpu_measurement_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._gpu_measurement.cuda_visible_devices == configured_scope
+                and now - self._gpu_measurement_refreshed_at
+                < _GPU_MEASUREMENT_CACHE_SECONDS
+            ):
+                return self._gpu_measurement
+            try:
+                measurement = await probe_gpu_memory(
+                    settings.gpu_probe_timeout_seconds,
+                    cuda_visible_devices=configured_scope,
+                )
+            except Exception as exc:  # pragma: no cover - sonde OS spécifique
+                # Le node-agent doit continuer à servir le contrôle même si un
+                # backend de sonde inattendu lève une exception.
+                log.warning("Mesure GPU indisponible : %s", type(exc).__name__)
+                measurement = GpuVramMeasurement.unavailable(
+                    "nvidia_smi_probe_error",
+                    configured_scope,
+                    detail=type(exc).__name__,
+                )
+            if not isinstance(measurement, GpuVramMeasurement):
+                measurement = GpuVramMeasurement.unavailable(
+                    "gpu_probe_invalid", configured_scope
+                )
+            self._gpu_measurement = measurement
+            self._gpu_measurement_refreshed_at = time.monotonic()
+            return measurement
+
+    def gpu_measurement(self) -> GpuVramMeasurement:
+        """Retourne le dernier snapshot sans I/O (utile pour /status)."""
+        return self._gpu_measurement
 
     def _used_vram(self) -> float:
         return sum(
@@ -194,7 +279,13 @@ class _AgentState:
         )
 
     def _available_vram(self) -> float:
-        return settings.effective_vram_budget_gb() - self._used_vram()
+        configured = settings.effective_vram_budget_gb() - self._used_vram()
+        measured_used_mb = self._gpu_measurement.visible_used_mb
+        measured_total_mb = self._gpu_measurement.visible_total_mb
+        if measured_used_mb is None or measured_total_mb is None:
+            return configured
+        measured_free_gb = max(0.0, measured_total_mb - measured_used_mb) / 1024.0
+        return min(configured, measured_free_gb)
 
     @staticmethod
     def _reported_llama_url(port: int) -> str:
@@ -751,6 +842,11 @@ class _AgentState:
     async def shutdown(self) -> None:
         """Arrête les opérations acceptées avant de libérer les processus."""
         self._closing = True
+        if self._gpu_measurement_task is not None:
+            self._gpu_measurement_task.cancel()
+            await asyncio.gather(
+                self._gpu_measurement_task, return_exceptions=True
+            )
         async with self._lock:
             tasks = [
                 operation.task
@@ -790,9 +886,13 @@ class _AgentState:
             agent_version="1.0.0",
             total_vram_gb=settings.total_vram_gb,
             used_vram_gb=round(used, 2),
-            available_vram_gb=round(max(0.0, settings.effective_vram_budget_gb() - used), 2),
+            available_vram_gb=round(max(0.0, self._available_vram()), 2),
             loaded_model_ids=list(self._managers),
             free_ports=len(self._port_pool),
+            # Additif : les versions du protocole qui ne connaissent pas
+            # encore `gpu_measurement` ignorent ce champ, tandis que les
+            # versions mises à jour reçoivent l'inventaire UUID complet.
+            gpu_measurement=self._gpu_measurement.to_dict(),
         )
 
     @staticmethod
@@ -953,6 +1053,11 @@ async def lifespan(app: FastAPI):
         )
 
     _state = _AgentState()
+    # Initialiser le snapshot avant d'accepter un placement. L'absence de
+    # nvidia-smi est immédiate et non fatale ; un pilote bloqué reste borné par
+    # GPU_PROBE_TIMEOUT_SECONDS.
+    await _state.refresh_gpu_measurement(force=True)
+    _state.start_gpu_measurement_monitor()
     yield
     log.info("Arrêt de l'agent — déchargement de tous les modèles…")
     if _state:
@@ -1001,6 +1106,22 @@ async def status(
     state: _AgentState = Depends(_get_state),
 ) -> NodeStatus:
     return state.node_status()
+
+
+@app.get("/agent/gpus")
+async def gpu_inventory(
+    _: None = Depends(require_agent_secret),
+    state: _AgentState = Depends(_get_state),
+) -> dict:
+    """Expose l'inventaire GPU UUID et le périmètre de la dernière mesure.
+
+    Cette route reste séparée du heartbeat compact : elle permet à un
+    orchestrateur de récupérer les détails par GPU sans rendre le protocole
+    historique obligatoire pour les agents CPU-only ou les mises à jour
+    progressives.
+    """
+    measurement = await state.refresh_gpu_measurement()
+    return measurement.to_dict()
 
 
 @app.get("/agent/metrics")

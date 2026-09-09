@@ -1,7 +1,7 @@
 # EVARuntime — feuille de route et plan de référence
 
 > Document public de direction et de priorisation.
-> Dernière mise à jour : 3 septembre 2026.
+> Dernière mise à jour : 9 septembre 2026.
 >
 > Ce document rassemble la vision produit, les résultats de l’audit du dépôt,
 > les limites connues, l’architecture cible et le plan de travail. Il ne
@@ -115,13 +115,13 @@ polling `GET /agent/operations/{id}`, unload non confirmé exposé 503 avec éta
 | `CLU-003` ✅ | P0 | L’idempotence du node agent dépend seulement de `model.id` | Une nouvelle définition peut continuer à servir une ancienne génération | `deployment_digest` et `generation_id` obligatoires |
 | `CLU-005` ✅ | P0 | Le timeout cluster fixe est inférieur aux chargements de certains modèles | L’orchestrateur abandonne alors que l’agent continue, créant des doublons | `operation_id`, progression et deadline négociée |
 | `CFG-001` ✅ | P0 | VRAM, ports, quotas et timeouts peuvent prendre des valeurs incohérentes | Échecs tardifs et interprétation accidentelle d’un quota négatif | Validation de bornes et invariants croisés au démarrage |
-| `SEC-006` | P0 | Le data-plane cluster reconstruit des URLs HTTP | Prompts et secret interne peuvent transiter en clair | mTLS/WireGuard ou profil production fail-closed |
+| `SEC-006` | P0 production | Le data-plane cluster reconstruit des URLs HTTP | Sur un réseau partagé ou non maîtrisé, prompts et secret interne peuvent transiter en clair | En développement, HTTP autorisé uniquement sur un LAN privé avec firewall limité à l'orchestrateur et avertissement explicite ; en production, profil fail-closed sans data-plane chiffré (proxy HTTPS, mTLS ou WireGuard) |
 | `TST-004` | P0 | La recette sur vrai runtime/GPU/GGUF/nginx n’est pas archivée | Le chemin installé jusqu’au premier token reste une hypothèse | Rapport reproductible signé par environnement |
 | `TST-005` | P0 | Les tests cluster utilisent surtout des fakes in-process | Les sockets, délais, streams, pannes et processus réels ne sont pas prouvés | E2E avec vrais agents/processus et injections de panne |
 | `REG-001` ✅ | P1 | Le parseur YAML accepte des types invalides ou trop permissifs | Le contrat YAML diffère du contrat admin | Schémas stricts et erreurs identiques |
 | `REG-002` ✅ | P1 | `vision` n’exige pas structurellement un projector | Une configuration apparemment valide échoue à la première image | `vision` exige `mmproj` et son intégrité |
 | `PORT-001` | P1 | Les ports occupés sont détectés mais restent réallouables | Échecs répétés et réutilisation d’un port orphelin | États `available/owned/quarantined` |
-| `GPU-002` | P1 | La sonde VRAM agrège tous les GPU de l’hôte | Une charge hors `CUDA_VISIBLE_DEVICES` fausse la capacité EVA | Mesure par UUID et périmètre configuré |
+| `GPU-002` ✅ | P1 | La sonde VRAM agrège tous les GPU de l’hôte | Une charge hors `CUDA_VISIBLE_DEVICES` fausse la capacité EVA | Mesure par UUID et périmètre configuré |
 | `OBS-001` | P1 | La latence persistée exclut queue et cold start | Les SLO et rapports sont optimistes | `total_ms`, `queue_ms`, `load_ms`, `backend_ms` séparés |
 | `OBS-002` | P1 | `usage_log` ne compte pas tous les résultats terminaux | Le taux d’erreur paraît meilleur qu’il ne l’est | Un outcome par requête, indépendant de la facturation |
 | `QUOTA-001` | P1 | Le quota est lu puis crédité après coup | Des requêtes concurrentes peuvent dépasser la limite | Réservation atomique, remboursement/ajustement documenté |
@@ -129,6 +129,22 @@ polling `GET /agent/operations/{id}`, unload non confirmé exposé 503 avec éta
 | `API-002` | P1 | `stream_options` du client est écrasé | Incompatibilité avec certains SDK OpenAI | Fusion contrôlée et tests de compatibilité |
 | `PERF-002` | P1 | Des métriques `*_total` sont des fenêtres glissantes | Elles peuvent diminuer, ce qui viole Prometheus | Counters monotones ou renommage en gauges 24 h |
 | `PERF-008` | P2 | Le nettoyage du rate limiter n’est pas planifié | Accumulation possible d’identités inactives | Tâche périodique bornée et testée |
+
+`SEC-006` ne doit pas compliquer ni bloquer l'installation locale, qui reste le
+mode par défaut. Un cluster de développement peut fonctionner sur un LAN privé
+si les ports du data-plane sont filtrés pour n'accepter que l'orchestrateur et
+si l'absence de chiffrement est signalée clairement. L'exigence fail-closed
+s'applique au profil de production, avant toute qualification du cluster comme
+apte à transporter des prompts sensibles.
+
+Première tranche de l'épic #40 : `GPU-002` est corrigé. La sonde partagée
+conserve l'UUID de chaque GPU, respecte l'ordre et le périmètre de
+`CUDA_VISIBLE_DEVICES`, publie un état explicite lorsque la mesure est
+indisponible et refuse d'assimiler une instance MIG à son GPU parent. Le
+gateway local et les node-agents utilisent le même contrat ; les métriques
+protégées restent bornées aux GPU visibles et la VRAM physique libre borne
+l'admission lorsqu'une mesure valide existe, avec repli non bloquant sur la
+configuration dans les environnements sans `nvidia-smi`.
 
 Les issues GitHub historiques déjà ouvertes sont à conserver :
 
@@ -543,8 +559,12 @@ hors R0 : SEC-006, TST-004, TST-005 (R1).
 
 ### R1 — preuve terrain et cluster qualifié
 
-Exécuter TST-004/TST-005, mesurer le matériel par UUID, sécuriser le data-plane,
-versionner le protocole et séparer les erreurs de capacité, artefact et santé.
+Exécuter TST-004/TST-005 ; la première tranche de mesure matérielle par UUID
+(`GPU-002`) est livrée. Pour le data-plane,
+autoriser le développement sur LAN privé filtré avec un avertissement clair,
+mais rendre le chiffrement obligatoire et fail-closed dans le profil de
+production. Versionner le protocole et séparer les erreurs de capacité,
+artefact et santé.
 
 ### R2 — qualité de service
 

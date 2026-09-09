@@ -137,6 +137,175 @@ def test_prometheus_no_crash_when_no_data(client, admin_headers):
     assert "eva_models_loaded" in resp.text
 
 
+def test_prometheus_exports_gpu_measurement_by_uuid(client, admin_headers, monkeypatch):
+    """Les séries GPU gardent l'UUID et n'exposent que les mesures valides."""
+    class _Manager:
+        def status(self):
+            return {
+                "vram_budget": {
+                    "gpu_measurement": {
+                        "status": "measured",
+                        "devices": [
+                            {
+                                "uuid": "GPU-hidden",
+                                "memory_used_mb": 700.0,
+                                "memory_total_mb": 1000.0,
+                                "memory_used_bytes": 734003200,
+                                "memory_total_bytes": 1048576000,
+                                "visible": False,
+                            },
+                            {
+                                "uuid": "GPU-visible",
+                                "memory_used_mb": 300.0,
+                                "memory_total_mb": 2000.0,
+                                "memory_used_bytes": 314572800,
+                                "memory_total_bytes": 2097152000,
+                                "visible": True,
+                            },
+                        ],
+                    },
+                },
+                "models": [],
+            }
+
+    async def no_llama_metrics():
+        return {}
+
+    monkeypatch.setattr(metrics_mod, "model_manager", _Manager())
+    monkeypatch.setattr(metrics_mod, "_collect_llama_metrics", no_llama_metrics)
+
+    resp = client.get("/admin/metrics/prometheus", headers=admin_headers)
+
+    assert resp.status_code == 200
+    assert 'eva_gpu_probe_success{node="local"} 1' in resp.text
+    assert (
+        'eva_gpu_memory_used_bytes{node="local",gpu_uuid="GPU-visible"} 314572800'
+        in resp.text
+    )
+    assert (
+        'eva_gpu_memory_total_bytes{node="local",gpu_uuid="GPU-visible"} 2097152000'
+        in resp.text
+    )
+    assert (
+        'eva_gpu_memory_available_bytes{node="local",gpu_uuid="GPU-visible"} 1782579200'
+        in resp.text
+    )
+    assert "GPU-hidden" not in resp.text
+
+
+def test_prometheus_hides_partial_gpu_values_when_unavailable(
+    client, admin_headers, monkeypatch,
+):
+    """Un statut unavailable ne transforme pas un inventaire partiel en métrique."""
+    class _Manager:
+        def status(self):
+            return {
+                "vram_budget": {
+                    "gpu_measurement": {
+                        "status": "unavailable",
+                        "reason": "nvidia_smi_timeout",
+                        "devices": [
+                            {
+                                "uuid": "GPU-partial",
+                                "memory_used_mb": 300.0,
+                                "memory_total_mb": 2000.0,
+                                "visible": True,
+                            },
+                        ],
+                    },
+                },
+                "models": [],
+            }
+
+    async def no_llama_metrics():
+        return {}
+
+    monkeypatch.setattr(metrics_mod, "model_manager", _Manager())
+    monkeypatch.setattr(metrics_mod, "_collect_llama_metrics", no_llama_metrics)
+
+    resp = client.get("/admin/metrics/prometheus", headers=admin_headers)
+
+    assert resp.status_code == 200
+    assert 'eva_gpu_probe_success{node="local"} 0' in resp.text
+    assert "GPU-partial" not in resp.text
+
+
+def test_prometheus_exports_cluster_gpu_measurement_with_node_label(
+    client, admin_headers, monkeypatch,
+):
+    class _ClusterManager:
+        def status(self):
+            return {"vram_budget": {}, "models": []}
+
+        def cluster_status(self):
+            return [
+                {
+                    "node_id": "gpu-a",
+                    "gpu_measurement": {
+                        "status": "measured",
+                        "devices": [
+                            {
+                                "uuid": "GPU-cluster",
+                                "memory_used_bytes": 1048576,
+                                "memory_total_bytes": 4194304,
+                                "visible": True,
+                            }
+                        ],
+                    },
+                }
+            ]
+
+    async def no_llama_metrics():
+        return {}
+
+    monkeypatch.setattr(metrics_mod, "model_manager", _ClusterManager())
+    monkeypatch.setattr(metrics_mod, "_collect_llama_metrics", no_llama_metrics)
+
+    response = client.get("/admin/metrics/prometheus", headers=admin_headers)
+
+    assert response.status_code == 200
+    assert 'eva_gpu_probe_success{node="gpu-a"} 1' in response.text
+    assert (
+        'eva_gpu_memory_available_bytes{node="gpu-a",gpu_uuid="GPU-cluster"} '
+        "3145728" in response.text
+    )
+
+
+def test_prometheus_does_not_publish_stale_gpu_values_for_offline_node(
+    client, admin_headers, monkeypatch,
+):
+    class _ClusterManager:
+        def status(self):
+            return {"vram_budget": {}, "models": []}
+
+        def cluster_status(self):
+            return [{
+                "node_id": "gpu-offline",
+                "online": False,
+                "gpu_measurement": {
+                    "status": "measured",
+                    "devices": [{
+                        "uuid": "GPU-stale",
+                        "memory_used_bytes": 1,
+                        "memory_total_bytes": 2,
+                        "visible": True,
+                    }],
+                },
+            }]
+
+    async def no_llama_metrics():
+        return {}
+
+    monkeypatch.setattr(metrics_mod, "model_manager", _ClusterManager())
+    monkeypatch.setattr(metrics_mod, "_collect_llama_metrics", no_llama_metrics)
+
+    response = client.get("/admin/metrics/prometheus", headers=admin_headers)
+
+    assert response.status_code == 200
+    assert 'eva_gpu_probe_success{node="gpu-offline"} 0' in response.text
+    assert "GPU-stale" not in response.text
+
+
 def test_prometheus_labels_escaped(client, admin_headers, monkeypatch):
     """
     Un model_id contenant des caractères spéciaux doit être échappé proprement

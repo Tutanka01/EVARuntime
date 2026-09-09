@@ -253,6 +253,10 @@ Métriques exposées (noms exacts) :
 | `eva_vram_used_gb` | gauge | — | VRAM utilisée estimée (budget comptabilisé) |
 | `eva_vram_total_gb` | gauge | — | VRAM totale du budget |
 | `eva_vram_available_gb` | gauge | — | VRAM disponible estimée |
+| `eva_gpu_probe_success` | gauge | `node` | Dernier inventaire GPU exploitable (`1`) ou indisponible (`0`) |
+| `eva_gpu_memory_total_bytes` | gauge | `node`, `gpu_uuid` | VRAM totale mesurée du GPU visible |
+| `eva_gpu_memory_used_bytes` | gauge | `node`, `gpu_uuid` | VRAM utilisée mesurée du GPU visible |
+| `eva_gpu_memory_available_bytes` | gauge | `node`, `gpu_uuid` | VRAM disponible mesurée du GPU visible |
 | `eva_models_loaded` | gauge | — | Nombre de modèles à l'état `ready` |
 | `eva_inference_ttft_seconds` | histogram | `model`, `node`, `outcome` | Temps entre la réception de la requête et le premier delta SSE significatif (`content`, `reasoning_content` ou `tool_calls`; queue et chargement inclus) |
 | `eva_model_load_seconds` | histogram | `model`, `node`, `outcome` | Durée d'un appel réel de chargement local ou distant |
@@ -267,6 +271,9 @@ Propriétés importantes :
 - **Robuste par construction** : chaque source indisponible (aucun modèle chargé,
   pas de `nvidia-smi`, mode cluster sans agrégation, DB vide) est silencieusement
   omise ou émise à `0` — jamais de `500`.
+- **Périmètre GPU explicite** : seules les cartes sélectionnées par
+  `CUDA_VISIBLE_DEVICES` produisent des séries mémoire. Une mesure indisponible
+  émet `eva_gpu_probe_success{node}=0`, sans inventer de valeurs mémoire nulles.
 - **Aucune fuite de prompt** : uniquement des compteurs agrégés. Aucun contenu de
   requête ou de réponse n'est exposé.
 - **Cardinalité bornée** : les trois histogrammes runtime n'acceptent que les

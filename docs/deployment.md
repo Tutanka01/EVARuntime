@@ -2507,6 +2507,19 @@ L'installateur exige un build minimal positif et sonde le binaire canonique
 doit être déclaré explicitement avec `--llama-server-bin` ; un build illisible
 ou inférieur au plancher fait échouer le préflight.
 
+Le node-agent mesure aussi la VRAM par UUID en respectant
+`CUDA_VISIBLE_DEVICES`. Cette sonde est best-effort et ne complique pas une
+installation CPU-only : `GPU_PROBE_TIMEOUT_SECONDS` (défaut `5`) borne chaque
+appel et `GPU_PROBE_INTERVAL_SECONDS` (défaut `60`, `0` pour désactiver) règle
+le rafraîchissement en arrière-plan. `/agent/health` ne lance jamais
+`nvidia-smi` ; l'inventaire détaillé est disponible dans son champ optionnel
+`gpu_measurement` et via la route protégée `GET /agent/gpus`. Un statut
+`unavailable` est un diagnostic explicite, jamais une mesure à zéro. Quand la
+mesure est valide, la VRAM physique libre borne l'admission du prochain modèle ;
+si elle est indisponible, l'agent conserve le budget configuré. Les machines en
+mode MIG sont signalées `mig_unsupported` plutôt que de compter la VRAM du GPU
+parent comme celle d'une instance.
+
 ### Registre et fichiers de modèles partagés
 
 Le registre `/var/lib/llm-gateway/models.yaml` vit sur l'orchestrateur, mais les

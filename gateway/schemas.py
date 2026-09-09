@@ -335,6 +335,36 @@ class ModelStatusResponse(BaseModel):
     active_requests: Optional[int] = None
 
 
+class GpuVramSampleResponse(BaseModel):
+    """Mesure d'un GPU local, conservant son identité UUID."""
+
+    index: Optional[int] = None
+    uuid: str
+    name: str = ""
+    memory_used_mb: Optional[float] = None
+    memory_total_mb: Optional[float] = None
+    memory_used_bytes: Optional[int] = None
+    memory_total_bytes: Optional[int] = None
+    driver_version: str = ""
+    compute_capability: str = ""
+    mig_mode_current: str = ""
+    visible: bool
+
+
+class GpuVramMeasurementResponse(BaseModel):
+    """Résultat de la sonde GPU, y compris l'état ``unavailable``."""
+
+    status: Literal["measured", "unavailable"]
+    reason: str
+    measured_at: Optional[str] = None
+    cuda_visible_devices: Optional[str] = None
+    visible_uuids: list[str] = Field(default_factory=list)
+    devices: list[GpuVramSampleResponse] = Field(default_factory=list)
+    visible_used_mb: Optional[float] = None
+    visible_total_mb: Optional[float] = None
+    detail: Optional[str] = None
+
+
 class VramBudgetResponse(BaseModel):
     """
     Budget VRAM global de la gateway — commun aux modes local et cluster.
@@ -349,7 +379,10 @@ class VramBudgetResponse(BaseModel):
     - `safety_margin` : ratio de configuration mono-hôte. Absent en cluster, où
       la réserve des nœuds est déjà agrégée en GB dans `overhead_gb`.
     - `nodes` / `nodes_online` : cluster uniquement.
-    - `gpu_used_mb_measured` / `vram_drift_mb` : local uniquement, et seulement
+    - `gpu_measurement` : état et inventaire par UUID de la dernière sonde
+      locale. Le statut `unavailable` est conservé explicitement ; les agrégats
+      ne comptent que les UUID exposés par `CUDA_VISIBLE_DEVICES`.
+    - `gpu_used_mb_measured` / `vram_drift_mb` : compatibilité locale, seulement
       si une sonde nvidia-smi a réussi.
     """
     total_gb: float
@@ -365,6 +398,7 @@ class VramBudgetResponse(BaseModel):
     # Local uniquement — réconciliation nvidia-smi consommée par le dashboard.
     gpu_used_mb_measured: Optional[float] = None
     vram_drift_mb: Optional[float] = None
+    gpu_measurement: Optional[GpuVramMeasurementResponse] = None
 
 
 class CapacityQueueStatusResponse(BaseModel):

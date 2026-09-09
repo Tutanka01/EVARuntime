@@ -1309,13 +1309,25 @@ pas annulées — un warning non fatal liste celles qui restent.
 ### Réconciliation VRAM via `nvidia-smi`
 
 Une tâche périodique (`start_vram_reconcile()`) compare la VRAM réelle mesurée
-par `nvidia-smi` à la somme des `vram_gb` déclarés des modèles READY. Une dérive
-significative (VRAM réelle > déclaré × (1 + seuil), et > 512 Mo de bruit)
-déclenche un **warning** invitant à chercher des `llama-server` orphelins.
-Purement diagnostique — aucune éviction n'est déclenchée. Si `nvidia-smi` est
-absent, la sonde renvoie `None` et rien n'est fait (aucun champ trompeur dans
-`status()`). Après une sonde réussie, `status()` ajoute `gpu_used_mb_measured` et
-`vram_drift_mb` au bloc `vram_budget`.
+par `nvidia-smi` à la somme des `vram_gb` déclarés des modèles READY. La sonde
+conserve l'UUID de chaque GPU et agrège uniquement les devices sélectionnés par
+`CUDA_VISIBLE_DEVICES`, dans l'ordre déclaré. Une charge située sur un GPU
+masqué ne fausse donc plus la dérive EVA. Une dérive significative (VRAM réelle
+> déclaré × (1 + seuil), et > 512 Mo de bruit) déclenche un **warning** invitant
+à chercher des `llama-server` orphelins. La mesure ne déclenche aucune éviction,
+mais sa VRAM libre borne désormais la capacité d'admission : EVA retient le
+minimum entre le budget configuré restant et la mémoire physique libre. Si la
+sonde est indisponible, le comportement historique fondé sur la configuration
+reste actif afin de ne pas rendre un environnement CPU-only inutilisable.
+
+Le bloc admin `vram_budget.gpu_measurement` publie l'inventaire par UUID et un
+état `measured` ou `unavailable` avec une raison stable. Une sonde absente,
+échouée, expirée ou partielle n'est jamais convertie en zéro et remplace tout
+ancien snapshot devenu obsolète. Les anciens champs
+`gpu_used_mb_measured`/`vram_drift_mb` restent présents après une mesure valide.
+Les UUID MIG et un GPU parent dont `mig.mode.current=Enabled` sont refusés avec
+`mig_unsupported` tant qu'une sonde dédiée ne permet pas d'éviter le double
+comptage parent/instance.
 
 | Variable | Défaut | Rôle |
 |----------|--------|------|
@@ -1492,6 +1504,12 @@ mise à jour orchestrateur ne pousse du code sur les nœuds.
 |------|-------------|-----------|--------|
 | Contrôle | orchestrateur ↔ agent | HTTPS + Bearer | Faible (load/unload/health) |
 | Données | orchestrateur ↔ llama-server | HTTP LAN | Élevé (tokens SSE) |
+
+Chaque node-agent rafraîchit en arrière-plan le même inventaire GPU par UUID.
+Le heartbeat reste une lecture mémoire sans sous-processus ; son champ optionnel
+`gpu_measurement` permet une mise à jour progressive des agents et de
+l'orchestrateur. L'endpoint protégé `GET /agent/gpus` force au besoin une
+actualisation et expose le diagnostic détaillé.
 
 Le registre est central mais les artefacts ne le sont pas : `path` et
 `mmproj_path` doivent résoudre vers des fichiers identiques, aux mêmes chemins
