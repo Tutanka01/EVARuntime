@@ -104,7 +104,7 @@ class FakeServerManager:
         self.active_requests_at_unload = self._active_requests
         self._state = ModelState.UNLOADED
         if self._on_unload:
-            self._on_unload(self._model.id)
+            self._on_unload(self._model.id, reason)
 
     def pin(self) -> None:
         self._active_requests += 1

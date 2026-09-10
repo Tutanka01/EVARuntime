@@ -239,7 +239,7 @@ async def test_cancelled_load_leaves_last_load_seconds_none(monkeypatch):
 @pytest.mark.anyio
 async def test_idle_monitor_never_unloads_pinned(monkeypatch):
     unloaded = []
-    mgr = make_manager(on_unload=lambda mid: unloaded.append(mid))
+    mgr = make_manager(on_unload=lambda mid, reason: unloaded.append(mid))
     patch_process_and_health(mgr, monkeypatch)
 
     await mgr.ensure_loaded()
@@ -297,7 +297,7 @@ async def test_crash_in_ready_transitions_to_unloaded(monkeypatch):
     unloaded = []
     capacity = []
     mgr = make_manager(
-        on_unload=lambda mid: unloaded.append(mid),
+        on_unload=lambda mid, reason: unloaded.append(mid),
         on_capacity_change=lambda: capacity.append(True),
     )
     patch_process_and_health(mgr, monkeypatch)
@@ -355,7 +355,7 @@ async def test_unload_cancels_load_task(monkeypatch):
 @pytest.mark.anyio
 async def test_idle_unload_via_real_monitor(monkeypatch):
     unloaded = []
-    mgr = make_manager(on_unload=lambda mid: unloaded.append(mid))
+    mgr = make_manager(on_unload=lambda mid, reason: unloaded.append(mid))
     patch_process_and_health(mgr, monkeypatch)
 
     await mgr.ensure_loaded()
@@ -380,7 +380,7 @@ async def test_idle_unload_disabled_keeps_watchdog_without_idle_eviction(monkeyp
     """Mode agent : pas d'éviction idle aveugle, mais les crashs restent détectés."""
     unloaded = []
     mgr = make_manager(
-        on_unload=lambda mid: unloaded.append(mid),
+        on_unload=lambda mid, reason: unloaded.append(mid),
         idle_unload_enabled=False,
     )
     patch_process_and_health(mgr, monkeypatch)

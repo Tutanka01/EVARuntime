@@ -57,7 +57,7 @@ class FakeRegistry:
 
 class FakeServerManager:
     def __init__(
-        self, model, port, on_unload=None, on_capacity_change=None, *,
+        self, model, port, on_unload=None, on_capacity_change=None, idle_unload_enabled: bool = True, *,
         ready: bool = False, active_requests: int = 0, last_request_time: float | None = None,
     ):
         self._model = model
@@ -85,10 +85,14 @@ class FakeServerManager:
         self.unload_calls += 1
         self._state = ModelState.UNLOADED
         if self._on_unload:
-            self._on_unload(self._model.id)
+            self._on_unload(self._model.id, reason)
+        self._active_requests = max(0, self._active_requests - 1)
 
     def unpin(self):
+        was_pinned = self._active_requests > 0
         self._active_requests = max(0, self._active_requests - 1)
+        if was_pinned and self._active_requests == 0 and self._on_capacity_change:
+            self._on_capacity_change()
 
     def status(self):
         return {
