@@ -1,264 +1,128 @@
 # EVARuntime
 
-> OpenAI-compatible LLM inference gateway for private GPU infrastructure.
+**Private LLM inference for shared GPUs. Load a model when it is needed; give the memory back when it is idle.**
 
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg)](https://fastapi.tiangolo.com/)
-[![llama.cpp](https://img.shields.io/badge/llama.cpp-CUDA-orange.svg)](https://github.com/ggml-org/llama.cpp)
-[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20compatible-green.svg)](https://platform.openai.com/docs/api-reference)
+EVARuntime is a self-hosted control plane for running `llama.cpp` models on shared GPU machines. Your applications use an OpenAI-style API; EVARuntime decides which GGUF model to run, when to start its `llama-server` process, who may use it, and when that process can safely stop. Prompts, models, keys and usage records stay on infrastructure you operate.
 
-EVARuntime turns one or more NVIDIA GPU servers into a controlled, auditable and energy-aware LLM inference platform. It exposes a familiar OpenAI-compatible API while keeping model execution, access control and usage logs inside your own infrastructure.
+It is built for labs and small platform teams that share GPU machines between inference and other work, and want predictable operations without a Kubernetes stack.
 
-> **Project status:** the local `llama.cpp` path and its lifecycle controls are
-> heavily tested. Physical GPU qualification, energy accounting, vLLM and
-> multi-node model sharding are active roadmap items. See the
-> [roadmap](ROADMAP.md) and [product vision](docs/vision.md).
+![EVARuntime admin dashboard showing model states, VRAM budget and usage](docs/assets/dashboard-overview.png)
 
-Developed by **Mohamad El Akhal** within the **Université de Pau et des Pays de l'Adour (UPPA)**.
+*One model is ready and seven are unloaded in this dashboard snapshot. It is not a measured before-and-after VRAM result.*
 
----
+## Why it exists
 
-## What It Solves
+Keeping a model resident reserves GPU memory even when nobody is asking it anything. On a shared machine, that memory could be used for another model, an experiment or training. EVARuntime makes the model lifecycle part of the service rather than an operator chore.
 
-Many research teams, universities and internal platforms need LLM access without sending data to a third-party API. EVARuntime focuses on that operational problem:
+`llama.cpp` generates the tokens. EVARuntime handles admission, access, lifecycle and observability around it:
 
-| Need | EVARuntime approach |
+```text
+UNLOADED ── request ──> LOADING ──> READY ── idle ──> UNLOADING ──> UNLOADED
+                                   │
+                                   └── active requests keep the model pinned
+```
+
+If capacity is tight, requests wait in a bounded queue and an inactive model can be evicted. An active response keeps its model pinned; stream completion and client disconnect both release that pin.
+
+## Why not use another server directly?
+
+<details>
+<summary>Why not just llama.cpp?</summary>
+
+`llama-server` already has a router that can load models on demand. Use it directly if that covers your needs. EVARuntime adds a separate control plane for user keys and quotas, VRAM admission, persistent usage records, artifact checks and optional placement across nodes. [llama.cpp router docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#using-multiple-models)
+
+</details>
+
+<details>
+<summary>Why not Ollama?</summary>
+
+Ollama also unloads idle models and queues requests. EVARuntime is for operators who want to manage their own GGUF and `llama-server` deployment while giving multiple users controlled access, quotas and usage history. Choose the workflow that fits your team. [Ollama FAQ](https://docs.ollama.com/faq)
+
+</details>
+
+<details>
+<summary>Why not vLLM?</summary>
+
+vLLM focuses on high-throughput inference and has a sleep mode. EVARuntime currently manages `llama.cpp` and GGUF; vLLM support is roadmap work, not a current backend. [vLLM sleep mode](https://docs.vllm.ai/en/latest/features/sleep_mode/)
+
+</details>
+
+## What works today
+
+- **Local inference:** gateway-owned `llama-server` processes for GGUF models on Linux with NVIDIA GPUs or macOS with Apple Silicon and Metal.
+- **Familiar client API:** authenticated `/v1/chat/completions`, SSE streaming and `/v1/models`, with the model ID taken from the validated YAML registry.
+- **Shared GPU control:** on-demand loading, VRAM and port budgets, coalesced concurrent loads, idle unload and LRU eviction of inactive models.
+- **Access and audit:** per-user API keys stored as hashes, rate limits, monthly token quotas, usage records and user anonymization.
+- **Artifact controls:** validated model paths and optional GGUF SHA-256 checks before loading.
+- **Operations:** an admin dashboard, Prometheus metrics, structural `/ready` checks, `doctor`, a first-token smoke test and deployment scripts for Linux and macOS.
+- **Optional multi-node mode:** a Linux orchestrator can place models on separately installed GPU node agents, reconcile their state and fail over when a node becomes unavailable.
+
+The stack stays deliberately small: FastAPI, SQLite WAL, `llama.cpp`, and systemd or launchd. See the [architecture](docs/architecture.md) for the request path and lifecycle invariants.
+
+## Get a first token
+
+You need Python 3.11+, a working `llama-server` build and a GGUF model. The installer sets up the gateway; it does **not** download or compile the inference runtime or model for you.
+
+| Where you run it | Start here |
 | --- | --- |
-| Keep prompts and responses on-premise | Models run on your GPU nodes; clients call your gateway |
-| Reuse existing tooling | OpenAI-compatible `/v1/chat/completions`, streaming included |
-| Share a costly GPU safely | API keys, rate limits, quotas and request logs |
-| Avoid idle GPU waste | Models are loaded on demand and unloaded after inactivity |
-| Operate several models | VRAM budget, model registry, LRU eviction and optional cluster mode |
+| Linux with NVIDIA GPU | [Local first-token walkthrough](docs/deployment.md#déploiement-local--premier-token-linux), from CUDA build to smoke test |
+| macOS 14+ on Apple Silicon | [macOS local installation](docs/deployment.md#déploiement-macos-apple-silicon), including Metal and model registration |
+| Several Linux GPU nodes | [Multi-node deployment](docs/deployment.md#13-déploiement-multi-nœuds-optionnel--avancé), after understanding the [cluster limits](#current-limits) |
 
-The project is intentionally pragmatic: FastAPI, SQLite WAL, systemd, nginx and `llama.cpp` instead of a heavy control plane.
-
-## Core Features
-
-- OpenAI-compatible chat completions API, including Server-Sent Events streaming.
-- Per-user API keys stored as SHA-256 hashes.
-- Sliding-window rate limiting and monthly token quotas.
-- SQLite WAL storage with per-connection robustness pragmas and a manual retention purge.
-- On-demand `llama-server` lifecycle management with a shared keep-alive HTTP client on the hot path.
-- Full GPU memory release when models are idle, plus a bounded drain of active requests on shutdown.
-- Multi-model VRAM budgeting with LRU eviction and best-effort VRAM reconciliation via `nvidia-smi`.
-- Optional multi-node mode with lightweight GPU agents, state reconciliation on startup and fast failover.
-- Supply-chain hardening: optional GGUF `sha256` integrity checks and `llama-server` build pinning.
-- Unprivileged bootstrap planner (`bootstrap-plan`): inventories the host and explains what it would install to reach a first token, without downloading, compiling or writing anything.
-- Observability: Prometheus text exposition (`/admin/metrics/prometheus`) and a `/ready` readiness probe.
-- Admin CLI and REST API for users, keys, models and reports.
-- Deployment assets for systemd, nginx, journald and scheduled SQLite backups.
-
-## Architecture
-
-```text
-Client
-  |
-  v
-nginx / TLS / optional network filtering
-  |
-  v
-FastAPI Gateway
-  |-- Auth, rate limits, quotas
-  |-- Model manager
-  |-- SQLite WAL
-  |
-  +-- llama-server process, model A
-  +-- llama-server process, model B
-  +-- remote node agents, optional cluster mode
-```
-
-Each model backend is managed as a gateway-owned subprocess instead of a permanently running service. That design lets EVARuntime terminate idle backends and return GPU memory to the host, which is useful when the same machine is shared between inference, experimentation and training workloads.
-
-## Repository Layout
-
-```text
-gateway/                 Main OpenAI-compatible gateway
-gateway/bootstrap/       Unprivileged bootstrap planner and approved-model catalog
-gateway/cluster/         Multi-node scheduling and remote node client
-gateway/deploy/          systemd, nginx and install scripts (Linux)
-gateway/deploy-macos/    macOS deployment scripts (launchd, Homebrew)
-gateway/static/          Admin dashboard
-gateway/tests/           Gateway test suite
-node_agent/              Lightweight remote GPU node agent
-docs/                    Architecture, API, admin and deployment guides
-```
-
-## Quick Start
-
-Prerequisites:
-
-- **Local mode**: a Linux server with NVIDIA GPU, CUDA `llama.cpp` and local GGUFs, OR macOS 26+ on Apple Silicon (M2/M3/M4) with Homebrew and Metal-enabled `llama.cpp`.
-- **Cluster mode**: a Linux orchestrator (GPU optional) plus separately installed
-  GPU node-agents with CUDA `llama.cpp` and identical model paths.
-- Python 3.11+.
-
-EVARuntime has two explicit deployment paths. The single-node product remains
-the safe default; the multi-node control plane is an optional second product:
-
-| Path | Gateway host | GPU execution | Command |
-| --- | --- | --- | --- |
-| Local (default) | Gateway + `llama-server` | On the gateway host | `install.sh --mode local` |
-| macOS Local | Gateway + `llama-server` (Metal) | Apple Silicon (M2/M3/M4) | `gateway/deploy-macos/install.sh --mode local` |
-| Cluster (opt-in) | Orchestrator only | On separately installed node-agents | `install.sh --mode cluster` |
-
-### Linux: Install the local single-node gateway
+On Linux, you can preview the installer before changing the host:
 
 ```bash
 git clone https://github.com/Tutanka01/EVARuntime.git
 cd EVARuntime
-sudo bash gateway/deploy/install.sh --mode local
+bash gateway/deploy/install.sh --mode local --dry-run
 ```
 
-Production bootstrap has three explicit stages: review a non-mutating plan,
-install the service base, then apply the reviewed plan to publish the pinned
-runtime and models and prove the first token:
+Follow the linked walkthrough to prepare the runtime and model, install the service, then run `smoke_test.sh`. `/ready` checks whether the gateway is structurally ready; the smoke test actually loads a model and checks the first streamed token.
 
-```bash
-cd gateway && python cli.py bootstrap-plan
-```
-
-`bootstrap-plan` produces a versioned, secret-free document meant to be reviewed
-or pasted into a ticket. It writes nothing and installs nothing; without a pinned
-`llama.cpp` version and commit it deliberately reports a blocked plan rather than
-inventing a build number. The complete production sequence, including
-`bootstrap-apply`, systemd environment hardening, `doctor` and the public smoke
-test, is in the [deployment guide](docs/deployment.md#parcours-production-complet--mode-local).
-
-Once a local installation runs, [« Première requête authentifiée »](docs/deployment.md#première-requête-authentifiée)
-walks you from creating a user and an API key (`llmgw-…`) to the first
-`/v1/chat/completions` on `http://127.0.0.1:8000` — and explains why the gateway
-rejects `ADMIN_SECRET` on `/v1/*` routes.
-
-### macOS: Install the local single-node gateway (Apple Silicon)
-
-```bash
-git clone https://github.com/Tutanka01/EVARuntime.git
-cd EVARuntime
-cd gateway/deploy-macos
-bash install.sh --mode local
-```
-
-macOS uses launchd instead of systemd and Homebrew for dependencies. The installer
-creates a Metal-enabled `llama-server` configuration and sets up the service with
-user-space paths (`~/Library/Application Support/evaruntime/`).
-
-> **Note**: Cluster mode is NOT supported on macOS. Only local (single-node) mode works.
-
-Omitting `--mode` on a fresh install is equivalent to `--mode local`. For a
-multi-node orchestrator, inspect the plan first, then install explicitly:
-
-```bash
-bash gateway/deploy/install.sh --mode cluster --dry-run
-sudo bash gateway/deploy/install.sh --mode cluster
-```
-
-The installer never replaces an existing `env`, `models.yaml`, `nodes.yaml` or
-secret. A local↔cluster migration requires both an explicit target mode and
-`--allow-mode-change`. Updates preserve the installed mode when `--mode` is
-omitted:
-
-```bash
-# Linux
-sudo bash gateway/deploy/update.sh                 # auto-detect and preserve
-sudo bash gateway/deploy/update.sh --mode cluster  # explicit cluster update
-
-# macOS (local only)
-bash gateway/deploy-macos/update.sh                # auto-detect and preserve
-```
-
-Cluster agents are installed and updated on each GPU node; the orchestrator
-does not update them remotely. See the [deployment guide](docs/deployment.md)
-for TLS, ports, shared model paths, migration and rollback.
-
-## API Example
-
-On a fresh local install the gateway listens directly on `http://127.0.0.1:8000`;
-behind nginx, use your public URL instead. The `model` field is the `id` declared
-in `models.yaml` (not the GGUF file name).
+Once an admin has [created a user API key](docs/deployment.md#première-requête-authentifiée), an existing OpenAI Python client can call the gateway:
 
 ```python
+import os
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8000/v1",
-    api_key="llmgw-your_api_key",
+    api_key=os.environ["EVA_API_KEY"],
 )
 
-response = client.chat.completions.create(
-    model="llama-3.1-8b-instruct",
-    messages=[{"role": "user", "content": "Explain Bayes' theorem."}],
-)
-
-print(response.choices[0].message.content)
-```
-
-Streaming works with standard OpenAI clients:
-
-```python
 stream = client.chat.completions.create(
-    model="llama-3.1-8b-instruct",
-    messages=[{"role": "user", "content": "Write a short introduction to LLMs."}],
+    model=os.environ["EVA_MODEL_ID"],  # an id returned by GET /v1/models
+    messages=[{"role": "user", "content": "Hello, EVA."}],
     stream=True,
 )
-
 for chunk in stream:
     print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
-## Administration
+The first request may wait while the model loads. Set `EVA_API_KEY` to a **user** key (`llmgw-…`), not the admin secret, and `EVA_MODEL_ID` to an ID from your registry. For curl, request options and error handling, see the [API guide](docs/api.md).
 
-```bash
-cd /opt/llm-gateway
+## Current limits
 
-sudo -u llmservice ./venv/bin/python cli.py add-user alice \
-  --email alice@example.com --rpm 30
+More than 2,500 gateway tests and a separate node-agent suite exercise lifecycle, scheduling, artifact integrity, access control, quotas and failure handling; see the [dated results](ROADMAP.md#vérification-locale-du-3-septembre-2026). That is software evidence.
 
-sudo -u llmservice ./venv/bin/python cli.py create-key alice --name research
-sudo -u llmservice ./venv/bin/python cli.py list-users
-sudo -u llmservice ./venv/bin/python cli.py usage-report --month 2026-06 --summary
-sudo -u llmservice ./venv/bin/python cli.py status
-```
+A reproducible, published end-to-end report on real GPU hardware, GGUF and nginx is still [roadmap work](ROADMAP.md#r1--preuve-terrain-et-cluster-qualifié); the dashboard snapshot above is not that evidence.
 
-Admin HTTP routes are protected by `Authorization: Bearer <ADMIN_SECRET>` and should be restricted at the reverse proxy layer.
+Multi-node mode places **whole models** on nodes; it does not split one model across machines. Its data-plane traffic currently uses HTTP, so cluster experiments belong on a private, firewalled LAN. An encrypted data plane and real-process cluster failure tests are required before claiming production use with sensitive prompts. See the [deployment guide](docs/deployment.md#13-déploiement-multi-nœuds-optionnel--avancé) and [roadmap](ROADMAP.md).
 
-## Configuration
+Energy accounting, vLLM, and distributed model execution are goals, not shipped features. The [product vision](docs/vision.md) explains why they matter; the [roadmap](ROADMAP.md) tracks what must be proven first.
 
-Start with [gateway/.env.example](gateway/.env.example). The important settings are:
+## Explore the project
 
-| Setting | Purpose |
+| Topic | Where to go |
 | --- | --- |
-| `MODELS_CONFIG_PATH` | YAML model registry |
-| `LLAMA_SERVER_BIN` | Published CUDA runtime (supported default: `/opt/llama.cpp/current/llama-server`) |
-| `INTERNAL_API_KEY` | Internal gateway-to-backend key |
-| `ADMIN_SECRET` | Secret for admin endpoints (≥ 32 chars, enforced fail-closed) |
-| `IDLE_TIMEOUT_SECONDS` | Idle delay before unloading a model |
-| `TOTAL_VRAM_GB` | Total GPU VRAM used to compute the model manager budget |
-| `CLUSTER_MODE` | `local` or `cluster` |
+| Current design and invariants | [Architecture](docs/architecture.md) |
+| Client routes and examples | [API guide](docs/api.md) |
+| Admin users, models and dashboard | [Admin guide](docs/admin.md) |
+| Installation, upgrades and recovery | [Deployment guide](docs/deployment.md) |
+| Model and gateway settings | [Model registry](gateway/models.yaml) and [environment template](gateway/.env.example) |
+| Readiness, metrics and logs | [Observability guide](docs/observability.md) |
+| Priorities and known defects | [Roadmap](ROADMAP.md) |
 
-Never publish real `.env` files, generated secrets, TLS private keys, databases or logs.
+Bug reports and focused contributions are welcome through [GitHub Issues](https://github.com/Tutanka01/EVARuntime/issues). Please include the platform, a way to reproduce the problem and logs with secrets removed.
 
-## Documentation
-
-- [Roadmap and project status](ROADMAP.md)
-- [Product vision](docs/vision.md)
-- [Architecture](docs/architecture.md)
-- [Dependency and CVE policy](docs/dependency-policy.md)
-- [API guide](docs/api.md)
-- [Admin guide](docs/admin.md)
-- [Deployment guide](docs/deployment.md)
-- [Observability guide](docs/observability.md)
-- [llama.cpp build notes](docs/build-llama-cpp-dgx-spark.md)
-
-## Public Release Checklist
-
-Before making a fork or repository public:
-
-- Keep only `.env.example` files, never production `.env` files.
-- Replace organization-specific domains, addresses and certificates with placeholders.
-- Remove generated caches such as `__pycache__`, `.pytest_cache` and `.pyc`.
-- Rotate any secret that may have appeared in a local file or terminal output.
-- Review deployment documentation for infrastructure details that should remain private.
-
-## Author
-
-EVARuntime was designed and implemented by **Mohamad El Akhal** within the **Université de Pau et des Pays de l'Adour (UPPA)**.
+EVARuntime was created by **Mohamad El Akhal** at the **Université de Pau et des Pays de l'Adour (UPPA)**. Licensed under [AGPL-3.0](LICENSE).
