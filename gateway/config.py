@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     # Laisser vide ("") pour utiliser automatiquement le premier modèle activé du registre.
     default_model_id: str = ""
 
+    # ── Modèles toujours chargés (always-on) ──────────────────────────────────
+    # Liste séparée par des virgules de modèles qui doivent être chargés au
+    # démarrage et ne jamais être déchargés automatiquement pour inactivité.
+    # Ils sont rechargés dès qu'un autre modèle se décharge pour inactivité.
+    always_on_models: str | list[str] = Field(default_factory=list)
+
     # ── Répertoires autorisés pour les fichiers .gguf ─────────────────────────
     # Liste séparée par des virgules. Vide = pas de restriction (tous répertoires autorisés).
     # Exemple : ALLOWED_MODEL_DIRS=/models,/data/models
@@ -426,6 +432,11 @@ class Settings(BaseSettings):
     @classmethod
     def split_allowed_model_dirs(cls, v: object) -> object:
         return split_list_setting(v, "ALLOWED_MODEL_DIRS")
+
+    @field_validator("always_on_models", mode="before")
+    @classmethod
+    def split_always_on_models(cls, v: object) -> object:
+        return split_list_setting(v, "ALWAYS_ON_MODELS")
 
     @field_validator("cluster_health_interval", "cluster_health_failures_to_offline")
     @classmethod

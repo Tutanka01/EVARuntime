@@ -244,6 +244,13 @@ async def lifespan(app: FastAPI):
     log.info("Mode déploiement : CLUSTER_MODE=%s", settings.cluster_mode)
     await model_manager.start_health_monitor()
 
+    # Chargement des modèles always-on au démarrage (mode local uniquement).
+    if settings.cluster_mode == "local" and hasattr(model_manager, "load_always_on_models"):
+        try:
+            await model_manager.load_always_on_models()
+        except Exception as exc:  # non fatal — les always-on peuvent être chargés plus tard
+            log.warning("Chargement initial des always-on ignoré (non fatal) : %s", exc)
+
     # ── Robustesse cycle de vie (mode local uniquement) ───────────────────────
     # Détection best-effort des llama-server orphelins tenant un port du pool
     # (survivants d'un crash gateway). LOG seulement par défaut — ne tue rien.
