@@ -8,7 +8,9 @@ Endpoints gérés :
   POST /completion            — alias direct pour les scripts llama.cpp existants
   POST /v1/tokenize           — tokenisation d'un texte
   POST /v1/detokenize         — reconstruction texte depuis token IDs
+  POST /v1/embeddings         — vecteurs d'embedding (non streamant)
   GET  /v1/models             — liste dynamique depuis le registre
+  GET  /v1/models/{model_id}  — entrée unique (« retrieve model »)
 
 Design :
 - On extrait le champ "model" du body JSON pour router vers le bon llama-server
@@ -252,13 +254,26 @@ async def proxy_request(
     path: str,
     user: dict,
     model_manager: ModelManager,
+    *,
+    required_capability: str | None = None,
+    allow_streaming: bool = True,
 ) -> StreamingResponse | JSONResponse:
     """
     Point d'entrée générique.
     - Lit le body et résout le modèle cible
+    - Refuse la requête si la route exige une capability non déclarée
     - Assure que le modèle est chargé (charge si nécessaire, évinçe LRU si besoin)
     - Proxy la requête vers le bon llama-server
     - Log l'usage
+
+    required_capability : capability que le modèle doit déclarer pour cette
+    route (``embeddings``). Contrôlée AVANT le chargement — voir
+    `_capability_refusal`.
+
+    allow_streaming : False pour une route dont le backend ne streame pas
+    (embeddings). Le champ `stream` du corps est alors ignoré ET retiré avant
+    le forward, pour que le client ne puisse pas pousser la requête sur un
+    chemin SSE que le backend ne sait pas servir.
     """
     request_start_time = time.monotonic()
 
@@ -283,6 +298,12 @@ async def proxy_request(
             "Précisez le champ 'model' dans votre requête.",
             "invalid_request_error",
         )
+
+    # ── Capability exigée par la route ────────────────────────────────────────
+    if required_capability is not None:
+        refusal = _capability_refusal(model_manager, model_id, required_capability)
+        if refusal is not None:
+            return refusal
 
     # ── Charger le modèle ─────────────────────────────────────────────────────
     try:
@@ -311,7 +332,18 @@ async def proxy_request(
         log.exception("Erreur inattendue lors du chargement du modèle '%s'", model_id)
         return _openai_error(500, "Erreur interne du serveur.", "server_error")
 
-    is_streaming = body.get("stream", False)
+    if allow_streaming:
+        is_streaming = body.get("stream", False)
+    else:
+        # Route non streamante : `stream` n'active pas le chemin SSE et ne part
+        # pas vers le backend, qui répondrait une erreur ou un corps inattendu.
+        is_streaming = False
+        body = {
+            key: value
+            for key, value in body.items()
+            if key not in ("stream", "stream_options")
+        }
+
     request_id = str(uuid.uuid4())
     start_time = time.monotonic()
 
@@ -724,6 +756,23 @@ async def _stream_proxy(
 
 # ── /v1/models ────────────────────────────────────────────────────────────────
 
+# Date de création annoncée aux clients OpenAI. Le registre ne datant pas ses
+# entrées, la valeur est constante et volontairement inerte — un timestamp
+# fabriqué à la volée ferait croire à un modèle recréé à chaque appel.
+_MODEL_CREATED = 1704067200
+
+
+def _model_object(model) -> dict:
+    """Entrée « model » au format OpenAI, partagée par la liste et l'unitaire."""
+    return {
+        "id": model.id,
+        "object": "model",
+        "created": _MODEL_CREATED,
+        "owned_by": "local-uppa",
+        "description": model.description,
+    }
+
+
 def models_response(model_manager: ModelManager) -> JSONResponse:
     """
     Retourne la liste des modèles activés dans le registre.
@@ -732,17 +781,56 @@ def models_response(model_manager: ModelManager) -> JSONResponse:
     enabled_models = model_manager.registry.list_enabled()
     return JSONResponse(content={
         "object": "list",
-        "data": [
-            {
-                "id": model.id,
-                "object": "model",
-                "created": 1704067200,
-                "owned_by": "local-uppa",
-                "description": model.description,
-            }
-            for model in enabled_models
-        ],
+        "data": [_model_object(model) for model in enabled_models],
     })
+
+
+def model_response(model_manager: ModelManager, model_id: str) -> JSONResponse:
+    """
+    Retourne une entrée unique — contrat OpenAI « retrieve model ».
+    Compatible avec openai.models.retrieve().
+
+    Même visibilité que `models_response` : seuls les modèles activés sont
+    exposés. Un identifiant inconnu ET un modèle désactivé renvoient le même
+    404 `model_not_found` : la liste n'annonce pas les modèles désactivés, et
+    l'unitaire ne doit pas être le canal qui révèle leur existence.
+    """
+    requested = (model_id or "").strip()
+    for model in model_manager.registry.list_enabled():
+        if model.id == requested:
+            return JSONResponse(content=_model_object(model))
+    return _openai_error(
+        404,
+        f"Modèle '{requested}' introuvable ou désactivé.",
+        "model_not_found",
+    )
+
+
+def _capability_refusal(
+    model_manager: ModelManager,
+    model_id: str,
+    capability: str,
+) -> JSONResponse | None:
+    """
+    Refuse une route spécialisée quand le modèle ne déclare pas `capability`.
+
+    Le contrôle précède `ensure_model_loaded` : charger plusieurs Go de VRAM
+    pour répondre 400 offrirait un déni de service GPU à coût nul. Un modèle
+    INCONNU du registre n'est pas tranché ici — on laisse le chargement
+    produire le 404 `model_not_found` habituel, pour qu'un identifiant
+    inexistant réponde la même chose sur toutes les routes.
+    """
+    model = model_manager.registry.get(model_id)
+    if model is None:
+        return None
+    if capability in (getattr(model, "capabilities", ()) or ()):
+        return None
+    return _openai_error(
+        400,
+        f"Le modèle '{model.id}' ne déclare pas la capability "
+        f"'{capability}' — route indisponible pour ce modèle.",
+        "invalid_request_error",
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

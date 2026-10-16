@@ -30,7 +30,13 @@ from llama_version import enforce_llama_min_build
 from metrics import router as metrics_router
 from model_manager import model_manager
 from model_registry import IntegrityError
-from proxy import aclose_http_client, init_http_client, models_response, proxy_request
+from proxy import (
+    aclose_http_client,
+    init_http_client,
+    model_response,
+    models_response,
+    proxy_request,
+)
 from rate_limiter import check_rate_limit
 from readiness import caller_is_privileged, evaluate_readiness
 
@@ -552,6 +558,19 @@ async def list_models(user: dict = Depends(get_current_user)):
     return models_response(model_manager)
 
 
+@app.get("/v1/models/{model_id}")
+async def retrieve_model(model_id: str, user: dict = Depends(get_current_user)):
+    """
+    Détail d'un modèle — compatible openai.models.retrieve().
+
+    Même visibilité que `/v1/models` : un modèle désactivé ou inconnu renvoie
+    404 `model_not_found`. Le chemin n'accepte pas de `/` (les identifiants du
+    registre n'en contiennent jamais, cf. `_MODEL_ID_RE`), donc aucun risque
+    de capture d'un sous-chemin.
+    """
+    return model_response(model_manager, model_id)
+
+
 @app.get("/v1/capacity")
 async def capacity_status(user: dict = Depends(get_current_user)):
     """
@@ -658,6 +677,32 @@ async def detokenize(
 ):
     """Reconstruit du texte depuis des token IDs. Body: {"model": "...", "tokens": [...]}"""
     return await proxy_request(request, "/detokenize", user, model_manager)
+
+
+@app.post("/v1/embeddings")
+async def embeddings(
+    request: Request,
+    user: dict = Depends(check_rate_limit),
+):
+    """
+    Embeddings — compatible OpenAI (openai.embeddings.create()).
+
+    Body : {"model": "...", "input": "texte" | ["texte", ...]}.
+
+    Le modèle cible doit déclarer la capability `embeddings` dans le registre :
+    sans elle, llama-server a été lancé en mode génération et répondrait une
+    erreur opaque. Le refus est donc prononcé par la gateway, avant tout
+    chargement de VRAM. La route n'est jamais streamante : un `stream` dans le
+    corps est ignoré et retiré avant le forward.
+    """
+    return await proxy_request(
+        request,
+        "/v1/embeddings",
+        user,
+        model_manager,
+        required_capability="embeddings",
+        allow_streaming=False,
+    )
 
 
 # ── Gestionnaire d'erreurs global ────────────────────────────────────────────
