@@ -333,7 +333,11 @@ def _documented_public_paths() -> set[str]:
         paths.add(match.group(1))
     # `…/v1` est une base_url de client OpenAI, pas une route.
     paths.discard("/v1")
-    return paths
+    # Même normalisation que `_app_route_paths` : la doc écrit les paramètres de
+    # chemin sous leur forme de gabarit (`GET /v1/models/{model_id}`), que l'on
+    # compare à la route FastAPI correspondante — ce sont des formes de route,
+    # pas des URL concrètes.
+    return {re.sub(r"\{[^}]+\}", "x", path) for path in paths}
 
 
 def test_les_routes_documentees_sont_proxifiees():

@@ -783,7 +783,7 @@
             <label class="cap-chip"><input type="checkbox" value="tool_calls" onchange="syncCapChip(this)" />tool_calls</label>
             <label class="cap-chip"><input type="checkbox" value="streaming" onchange="syncCapChip(this)" />streaming</label>
             <label class="cap-chip"><input type="checkbox" value="vision" onchange="syncCapChip(this)" />vision</label>
-            <label class="cap-chip"><input type="checkbox" value="embedding" onchange="syncCapChip(this)" />embedding</label>
+            <label class="cap-chip"><input type="checkbox" value="embeddings" onchange="syncCapChip(this)" />embeddings</label>
           </div>
         </div>
 
@@ -2179,7 +2179,11 @@ const CAP_LABELS = {
   vision:          'Images (vision)',
   tool_calls:      'Tool calls',
   streaming:       'Streaming',
-  embedding:       'Embeddings',
+  // La clé doit être la valeur EXACTE de MODEL_CAPABILITIES ('embeddings' au
+  // pluriel) : la case du formulaire part telle quelle vers l'API admin, qui
+  // refuse toute capability inconnue, et un libellé mal orthographié laisse un
+  // modèle correctement déclaré s'afficher sans nom.
+  embeddings:      'Embeddings',
 };
 
 function miRow(key, val) {

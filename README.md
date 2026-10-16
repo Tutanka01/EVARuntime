@@ -50,7 +50,7 @@ vLLM focuses on high-throughput inference and has a sleep mode. EVARuntime curre
 ## What works today
 
 - **Local inference:** gateway-owned `llama-server` processes for GGUF models on Linux with NVIDIA GPUs or macOS with Apple Silicon and Metal.
-- **Familiar client API:** authenticated `/v1/chat/completions`, SSE streaming and `/v1/models`, with the model ID taken from the validated YAML registry.
+- **Familiar client API:** authenticated `/v1/chat/completions`, SSE streaming, `/v1/embeddings` (for models declaring the `embeddings` capability) and `/v1/models` (list and retrieve), with the model ID taken from the validated YAML registry.
 - **Shared GPU control:** on-demand loading, VRAM and port budgets, coalesced concurrent loads, idle unload and LRU eviction of inactive models.
 - **Access and audit:** per-user API keys stored as hashes, rate limits, monthly token quotas, usage records and user anonymization.
 - **Artifact controls:** validated model paths and optional GGUF SHA-256 checks before loading.
