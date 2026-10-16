@@ -212,6 +212,19 @@ Add or update tests when changing:
 - cluster node scheduling, node protocol validation, or node client errors;
 - admin model mutation APIs that persist to YAML.
 
+Any change to a route, a request/response model or an error envelope also
+requires regenerating the versioned API contract, in the same commit:
+
+```bash
+python scripts/export_openapi.py
+```
+
+`docs/openapi.json` is the machine-readable contract. CI compares it to the
+live app (`Check OpenAPI contract`, plus `tests/test_openapi_contract.py`) and
+fails on drift. Corollary: no Pydantic model under `gateway/` may take a
+default from `settings` — the schema must not depend on the environment, or the
+committed file differs from one machine to the next and the guard is useless.
+
 For deployment-only changes, validate scripts/configs by inspection and, where
 reasonable, with syntax checks. Do not run installers against the host unless the
 user explicitly asks for it. Deployment logic can still be tested for real: drive

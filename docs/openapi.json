@@ -1,0 +1,2938 @@
+{
+  "components": {
+    "schemas": {
+      "BootstrapModelSync": {
+        "additionalProperties": false,
+        "description": "Transition live étroite du bootstrap, sans aucune écriture YAML.",
+        "properties": {
+          "action": {
+            "enum": [
+              "activate",
+              "rollback",
+              "confirm"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "digest": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          },
+          "lease_seconds": {
+            "anyOf": [
+              {
+                "maximum": 3600.0,
+                "minimum": 30.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Seconds"
+          },
+          "vram_gb": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vram Gb"
+          }
+        },
+        "required": [
+          "action",
+          "digest"
+        ],
+        "title": "BootstrapModelSync",
+        "type": "object"
+      },
+      "CapacityQueueStatusResponse": {
+        "description": "État de la queue d'admission VRAM locale.",
+        "properties": {
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "max_waiters": {
+            "title": "Max Waiters",
+            "type": "integer"
+          },
+          "timeout_seconds": {
+            "title": "Timeout Seconds",
+            "type": "integer"
+          },
+          "waiters": {
+            "title": "Waiters",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "enabled",
+          "waiters",
+          "max_waiters",
+          "timeout_seconds"
+        ],
+        "title": "CapacityQueueStatusResponse",
+        "type": "object"
+      },
+      "GatewayStatus": {
+        "description": "Statut complet de la gateway — retourné par GET /admin/status.",
+        "properties": {
+          "capacity_queue": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CapacityQueueStatusResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "models": {
+            "items": {
+              "$ref": "#/components/schemas/ModelStatusResponse"
+            },
+            "title": "Models",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "vram_budget": {
+            "$ref": "#/components/schemas/VramBudgetResponse"
+          }
+        },
+        "required": [
+          "status",
+          "vram_budget",
+          "models"
+        ],
+        "title": "GatewayStatus",
+        "type": "object"
+      },
+      "GpuVramMeasurementResponse": {
+        "description": "Résultat de la sonde GPU, y compris l'état ``unavailable``.",
+        "properties": {
+          "cuda_visible_devices": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cuda Visible Devices"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/GpuVramSampleResponse"
+            },
+            "title": "Devices",
+            "type": "array"
+          },
+          "measured_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measured At"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "measured",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "visible_total_mb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visible Total Mb"
+          },
+          "visible_used_mb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visible Used Mb"
+          },
+          "visible_uuids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Visible Uuids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "GpuVramMeasurementResponse",
+        "type": "object"
+      },
+      "GpuVramSampleResponse": {
+        "description": "Mesure d'un GPU local, conservant son identité UUID.",
+        "properties": {
+          "compute_capability": {
+            "default": "",
+            "title": "Compute Capability",
+            "type": "string"
+          },
+          "driver_version": {
+            "default": "",
+            "title": "Driver Version",
+            "type": "string"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          },
+          "memory_total_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Bytes"
+          },
+          "memory_total_mb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Total Mb"
+          },
+          "memory_used_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Used Bytes"
+          },
+          "memory_used_mb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Memory Used Mb"
+          },
+          "mig_mode_current": {
+            "default": "",
+            "title": "Mig Mode Current",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "uuid": {
+            "title": "Uuid",
+            "type": "string"
+          },
+          "visible": {
+            "title": "Visible",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "uuid",
+          "visible"
+        ],
+        "title": "GpuVramSampleResponse",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "KeyCreate": {
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "KeyCreate",
+        "type": "object"
+      },
+      "KeyCreateResponse": {
+        "description": "Retournée une seule fois à la création.\napi_key est la clé brute — après ça, elle est perdue côté serveur.",
+        "properties": {
+          "api_key": {
+            "description": "Clé API brute — à sauvegarder maintenant, non récupérable ensuite.",
+            "title": "Api Key",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "key_prefix": {
+            "title": "Key Prefix",
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "required": [
+          "api_key",
+          "key_prefix",
+          "name",
+          "created_at",
+          "expires_at"
+        ],
+        "title": "KeyCreateResponse",
+        "type": "object"
+      },
+      "KeyResponse": {
+        "description": "Sans la clé brute — pour lister les clés.",
+        "properties": {
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_active": {
+            "title": "Is Active",
+            "type": "boolean"
+          },
+          "key_prefix": {
+            "title": "Key Prefix",
+            "type": "string"
+          },
+          "last_used": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "required": [
+          "id",
+          "key_prefix",
+          "name",
+          "created_at",
+          "last_used",
+          "is_active",
+          "expires_at"
+        ],
+        "title": "KeyResponse",
+        "type": "object"
+      },
+      "LlamaParamsSchema": {
+        "additionalProperties": false,
+        "description": "Paramètres llama-server configurables par modèle.",
+        "properties": {
+          "batch_size": {
+            "default": 4096,
+            "minimum": 1.0,
+            "title": "Batch Size",
+            "type": "integer"
+          },
+          "cache_type_k": {
+            "default": "q8_0",
+            "enum": [
+              "f16",
+              "bf16",
+              "q8_0",
+              "q5_0",
+              "q4_0"
+            ],
+            "title": "Cache Type K",
+            "type": "string"
+          },
+          "cache_type_v": {
+            "default": "q8_0",
+            "enum": [
+              "f16",
+              "bf16",
+              "q8_0",
+              "q5_0",
+              "q4_0"
+            ],
+            "title": "Cache Type V",
+            "type": "string"
+          },
+          "cpu_moe": {
+            "default": false,
+            "title": "Cpu Moe",
+            "type": "boolean"
+          },
+          "ctx_size": {
+            "default": 32768,
+            "minimum": 512.0,
+            "title": "Ctx Size",
+            "type": "integer"
+          },
+          "flash_attn": {
+            "default": true,
+            "title": "Flash Attn",
+            "type": "boolean"
+          },
+          "n_gpu_layers": {
+            "default": 999,
+            "minimum": 0.0,
+            "title": "N Gpu Layers",
+            "type": "integer"
+          },
+          "parallel": {
+            "default": 4,
+            "minimum": 1.0,
+            "title": "Parallel",
+            "type": "integer"
+          },
+          "threads": {
+            "default": 8,
+            "minimum": 1.0,
+            "title": "Threads",
+            "type": "integer"
+          },
+          "threads_http": {
+            "default": 4,
+            "minimum": 1.0,
+            "title": "Threads Http",
+            "type": "integer"
+          },
+          "ubatch_size": {
+            "default": 512,
+            "minimum": 1.0,
+            "title": "Ubatch Size",
+            "type": "integer"
+          }
+        },
+        "title": "LlamaParamsSchema",
+        "type": "object"
+      },
+      "ModelEntryCreate": {
+        "additionalProperties": false,
+        "description": "Corps de requête pour POST /admin/models.",
+        "properties": {
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 200,
+            "title": "Description",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Identifiant unique du modèle (minuscules, chiffres, tirets, points, underscores)",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "llama_params": {
+            "$ref": "#/components/schemas/LlamaParamsSchema"
+          },
+          "load_timeout_seconds": {
+            "anyOf": [
+              {
+                "minimum": 30.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Load Timeout Seconds"
+          },
+          "mmproj_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mmproj Path"
+          },
+          "mmproj_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mmproj Sha256"
+          },
+          "path": {
+            "description": "Chemin absolu vers le fichier .gguf sur le serveur",
+            "title": "Path",
+            "type": "string"
+          },
+          "sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sha256"
+          },
+          "speculative": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeculativeParamsSchema"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vram_gb": {
+            "description": "VRAM estimée en GB (poids + KV cache à charge nominale)",
+            "exclusiveMinimum": 0.0,
+            "title": "Vram Gb",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "vram_gb"
+        ],
+        "title": "ModelEntryCreate",
+        "type": "object"
+      },
+      "ModelEntryUpdate": {
+        "additionalProperties": false,
+        "description": "Corps de requête pour PATCH /admin/models/{model_id}.\n\nllama_params — remplacement complet du bloc (pas de merge partiel).\nSi fourni, le modèle est déchargé et rechargé à la prochaine requête\npour prendre en compte les nouveaux paramètres de lancement.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enabled"
+          },
+          "llama_params": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LlamaParamsSchema"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "vram_gb": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vram Gb"
+          }
+        },
+        "title": "ModelEntryUpdate",
+        "type": "object"
+      },
+      "ModelStatusResponse": {
+        "description": "État live d'un modèle (chargé ou non).",
+        "properties": {
+          "active_requests": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Requests"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Capabilities",
+            "type": "array"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "enabled": {
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "idle_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle Seconds"
+          },
+          "last_load_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Load Seconds"
+          },
+          "llama_params": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llama Params"
+          },
+          "node": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "pid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pid"
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Port"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "uptime_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uptime Seconds"
+          },
+          "vram_gb": {
+            "title": "Vram Gb",
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "description",
+          "enabled",
+          "vram_gb",
+          "capabilities",
+          "state",
+          "path",
+          "pid",
+          "port",
+          "uptime_seconds",
+          "idle_seconds",
+          "llama_params"
+        ],
+        "title": "ModelStatusResponse",
+        "type": "object"
+      },
+      "SpeculativeParamsSchema": {
+        "additionalProperties": false,
+        "description": "Bloc MTP optionnel, avec les mêmes bornes que le registre YAML.",
+        "properties": {
+          "draft_max": {
+            "default": 16,
+            "minimum": 1.0,
+            "title": "Draft Max",
+            "type": "integer"
+          },
+          "draft_min": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Draft Min",
+            "type": "integer"
+          },
+          "draft_p_min": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Draft P Min",
+            "type": "number"
+          },
+          "type": {
+            "const": "mtp",
+            "default": "mtp",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "title": "SpeculativeParamsSchema",
+        "type": "object"
+      },
+      "UsageEntry": {
+        "properties": {
+          "completion_tokens": {
+            "title": "Completion Tokens",
+            "type": "integer"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Ms"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          },
+          "prompt_tokens": {
+            "title": "Prompt Tokens",
+            "type": "integer"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "status_code": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Code"
+          },
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "string"
+          },
+          "total_tokens": {
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "timestamp",
+          "username",
+          "model",
+          "prompt_tokens",
+          "completion_tokens",
+          "total_tokens",
+          "duration_ms",
+          "status_code",
+          "request_id"
+        ],
+        "title": "UsageEntry",
+        "type": "object"
+      },
+      "UsageSummaryEntry": {
+        "properties": {
+          "avg_duration_ms": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Duration Ms"
+          },
+          "first_request": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Request"
+          },
+          "last_request": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Request"
+          },
+          "request_count": {
+            "title": "Request Count",
+            "type": "integer"
+          },
+          "total_completion_tokens": {
+            "title": "Total Completion Tokens",
+            "type": "integer"
+          },
+          "total_prompt_tokens": {
+            "title": "Total Prompt Tokens",
+            "type": "integer"
+          },
+          "total_tokens": {
+            "title": "Total Tokens",
+            "type": "integer"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "request_count",
+          "total_prompt_tokens",
+          "total_completion_tokens",
+          "total_tokens",
+          "avg_duration_ms",
+          "first_request",
+          "last_request"
+        ],
+        "title": "UsageSummaryEntry",
+        "type": "object"
+      },
+      "UserAnonymizeResponse": {
+        "description": "Réponse de `DELETE /admin/users/{username}`.\n\nLa route porte le verbe `DELETE` pour compatibilité, mais son effet est une\nanonymisation irréversible : ce corps de réponse énumère explicitement ce qui\nest effacé et ce qui est conservé, pour qu'aucun opérateur ne puisse croire à\nune suppression de ligne.",
+        "properties": {
+          "anonymized_at": {
+            "title": "Anonymized At",
+            "type": "string"
+          },
+          "anonymized_username": {
+            "description": "Pseudonyme stable qui remplace le nom d'utilisateur effacé.",
+            "title": "Anonymized Username",
+            "type": "string"
+          },
+          "erased_fields": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Erased Fields",
+            "type": "array"
+          },
+          "keys_revoked": {
+            "description": "Clés encore actives révoquées par cet appel.",
+            "title": "Keys Revoked",
+            "type": "integer"
+          },
+          "keys_total": {
+            "description": "Clés attachées au compte, toutes révoquées.",
+            "title": "Keys Total",
+            "type": "integer"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "retained": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Retained",
+            "type": "array"
+          },
+          "status": {
+            "enum": [
+              "anonymized",
+              "already_anonymized"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "message",
+          "user_id",
+          "anonymized_username",
+          "anonymized_at",
+          "keys_revoked",
+          "keys_total",
+          "erased_fields",
+          "retained"
+        ],
+        "title": "UserAnonymizeResponse",
+        "type": "object"
+      },
+      "UserCreate": {
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "monthly_token_limit": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monthly Token Limit"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          },
+          "rpm_limit": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rpm Limit"
+          },
+          "username": {
+            "maxLength": 64,
+            "minLength": 2,
+            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username"
+        ],
+        "title": "UserCreate",
+        "type": "object"
+      },
+      "UserResponse": {
+        "properties": {
+          "anonymized_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Anonymized At"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_active": {
+            "title": "Is Active",
+            "type": "boolean"
+          },
+          "monthly_token_limit": {
+            "title": "Monthly Token Limit",
+            "type": "integer"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          },
+          "rpm_limit": {
+            "title": "Rpm Limit",
+            "type": "integer"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username",
+          "email",
+          "created_at",
+          "is_active",
+          "rpm_limit",
+          "monthly_token_limit",
+          "notes"
+        ],
+        "title": "UserResponse",
+        "type": "object"
+      },
+      "UserUpdate": {
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "is_active": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Active"
+          },
+          "monthly_token_limit": {
+            "anyOf": [
+              {
+                "maximum": 9.223372036854776e+18,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Monthly Token Limit"
+          },
+          "notes": {
+            "anyOf": [
+              {
+                "maxLength": 500,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Notes"
+          },
+          "rpm_limit": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rpm Limit"
+          }
+        },
+        "title": "UserUpdate",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VramBudgetResponse": {
+        "description": "Budget VRAM global de la gateway — commun aux modes local et cluster.\n\nSeuls `total_gb`, `used_gb` et `available_gb` ont un sens dans les deux\nmodes et restent donc obligatoires.\n\n- `overhead_gb` / `budget_net_gb` : toujours fournis (config de l'hôte en\n  local, agrégation des nœuds ONLINE en cluster). Optionnels au niveau du\n  schéma pour qu'un manager dégradé produise un statut partiel plutôt\n  qu'une ResponseValidationError (→ 500) sur une route d'observabilité.\n- `safety_margin` : ratio de configuration mono-hôte. Absent en cluster, où\n  la réserve des nœuds est déjà agrégée en GB dans `overhead_gb`.\n- `nodes` / `nodes_online` : cluster uniquement.\n- `gpu_measurement` : état et inventaire par UUID de la dernière sonde\n  locale. Le statut `unavailable` est conservé explicitement ; les agrégats\n  ne comptent que les UUID exposés par `CUDA_VISIBLE_DEVICES`.\n- `gpu_used_mb_measured` / `vram_drift_mb` : compatibilité locale, seulement\n  si une sonde nvidia-smi a réussi.",
+        "properties": {
+          "available_gb": {
+            "title": "Available Gb",
+            "type": "number"
+          },
+          "budget_net_gb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Net Gb"
+          },
+          "gpu_measurement": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GpuVramMeasurementResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gpu_used_mb_measured": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gpu Used Mb Measured"
+          },
+          "nodes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nodes"
+          },
+          "nodes_online": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nodes Online"
+          },
+          "overhead_gb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Overhead Gb"
+          },
+          "safety_margin": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Safety Margin"
+          },
+          "total_gb": {
+            "title": "Total Gb",
+            "type": "number"
+          },
+          "used_gb": {
+            "title": "Used Gb",
+            "type": "number"
+          },
+          "vram_drift_mb": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vram Drift Mb"
+          }
+        },
+        "required": [
+          "total_gb",
+          "used_gb",
+          "available_gb"
+        ],
+        "title": "VramBudgetResponse",
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "Inference gateway souverain du cluster EVA (hébergé à l'UPPA). Compatible API OpenAI. Multi-modèles avec gestion VRAM automatique. Accès réservé aux membres authentifiés.",
+    "title": "LLM Inference Gateway UPPA",
+    "version": "2.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/admin/cluster": {
+      "get": {
+        "description": "État de chaque nœud du cluster (uniquement en CLUSTER_MODE=cluster).\nRetourne 200 avec cluster_mode=local et une liste vide en mode mono-nœud.",
+        "operationId": "cluster_status_admin_cluster_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cluster Status Admin Cluster Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Cluster Status",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/keys/{key_prefix}": {
+      "delete": {
+        "description": "Révoque une clé API par son préfixe (ex: 'llmgw-abc12345').\nLa révocation est immédiate — la prochaine requête avec cette clé recevra un 401.",
+        "operationId": "revoke_key_admin_keys__key_prefix__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "key_prefix",
+            "required": true,
+            "schema": {
+              "title": "Key Prefix",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Revoke Key Admin Keys  Key Prefix  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Revoke Key",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/metrics/llama": {
+      "get": {
+        "description": "Métriques temps réel de llama-server (format Prometheus → JSON).\nInterroge tous les modèles actuellement chargés (état READY).\nRetourne {} si aucun modèle n'est chargé ou en cas d'erreur.\n\nEn mode cluster, l'agrégation est déléguée au ClusterManager et les entrées\nportent un champ \"node\" (node_id) — {} si l'agrégation n'est pas disponible.\n\nMétriques clés exposées par modèle :\n  llamacpp:kv_cache_usage_ratio   — occupation du cache KV (0–1)\n  llamacpp:requests_processing    — requêtes en cours d'inférence\n  llamacpp:requests_deferred      — requêtes en attente de slot\n  llamacpp:tokens_per_second      — vitesse de génération (tokens/s)\n  llamacpp:prompt_tokens_total    — tokens prompt traités depuis démarrage\n  llamacpp:tokens_predicted_total — tokens générés depuis démarrage",
+        "operationId": "metrics_llama_admin_metrics_llama_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Metrics Llama Admin Metrics Llama Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Metrics Llama",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/admin/metrics/overview": {
+      "get": {
+        "description": "KPIs principaux : requêtes aujourd'hui, tokens, latence, erreurs,\nutilisateurs actifs, statut du modèle.",
+        "operationId": "metrics_overview_admin_metrics_overview_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Metrics Overview Admin Metrics Overview Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Metrics Overview",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/admin/metrics/prometheus": {
+      "get": {
+        "description": "Exposition au format texte Prometheus (version 0.0.4), généré à la main.\n\nAdditif : ne remplace PAS les endpoints JSON existants. Robuste par\nconstruction — chaque source indisponible (aucun modèle, pas de nvidia-smi,\nmode cluster, DB vide) est silencieusement omise ou émise à 0, jamais 500.\nNe divulgue AUCUN contenu de prompt (seulement des compteurs agrégés).",
+        "operationId": "metrics_prometheus_admin_metrics_prometheus_get",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Metrics Prometheus",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/admin/metrics/status-codes": {
+      "get": {
+        "description": "Distribution des codes de statut HTTP sur la période.",
+        "operationId": "metrics_status_codes_admin_metrics_status_codes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": "24h",
+              "enum": [
+                "24h",
+                "7d",
+                "30d"
+              ],
+              "title": "Period",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Metrics Status Codes Admin Metrics Status Codes Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Metrics Status Codes",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/admin/metrics/timeseries": {
+      "get": {
+        "description": "Série temporelle des requêtes et tokens.\n- period=24h  → buckets horaires sur 24h\n- period=7d   → buckets journaliers sur 7 jours\n- period=30d  → buckets journaliers sur 30 jours",
+        "operationId": "metrics_timeseries_admin_metrics_timeseries_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": "24h",
+              "enum": [
+                "24h",
+                "7d",
+                "30d"
+              ],
+              "title": "Period",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Metrics Timeseries Admin Metrics Timeseries Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Metrics Timeseries",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/admin/metrics/users": {
+      "get": {
+        "description": "Statistiques par utilisateur avec consommation quota.",
+        "operationId": "metrics_users_admin_metrics_users_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "period",
+            "required": false,
+            "schema": {
+              "default": "30d",
+              "enum": [
+                "7d",
+                "30d",
+                "90d"
+              ],
+              "title": "Period",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Metrics Users Admin Metrics Users Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Metrics Users",
+        "tags": [
+          "metrics"
+        ]
+      }
+    },
+    "/admin/models": {
+      "get": {
+        "description": "Liste tous les modèles du registre avec leur état live (chargé / déchargé).",
+        "operationId": "list_models_admin_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ModelStatusResponse"
+                  },
+                  "title": "Response List Models Admin Models Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Models",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Enregistre un nouveau modèle dans le registre.\n\nValidations de sécurité :\n- path doit être absolu et pointer vers un fichier .gguf\n- path doit être sous un répertoire autorisé (si ALLOWED_MODEL_DIRS est configuré)\n- En local, le fichier .gguf doit exister sur la gateway\n- En cluster, son existence est validée par chaque node-agent au chargement\n- vram_gb doit tenir sur au moins un hôte d'inférence connu\n- Le modèle n'est PAS chargé automatiquement après enregistrement",
+        "operationId": "register_model_admin_models_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelEntryCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Register Model",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/models/{model_id}": {
+      "delete": {
+        "description": "Supprime un modèle du registre.\nLe modèle doit être déchargé au préalable (ou sera déchargé automatiquement).\n\nRefusé en 409 si le modèle traite encore des requêtes après le drain : dans\nce cas le modèle reste dans le registre et continue de servir.",
+        "operationId": "delete_model_admin_models__model_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Interrompre les requêtes actives au lieu de refuser en 409. À n'utiliser que sur décision explicite de l'opérateur.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Interrompre les requêtes actives au lieu de refuser en 409. À n'utiliser que sur décision explicite de l'opérateur.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Delete Model Admin Models  Model Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Model",
+        "tags": [
+          "admin"
+        ]
+      },
+      "patch": {
+        "description": "Met à jour les métadonnées d'un modèle (enabled, vram_gb, description, llama_params).\n\nllama_params — remplacement complet. Si fourni, le modèle chargé est déchargé\npour que la prochaine requête le relance avec les nouveaux paramètres.\nCela permet de corriger cpu_moe, ctx_size, parallel, etc. sans redémarrer la gateway.\n\nenabled=false — décharge le modèle.\n\nCes deux cas déchargent le modèle : ils sont donc refusés en 409 si des\nrequêtes sont encore actives après le drain, et le registre n'est alors PAS\nmodifié (jamais de `enabled: false` persisté sur un modèle qui sert encore).",
+        "operationId": "update_model_admin_models__model_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Interrompre les requêtes actives au lieu de refuser en 409. À n'utiliser que sur décision explicite de l'opérateur.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Interrompre les requêtes actives au lieu de refuser en 409. À n'utiliser que sur décision explicite de l'opérateur.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelEntryUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update Model",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/models/{model_id}/bootstrap-sync": {
+      "post": {
+        "description": "Synchronise l'activation live provisoire du bootstrap, sans écrire le YAML.\n\nCette machine d'état est strictement mono-worker : l'activation provisoire,\nson lock et sa lease vivent dans la mémoire du processus. Les unités systemd\nofficielles lancent donc uvicorn avec ``--workers 1``. Un crash gateway reste\nfail-closed, car le disque conserve ``enabled: false`` jusqu'à ``confirm``.",
+        "operationId": "bootstrap_sync_model_admin_models__model_id__bootstrap_sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BootstrapModelSync"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Bootstrap Sync Model Admin Models  Model Id  Bootstrap Sync Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Bootstrap Sync Model",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/models/{model_id}/load": {
+      "post": {
+        "description": "Pré-charge un modèle en mémoire (warm-up).\nUtile pour éviter la latence de cold-start sur la première requête.\nÉvinçe un modèle LRU si le budget VRAM est dépassé.",
+        "operationId": "load_model_admin_models__model_id__load_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Load Model Admin Models  Model Id  Load Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Load Model",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/models/{model_id}/unload": {
+      "post": {
+        "description": "Décharge un modèle spécifique et libère sa VRAM.\nSans effet si le modèle n'est pas chargé.\n\nLe modèle est mis en quarantaine (plus aucune nouvelle requête admise) puis\ndrainé pendant `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS`. S'il traite encore des\nrequêtes à l'expiration, la route répond 409 et le modèle reste chargé et\nutilisable — aucune génération n'est interrompue en silence.",
+        "operationId": "unload_model_admin_models__model_id__unload_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Interrompre les requêtes actives au lieu de refuser en 409. À n'utiliser que sur décision explicite de l'opérateur.",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Interrompre les requêtes actives au lieu de refuser en 409. À n'utiliser que sur décision explicite de l'opérateur.",
+              "title": "Force",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unload Model Admin Models  Model Id  Unload Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Unload Model",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/status": {
+      "get": {
+        "description": "État complet de la gateway : budget VRAM + état de chaque modèle.",
+        "operationId": "get_status_admin_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GatewayStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Status",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/unload": {
+      "post": {
+        "description": "Décharge tous les modèles sans arrêter le gestionnaire d'inférence.\n\nRefusé en 409 si une génération est encore active après le drain — aucun\nmodèle n'est déchargé dans ce cas. Il n'y a pas de forçage global : utiliser\nPOST /admin/models/{id}/unload?force=true modèle par modèle.",
+        "operationId": "unload_all_admin_unload_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Unload All Admin Unload Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Unload All",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/usage": {
+      "get": {
+        "description": "Journal d'usage détaillé (une ligne par requête).",
+        "operationId": "get_usage_admin_usage_get",
+        "parameters": [
+          {
+            "description": "Filtrer par utilisateur",
+            "in": "query",
+            "name": "username",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filtrer par utilisateur",
+              "title": "Username"
+            }
+          },
+          {
+            "description": "Date de début ISO 8601 (ex: 2025-01-01)",
+            "in": "query",
+            "name": "from_date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Date de début ISO 8601 (ex: 2025-01-01)",
+              "title": "From Date"
+            }
+          },
+          {
+            "description": "Date de fin ISO 8601 (ex: 2025-01-31)",
+            "in": "query",
+            "name": "to_date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Date de fin ISO 8601 (ex: 2025-01-31)",
+              "title": "To Date"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 10000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/UsageEntry"
+                  },
+                  "title": "Response Get Usage Admin Usage Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Usage",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/usage/summary": {
+      "get": {
+        "description": "Résumé agrégé par utilisateur — idéal pour le reporting mensuel.",
+        "operationId": "get_usage_summary_admin_usage_summary_get",
+        "parameters": [
+          {
+            "description": "Date de début ISO 8601",
+            "in": "query",
+            "name": "from_date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Date de début ISO 8601",
+              "title": "From Date"
+            }
+          },
+          {
+            "description": "Date de fin ISO 8601",
+            "in": "query",
+            "name": "to_date",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Date de fin ISO 8601",
+              "title": "To Date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/UsageSummaryEntry"
+                  },
+                  "title": "Response Get Usage Summary Admin Usage Summary Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Usage Summary",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users": {
+      "get": {
+        "description": "Liste tous les utilisateurs.",
+        "operationId": "list_users_admin_users_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/UserResponse"
+                  },
+                  "title": "Response List Users Admin Users Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Users",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Crée un nouvel utilisateur.",
+        "operationId": "create_user_admin_users_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create User",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/{username}": {
+      "delete": {
+        "description": "Anonymise un utilisateur — **irréversible**. Chemin du droit à l'effacement.\n\nLa route conserve le verbe `DELETE` et son chemin pour ne pas casser les\nscripts opérateur existants, mais son effet est une ANONYMISATION, pas une\nsuppression de ligne (politique DEC-001) :\n\n- effacé   : `username` (remplacé par un pseudonyme stable), `email`,\n  `notes`, et le champ libre `name` de chaque clé API ;\n- conservé : la ligne `users` (`id`, `created_at`) et tout l'historique\n  `usage_log`, pour que la facturation et l'audit restent exploitables ;\n- le compte est désactivé et **toutes** ses clés sont révoquées.\n\nUn `DELETE` réel était impossible : `usage_log.user_id` n'a pas de\n`ON DELETE CASCADE`, la route répondait donc 500 pour tout utilisateur ayant\nservi au moins une requête (COR-002).\n\nIdempotente : un second appel répond 200 sans réécrire l'horodatage initial.",
+        "operationId": "anonymize_user_admin_users__username__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserAnonymizeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Anonymiser un utilisateur (droit à l'effacement RGPD)",
+        "tags": [
+          "admin"
+        ]
+      },
+      "get": {
+        "operationId": "get_user_admin_users__username__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get User",
+        "tags": [
+          "admin"
+        ]
+      },
+      "patch": {
+        "description": "Modifie un utilisateur (activation/désactivation, RPM, quota, etc.).",
+        "operationId": "update_user_admin_users__username__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Update User",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/admin/users/{username}/keys": {
+      "get": {
+        "description": "Liste les clés d'un utilisateur (sans la valeur brute).",
+        "operationId": "list_keys_admin_users__username__keys_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/KeyResponse"
+                  },
+                  "title": "Response List Keys Admin Users  Username  Keys Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Keys",
+        "tags": [
+          "admin"
+        ]
+      },
+      "post": {
+        "description": "Génère une nouvelle clé API pour l'utilisateur.\nLa clé brute est retournée UNE SEULE FOIS — impossible de la récupérer ensuite.",
+        "operationId": "create_key_admin_users__username__keys_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "username",
+            "required": true,
+            "schema": {
+              "title": "Username",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeyCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeyCreateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Create Key",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/completion": {
+      "post": {
+        "description": "Endpoint natif llama.cpp. Prend un champ 'prompt' (string) au lieu de 'messages'.\nTous les paramètres de sampling avancés sont supportés sans configuration particulière :\nmirostat, dry_multiplier, dry_base, xtc_*, repeat_last_n, repeat_penalty, ignore_eos, etc.\nUtile pour les scripts llama.cpp existants ou les cas sans chat template.",
+        "operationId": "raw_completion_completion_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Raw Completion"
+      }
+    },
+    "/v1/capacity": {
+      "get": {
+        "description": "État minimal de la queue d'admission VRAM.\n\nRoute authentifiée par clé API utilisateur. Ne révèle ni VRAM détaillée,\nni modèles chargés, ni chemins fichiers : seulement l'état exploitable par\nune application cliente pour afficher attente/saturation et gérer Retry-After.",
+        "operationId": "capacity_status_v1_capacity_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Capacity Status"
+      }
+    },
+    "/v1/chat/completions": {
+      "post": {
+        "description": "Chat completions — compatible OpenAI.\nSupporte le streaming SSE (stream: true) et le mode classique.\nLe modèle est sélectionné via le champ \"model\" du body JSON.\nChargé automatiquement si nécessaire, avec éviction LRU si besoin de VRAM.",
+        "operationId": "chat_completions_v1_chat_completions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Chat Completions"
+      }
+    },
+    "/v1/completion": {
+      "post": {
+        "description": "Endpoint natif llama.cpp. Prend un champ 'prompt' (string) au lieu de 'messages'.\nTous les paramètres de sampling avancés sont supportés sans configuration particulière :\nmirostat, dry_multiplier, dry_base, xtc_*, repeat_last_n, repeat_penalty, ignore_eos, etc.\nUtile pour les scripts llama.cpp existants ou les cas sans chat template.",
+        "operationId": "raw_completion_v1_completion_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Raw Completion"
+      }
+    },
+    "/v1/completions": {
+      "post": {
+        "description": "Legacy text completions — compatible OpenAI.",
+        "operationId": "completions_v1_completions_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Completions"
+      }
+    },
+    "/v1/detokenize": {
+      "post": {
+        "description": "Reconstruit du texte depuis des token IDs. Body: {\"model\": \"...\", \"tokens\": [...]}",
+        "operationId": "detokenize_v1_detokenize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Detokenize"
+      }
+    },
+    "/v1/models": {
+      "get": {
+        "description": "Liste les modèles disponibles — compatible openai.models.list().",
+        "operationId": "list_models_v1_models_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Models"
+      }
+    },
+    "/v1/tokenize": {
+      "post": {
+        "description": "Tokenise un texte — retourne les token IDs. Body: {\"model\": \"...\", \"content\": \"...\"}",
+        "operationId": "tokenize_v1_tokenize_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Tokenize"
+      }
+    }
+  }
+}

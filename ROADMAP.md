@@ -182,7 +182,18 @@ comme une nouvelle forêt d’issues :
 | `OPS-001` | Profils matériels officiellement supportés | GPU/énergie |
 | `OPS-002` | Exercice de restauration off-host et rétention des backups | Lifecycle |
 | `OPS-003` | Releases immuables et rollback vérifiable | Lifecycle |
-| `OPS-004` | Request ID propagé et corrélé aux métriques | Observabilité |
+| `OPS-004` ✅ | Request ID propagé (réponse, journal d'accès, `usage_log`, backend) | Observabilité |
+
+`OPS-004` est livré avec une réserve explicite : l'identifiant de requête
+n'est **pas** ajouté aux labels Prometheus, contrairement à ce que suggérait
+l'intitulé « corrélé aux métriques ». Un label par requête est une cardinalité
+non bornée, et Prometheus n'est pas un journal. La corrélation passe par
+l'en-tête `X-Request-Id`, le journal d'accès et `usage_log.request_id` ; voir
+`docs/observability.md` § 6.
+
+Le contrat OpenAPI est désormais versionné dans `docs/openapi.json` et
+comparé en CI : une route, un champ ou une enveloppe d'erreur ne peuvent plus
+changer sans que le diff du contrat apparaisse dans la revue.
 
 ### Compléments cluster à ne pas perdre
 
