@@ -39,6 +39,7 @@ from proxy import (
 )
 from rate_limiter import check_rate_limit
 from readiness import caller_is_privileged, evaluate_readiness
+from request_context import REQUEST_ID_HEADER, resolve_request_id, set_request_id
 
 # Alias conservé pour les intégrations et tests qui instrumentaient l'ancien
 # point d'entrée de l'attestation du GGUF principal. Le comportement inclut
@@ -463,18 +464,35 @@ _DASHBOARD_SECURITY_HEADERS = {
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    """
+    Journal d'accès de la gateway et propagation de l'identifiant de requête.
+
+    L'identifiant est posé ICI, avant toute route : il couvre aussi les routes
+    admin et les réponses d'erreur, qui ne passent pas par `proxy_request`. Il
+    repart systématiquement dans l'en-tête de réponse, y compris sur une
+    erreur — c'est précisément le cas où l'utilisateur a besoin de pouvoir
+    citer un identifiant.
+    """
+    request_id = resolve_request_id(request.headers.get(REQUEST_ID_HEADER))
+    set_request_id(request_id)
+
     start = time.monotonic()
     response = await call_next(request)
     duration_ms = int((time.monotonic() - start) * 1000)
 
+    # Posé avant le retour : le corps n'est pas encore parti, y compris pour
+    # une StreamingResponse dont le générateur n'a pas encore démarré.
+    response.headers[REQUEST_ID_HEADER] = request_id
+
     _silent = ("/health", "/v1/models")
     if not request.url.path.startswith("/admin/metrics") and request.url.path not in _silent:
         log.info(
-            "%s %s %d %dms",
+            "%s %s %d %dms rid=%s",
             request.method,
             _redact_target(request.url.path),
             response.status_code,
             duration_ms,
+            request_id,
         )
     return response
 

@@ -38,7 +38,6 @@ import inspect
 import json
 import logging
 import time
-import uuid
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import AsyncGenerator, Callable
@@ -52,6 +51,7 @@ import database as db
 from background import fire_and_forget
 from config import settings
 from model_manager import CapacityQueueFull, CapacityQueueTimeout, ModelManager
+from request_context import REQUEST_ID_HEADER, current_or_new_request_id
 from server_manager import ServerManager
 from telemetry import TTFT_SECONDS
 
@@ -165,10 +165,26 @@ class _OpenedStream:
     response: httpx.Response
 
 
+def _upstream_headers(manager: ServerManager, request_id: str) -> dict[str, str]:
+    """
+    En-têtes de la requête gateway → llama-server.
+
+    L'identifiant de requête est transmis au backend pour que ses propres
+    journaux soient corrélables à ceux de la gateway pendant un incident. Il
+    est déjà validé par `request_context.sanitize_request_id` (jeu de
+    caractères borné), donc il ne peut pas forger d'en-tête supplémentaire.
+    """
+    headers = dict(manager.auth_headers())
+    if request_id:
+        headers[REQUEST_ID_HEADER] = request_id
+    return headers
+
+
 async def _open_upstream_stream(
     manager: ServerManager,
     path: str,
     json_body: dict,
+    request_id: str = "",
 ) -> _OpenedStream:
     """
     Ouvre le stream upstream sans consommer le corps : on entre dans le
@@ -181,7 +197,7 @@ async def _open_upstream_stream(
         "POST",
         manager.llama_url(path),
         json=json_body,
-        headers=manager.auth_headers(),
+        headers=_upstream_headers(manager, request_id),
     )
     response = await ctx.__aenter__()
     return _OpenedStream(ctx=ctx, response=response)
@@ -344,7 +360,11 @@ async def proxy_request(
             if key not in ("stream", "stream_options")
         }
 
-    request_id = str(uuid.uuid4())
+    # Identifiant posé par le middleware HTTP (OPS-004) : c'est celui que le
+    # client a reçu dans `X-Request-Id` et celui que le journal d'accès a
+    # écrit. Le tirer à nouveau ici donnerait trois identifiants différents
+    # pour une seule requête. Le repli couvre les appels directs en test.
+    request_id = current_or_new_request_id()
     start_time = time.monotonic()
 
     if is_streaming:
@@ -398,7 +418,9 @@ async def proxy_request(
         body_with_usage = {**body, "stream_options": {"include_usage": True}}
 
         try:
-            opened = await _open_upstream_stream(manager, path, body_with_usage)
+            opened = await _open_upstream_stream(
+                manager, path, body_with_usage, request_id
+            )
         except httpx.TimeoutException:
             _release_stream_guard()
             await _report_backend_failure(manager)
@@ -552,7 +574,7 @@ async def _non_stream_proxy(
         response = await client.post(
             manager.llama_url(path),
             json=body,
-            headers=manager.auth_headers(),
+            headers=_upstream_headers(manager, request_id),
         )
     except httpx.TimeoutException:
         await _report_backend_failure(manager)

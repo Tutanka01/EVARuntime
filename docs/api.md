@@ -12,6 +12,13 @@ en changeant uniquement l'URL de base et la clé d'authentification.
 > est défini par l'administrateur du service (voir
 > [section 1](#1-obtenir-une-clé-api)).
 
+Le contrat machine correspondant est versionné dans
+[`docs/openapi.json`](openapi.json) (OpenAPI 3.1). Il décrit les routes, les
+corps acceptés et les enveloppes d'erreur, et sert à générer un client. La
+gateway ne sert pas ce schéma en ligne : la forme des routes `/admin/*` n'a pas
+à être publiée à tout porteur de clé. Un test de CI échoue si le fichier ne
+correspond plus au code, donc il reflète la version déployée.
+
 ---
 
 ## Table des matières
@@ -1265,7 +1272,7 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
 | `503` | `server_error` | Queue VRAM pleine/expirée, modèle impossible à charger ou backend temporairement indisponible | Respecter `Retry-After` si présent, sinon attendre 30 à 90 s |
 | `504` | `server_error` | Timeout de génération | Réduire `max_tokens` ou simplifier le prompt |
 | `502` | `server_error` | Moteur d'inférence injoignable | Transitoire — réessayer dans 30 s |
-| `500` | `server_error` | Erreur interne inattendue | Contacter l'admin avec l'heure et le contexte |
+| `500` | `server_error` | Erreur interne inattendue | Contacter l'admin avec le `X-Request-Id` de la réponse (voir ci-dessous) |
 
 ### Format des erreurs
 
@@ -1287,6 +1294,39 @@ Toutes les erreurs suivent le format OpenAI standard :
 > message générique identifiant le modèle ; le détail technique complet reste
 > dans les journaux serveur (corrélation avec l'`request_id` du journal
 > d'usage).
+
+### Identifier une requête — `X-Request-Id`
+
+Chaque réponse porte un en-tête `X-Request-Id`, succès comme erreur. C'est
+l'identifiant à citer lors d'un signalement : l'administrateur le retrouve
+dans le journal d'accès de la gateway et dans l'historique d'usage, sans avoir
+besoin de l'heure exacte ni du contenu du prompt.
+
+```bash
+curl -s -D - -o /dev/null https://gateway.example.com/v1/models \
+  -H "Authorization: Bearer $EVA_API_KEY" | grep -i x-request-id
+# x-request-id: 3f0c1f6e-7b1a-4c2e-9a3d-0b5e8f1d2c34
+```
+
+Vous pouvez fournir votre propre identifiant pour le faire correspondre à vos
+traces applicatives : envoyez `X-Request-Id` dans la requête, il est repris tel
+quel dans la réponse, dans les journaux et dans l'historique d'usage.
+
+```python
+response = client.chat.completions.with_raw_response.create(
+    model="qwen3.5-9b-q5_k_m",
+    messages=[{"role": "user", "content": "Bonjour"}],
+    extra_headers={"X-Request-Id": "commande-4815"},
+)
+print(response.headers["x-request-id"])   # commande-4815
+```
+
+Contraintes : au plus 64 caractères, parmi `A-Z a-z 0-9 . _ : -`. Un
+identifiant qui ne respecte pas ces règles n'est pas refusé — la requête est
+servie normalement — mais il est **remplacé** par un identifiant généré, jamais
+tronqué ni nettoyé en partie. Un identifiant modifié silencieusement ne
+correspondrait plus à celui que votre application conserve, ce qui est pire
+qu'un identifiant franchement différent.
 
 ### Gestion des erreurs avec openai-python
 

@@ -31,6 +31,12 @@ jobs:
       - name: Lint (ruff)
         run: cd gateway && ruff check .
 
+      # Le schéma OpenAPI versionné (docs/openapi.json) doit suivre les routes.
+      # Étape dédiée plutôt que seulement le test pytest équivalent : un échec
+      # de contrat se lit directement dans la liste des checks.
+      - name: Check OpenAPI contract
+        run: python scripts/export_openapi.py --check
+
       - name: Test (pytest)
         run: cd gateway && python -m pytest tests -v
 

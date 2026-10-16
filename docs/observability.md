@@ -18,6 +18,7 @@ reste. Rien n'oblige à déployer une pile observabilité complète.
 3. [Scraping local (Prometheus mono-binaire)](#3-scraping-local-prometheus-mono-binaire)
 4. [Métriques par nœud (mode cluster)](#4-métriques-par-nœud-mode-cluster)
 5. [Règles d'alerte pragmatiques](#5-règles-dalerte-pragmatiques)
+6. [Corréler une requête — `X-Request-Id`](#6-corréler-une-requête--x-request-id)
 
 ---
 
@@ -418,3 +419,45 @@ eva_request_latency_seconds{quantile="0.95"} > 30
 Une latence élevée peut simplement refléter des chargements de modèles à froid
 (première requête) ou une file d'admission active ; corréler avec
 `eva_models_loaded` et `eva_llama_requests_deferred`.
+
+---
+
+## 6. Corréler une requête — `X-Request-Id`
+
+Un identifiant unique est attribué à chaque requête HTTP et apparaît aux trois
+endroits utiles pendant un incident :
+
+| Où | Forme |
+|---|---|
+| Réponse au client | en-tête `X-Request-Id`, y compris sur une erreur |
+| Journal d'accès de la gateway | suffixe `rid=<identifiant>` sur la ligne de la requête |
+| Historique d'usage | colonne `usage_log.request_id` |
+
+Un client peut fournir son propre `X-Request-Id` pour le faire correspondre à
+ses traces applicatives ; il est repris tel quel s'il respecte les contraintes
+(≤ 64 caractères, `A-Z a-z 0-9 . _ : -`) et remplacé par un identifiant généré
+sinon. La valeur n'est jamais tronquée ni nettoyée en partie : un identifiant
+modifié silencieusement ne correspondrait plus à celui que l'appelant conserve.
+
+Ce filtrage n'est pas cosmétique. La valeur atterrit dans journald et en base :
+un retour chariot permettrait de forger une fausse ligne de journal, et une
+longueur arbitraire amplifierait le stockage. C'est la même logique que la
+rédaction des chemins par `main._redact_path()`.
+
+L'identifiant est aussi transmis au backend `llama-server` dans la requête
+interne, pour que ses journaux soient rattachables aux mêmes requêtes.
+
+Depuis un signalement utilisateur :
+
+```bash
+# 1. La ligne de journal de la requête
+journalctl -u llm-gateway --since "-2h" | grep 'rid=commande-4815'
+
+# 2. La ligne d'usage correspondante (identité technique, jamais le username)
+sqlite3 /var/lib/llm-gateway/gateway.db \
+  "SELECT timestamp, user_id, model, status_code, duration_ms
+     FROM usage_log WHERE request_id = 'commande-4815';"
+```
+
+Les métriques, elles, ne portent **jamais** l'identifiant de requête : ce
+serait un label à cardinalité non bornée, et Prometheus n'est pas un journal.
