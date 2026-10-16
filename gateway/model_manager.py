@@ -181,6 +181,10 @@ class LocalModelManager:
             settings.base_llama_port + settings.max_loaded_models,
         ))
 
+        # Modèles always-on : chargés au démarrage, exempt d'idle timeout,
+        # rechargés automatiquement quand un autre modèle se décharge pour inactivité.
+        self._always_on: set[str] = set(settings.always_on_models) if settings.always_on_models else set()
+
         self._capacity_cond = asyncio.Condition()
         self._capacity_waiters: deque[object] = deque()
         self._model_locks: dict[str, asyncio.Lock] = {}
@@ -284,6 +288,7 @@ class LocalModelManager:
                         port=port,
                         on_unload=self._on_model_unloaded,
                         on_capacity_change=self._notify_capacity_changed,
+                        idle_unload_enabled=model.id not in self._always_on,
                     )
                     self._managers[model_id] = manager
                     log.info(
@@ -553,13 +558,52 @@ class LocalModelManager:
 
     # ── Callback de déchargement ──────────────────────────────────────────────
 
-    def _on_model_unloaded(self, model_id: str) -> None:
+    def _on_model_unloaded(self, model_id: str, reason: str = "manual") -> None:
         if model_id in self._allocated_ports:
             port = self._allocated_ports.pop(model_id)
             self._port_pool.append(port)
             log.debug("Port %d libéré et retourné au pool (modèle '%s')", port, model_id)
         self._managers.pop(model_id, None)
+
+        # Si un modèle se décharge pour inactivité, recharger les always-on qui ne le sont pas.
+        if reason == "idle" and self._always_on:
+            asyncio.create_task(self._reload_always_on_models())
+
         self._notify_capacity_changed()
+
+    async def _reload_always_on_models(self) -> None:
+        """Recharge les modèles always-on qui ne sont plus chargés."""
+        for model_id in list(self._always_on):
+            if not self.is_model_loaded(model_id):
+                log.info(
+                    "Modèle '%s' dans ALWAYS_ON_MODELS — rechargement automatique",
+                    model_id,
+                )
+                try:
+                    await self.ensure_model_loaded(model_id)
+                except Exception as exc:
+                    log.error(
+                        "Échec du rechargement automatique de '%s' : %s",
+                        model_id, exc,
+                    )
+
+    async def load_always_on_models(self) -> None:
+        """Charge les modèles always-on au démarrage."""
+        if not self._always_on:
+            return
+
+        for model_id in list(self._always_on):
+            log.info(
+                "Chargement automatique du modèle '%s' (ALWAYS_ON_MODELS)",
+                model_id,
+            )
+            try:
+                await self.ensure_model_loaded(model_id)
+            except Exception as exc:
+                log.error(
+                    "Échec du chargement initial de '%s' dans ALWAYS_ON_MODELS : %s",
+                    model_id, exc,
+                )
 
     def _notify_capacity_changed(self) -> None:
         try:

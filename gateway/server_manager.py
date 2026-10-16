@@ -82,7 +82,7 @@ class ServerManager:
         self,
         model: ModelDefinition,
         port: int,
-        on_unload: Callable[[str], None] | None = None,
+        on_unload: Callable[[str, str], None] | None = None,
         on_capacity_change: Callable[[], None] | None = None,
         idle_unload_enabled: bool = True,
     ) -> None:
@@ -481,7 +481,7 @@ class ServerManager:
 
     # ── Déchargement ──────────────────────────────────────────────────────────
 
-    async def unload(self, reason: str = "manuel") -> None:
+    async def unload(self, reason: str = "manual") -> None:
         """
         Termine llama-server et libère 100% de la VRAM GPU.
         Idempotent : sans effet si déjà UNLOADED.
@@ -546,7 +546,7 @@ class ServerManager:
 
         # Notifier ModelManager pour qu'il retourne le port au pool et nettoie son état
         if self._on_unload:
-            self._on_unload(self._model.id)
+            self._on_unload(self._model.id, reason)
 
     async def _kill_process(self) -> None:
         """SIGTERM → attente 10s → SIGKILL. Opère sur le process group entier."""
@@ -638,7 +638,7 @@ class ServerManager:
                     "Inactivité détectée sur '%s' (%.0fs sans requête) — déchargement.",
                     self._model.id, idle_for,
                 )
-                await self.unload(reason=f"inactivité ({idle_for:.0f}s)")
+                await self.unload(reason="idle")
                 break
 
     async def _mark_crashed(self) -> None:
@@ -662,7 +662,7 @@ class ServerManager:
         self._process = None
 
         if self._on_unload:
-            self._on_unload(self._model.id)
+            self._on_unload(self._model.id, "crash")
         if self._on_capacity_change:
             self._on_capacity_change()
 

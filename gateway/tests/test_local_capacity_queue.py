@@ -70,6 +70,7 @@ class FakeServerManager:
         port: int,
         on_unload=None,
         on_capacity_change=None,
+        idle_unload_enabled: bool = True,
         *,
         ready: bool = False,
         active_requests: int = 0,
@@ -123,7 +124,7 @@ class FakeServerManager:
         self.unload_calls += 1
         self._state = ModelState.UNLOADED
         if self._on_unload:
-            self._on_unload(self._model.id)
+            self._on_unload(self._model.id, reason)
 
     def unpin(self):
         was_pinned = self._active_requests > 0
