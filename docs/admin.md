@@ -1279,6 +1279,7 @@ Elles sont toutes soumises au rate limiting et à la gestion VRAM automatique.
 | Méthode | Route | Description |
 |---------|-------|-------------|
 | `GET` | `/v1/models` | Liste les modèles activés |
+| `GET` | `/v1/models/{model_id}` | Détail d'un modèle activé (« retrieve model » OpenAI) |
 | `GET` | `/v1/capacity` | État minimal de la queue VRAM (auth utilisateur, sans détail infra sensible) |
 | `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible, streaming supporté) |
 | `POST` | `/v1/completions` | Legacy text completion (OpenAI-compatible) |
@@ -1286,6 +1287,7 @@ Elles sont toutes soumises au rate limiting et à la gestion VRAM automatique.
 | `POST` | `/v1/completion` | Alias de `/completion` |
 | `POST` | `/v1/tokenize` | Tokenise un texte — retourne les token IDs |
 | `POST` | `/v1/detokenize` | Reconstruit du texte depuis des token IDs |
+| `POST` | `/v1/embeddings` | Vecteurs d'embedding — exige la capability `embeddings` sur le modèle |
 | `GET` | `/health` | Health check (non authentifié) |
 
 > **Paramètres avancés llama.cpp :** `/v1/chat/completions` et `/completion` acceptent tous les

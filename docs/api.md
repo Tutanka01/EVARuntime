@@ -188,6 +188,30 @@ curl -s http://127.0.0.1:8000/v1/models \
   -H "Authorization: Bearer $EVA_API_KEY" | python3 -m json.tool
 ```
 
+### Détail d'un modèle — `GET /v1/models/{model_id}`
+
+Contrat OpenAI « retrieve model » (`openai.models.retrieve()`). Renvoie la même
+entrée que la liste, pour un identifiant unique :
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models/qwen3.5-9b-q5_k_m \
+  -H "Authorization: Bearer $EVA_API_KEY" | python3 -m json.tool
+```
+
+```json
+{
+  "id": "qwen3.5-9b-q5_k_m",
+  "object": "model",
+  "created": 1704067200,
+  "owned_by": "local-uppa",
+  "description": "Modèle léger — latence réduite"
+}
+```
+
+Un identifiant inconnu **ou désactivé** renvoie `404` avec
+`"type": "model_not_found"` : la liste n'annonce pas les modèles désactivés, et
+cette route ne révèle pas leur existence.
+
 ### Voir l'état de la queue VRAM
 
 Cet endpoint est authentifié avec une clé API utilisateur normale. Il expose
@@ -947,6 +971,63 @@ curl -s https://gateway.example.com/v1/detokenize \
 # Réponse : {"content": "La France est un"}
 ```
 
+### Embeddings — `POST /v1/embeddings`
+
+Route **standard OpenAI** (`openai.embeddings.create()`), servie par un modèle
+d'embedding du registre. Elle n'est jamais streamante : un champ `stream` dans
+le corps est ignoré.
+
+**Le modèle cible doit déclarer la capability `embeddings` dans
+`models.yaml`.** Sans elle, `llama-server` a été lancé en mode génération et ne
+sait pas produire de vecteurs : la gateway refuse donc la requête avec un `400`
+`invalid_request_error`, **avant** tout chargement de VRAM, plutôt que de
+laisser remonter une erreur opaque du backend.
+
+```bash
+curl -s https://gateway.example.com/v1/embeddings \
+  -H "Authorization: Bearer $EVA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mon-modele-embeddings",
+    "input": ["La France est un pays", "Le Portugal aussi"]
+  }' | python3 -m json.tool
+```
+
+```json
+{
+  "object": "list",
+  "model": "mon-modele-embeddings",
+  "data": [
+    {"object": "embedding", "index": 0, "embedding": [0.0123, -0.0456, "…"]},
+    {"object": "embedding", "index": 1, "embedding": [0.0789, -0.0012, "…"]}
+  ],
+  "usage": {"prompt_tokens": 14, "total_tokens": 14}
+}
+```
+
+Python — client `openai` :
+
+```python
+import os
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://gateway.example.com/v1",
+    api_key=os.environ["EVA_API_KEY"],
+)
+
+resp = client.embeddings.create(
+    model="mon-modele-embeddings",
+    input=["La France est un pays", "Le Portugal aussi"],
+)
+print(len(resp.data[0].embedding))
+```
+
+`input` accepte une chaîne ou une liste de chaînes. Comme toute route `/v1/*`,
+l'appel est authentifié, rate-limité et journalisé dans `usage_log` — les
+tokens du prompt y sont comptés, le nombre de tokens de complétion vaut `0`
+(une requête d'embedding n'en génère aucun).
+
 ### Récapitulatif des endpoints disponibles
 
 | Endpoint | Entrée | Format de réponse | Usage recommandé |
@@ -957,7 +1038,9 @@ curl -s https://gateway.example.com/v1/detokenize \
 | `POST /v1/completion` | `prompt` (string) | Natif llama.cpp | Alias de `/completion` |
 | `POST /v1/tokenize` | `content` (string) | `{"tokens": [...]}` | Compter les tokens avant envoi |
 | `POST /v1/detokenize` | `tokens` (array) | `{"content": "…"}` | Reconstruire du texte depuis des IDs |
+| `POST /v1/embeddings` | `input` (string ou array) | OpenAI standard | Vecteurs d'embedding — capability `embeddings` requise |
 | `GET /v1/models` | — | OpenAI standard | Lister les modèles activés |
+| `GET /v1/models/{model_id}` | — | OpenAI standard | Détail d'un modèle activé ([§2](#2-premier-test--curl)) |
 | `GET /v1/capacity` | — | JSON | État de la queue d'admission VRAM ([§2](#2-premier-test--curl)) |
 | `GET /health` | — | JSON | Liveness du service (sans authentification) |
 | `GET /ready` | — | JSON | Readiness — capacité à servir maintenant (sans authentification) |
@@ -1181,6 +1264,7 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
 |---|---|---|---|
 | `200` | — | Succès | — |
 | `400` | `invalid_request_error` | JSON malformé ou paramètre invalide | Vérifier le corps de la requête |
+| `400` | `invalid_request_error` | Modèle sans la capability exigée par la route (`/v1/embeddings`) | Choisir un modèle qui déclare `embeddings` dans `models.yaml` |
 | `401` | `authentication_error` | Clé absente, invalide ou révoquée | Vérifier la clé ; contacter l'admin si révoquée |
 | `403` | `model_disabled` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible via `GET /v1/models` |
 | `404` | `model_not_found` | Identifiant de modèle inconnu | Vérifier l'ID du modèle via `GET /v1/models` |

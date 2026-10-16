@@ -2890,6 +2890,28 @@
         "summary": "Detokenize"
       }
     },
+    "/v1/embeddings": {
+      "post": {
+        "description": "Embeddings — compatible OpenAI (openai.embeddings.create()).\n\nBody : {\"model\": \"...\", \"input\": \"texte\" | [\"texte\", ...]}.\n\nLe modèle cible doit déclarer la capability `embeddings` dans le registre :\nsans elle, llama-server a été lancé en mode génération et répondrait une\nerreur opaque. Le refus est donc prononcé par la gateway, avant tout\nchargement de VRAM. La route n'est jamais streamante : un `stream` dans le\ncorps est ignoré et retiré avant le forward.",
+        "operationId": "embeddings_v1_embeddings_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Embeddings"
+      }
+    },
     "/v1/models": {
       "get": {
         "description": "Liste les modèles disponibles — compatible openai.models.list().",
@@ -2910,6 +2932,49 @@
           }
         ],
         "summary": "List Models"
+      }
+    },
+    "/v1/models/{model_id}": {
+      "get": {
+        "description": "Détail d'un modèle — compatible openai.models.retrieve().\n\nMême visibilité que `/v1/models` : un modèle désactivé ou inconnu renvoie\n404 `model_not_found`. Le chemin n'accepte pas de `/` (les identifiants du\nregistre n'en contiennent jamais, cf. `_MODEL_ID_RE`), donc aucun risque\nde capture d'un sous-chemin.",
+        "operationId": "retrieve_model_v1_models__model_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "model_id",
+            "required": true,
+            "schema": {
+              "title": "Model Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Retrieve Model"
       }
     },
     "/v1/tokenize": {
