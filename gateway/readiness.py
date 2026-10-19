@@ -55,7 +55,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
-from config import Settings, secret_is_placeholder
+from config import Settings, secret_is_placeholder, secret_is_weak
 from config import settings as _module_settings
 
 log = logging.getLogger(__name__)
@@ -491,14 +491,15 @@ def _check_secrets(config: Any) -> CheckResult:
     """
     Secrets laissés à leur valeur d'exemple — signalé, JAMAIS bloquant.
 
-    Un `ADMIN_SECRET` placeholder désactive déjà les routes `/admin` (fail-closed
-    côté route) et un `INTERNAL_API_KEY` placeholder rend la clé
+    Un `ADMIN_SECRET` faible (placeholder ou trop court, même critère que
+    `auth.require_admin`) désactive déjà les routes `/admin` (fail-closed côté
+    route) et un `INTERNAL_API_KEY` placeholder rend la clé
     gateway ↔ llama-server prévisible : deux défauts réels, mais qui n'empêchent
     pas de servir. Les rendre bloquants transformerait `/ready` en boucle de
     rollback sur les déploiements existants — on avertit donc sans bloquer.
     """
     problems: list[str] = []
-    if secret_is_placeholder(str(getattr(config, "admin_secret", ""))):
+    if secret_is_weak(str(getattr(config, "admin_secret", ""))):
         problems.append("ADMIN_SECRET")
     if str(getattr(config, "cluster_mode", "local")) == "local":
         if secret_is_placeholder(str(getattr(config, "internal_api_key", ""))):
@@ -509,8 +510,9 @@ def _check_secrets(config: Any) -> CheckResult:
     if problems:
         return CheckResult(
             "secrets", "warn", "secret_placeholder",
-            "Secret(s) non configuré(s) ou laissé(s) à une valeur d'exemple : "
-            f"{', '.join(problems)}. Générez un secret fort dans l'EnvironmentFile.",
+            "Secret(s) non configuré(s), laissé(s) à une valeur d'exemple ou "
+            f"trop court(s) : {', '.join(problems)}. Générez un secret fort dans "
+            "l'EnvironmentFile.",
             critical=False,
         )
     return CheckResult(
@@ -750,12 +752,17 @@ def caller_is_privileged(
     True si l'en-tête `Authorization` porte le bon `ADMIN_SECRET`.
 
     Utilisé par `/ready` pour décider d'ajouter (ou non) les messages détaillés,
-    qui contiennent des chemins de fichiers. Fail-closed : un secret laissé à sa
-    valeur d'exemple ne privilégie personne. Comparaison constant-time.
+    qui contiennent des chemins de fichiers. Comparaison constant-time.
+
+    Fail-closed, avec EXACTEMENT le critère de `auth.require_admin` : un secret
+    vide, placeholder ou plus court que `SECRET_MIN_LENGTH` ne privilégie
+    personne. Un critère plus laxe ici rouvrirait la vue détaillée avec un
+    secret que `/admin/*` refuse (« password ») — sur une route publique dont
+    nginx ne journalise pas les accès.
     """
     cfg: Any = config if config is not None else _module_settings
     admin_secret = str(getattr(cfg, "admin_secret", ""))
-    if secret_is_placeholder(admin_secret):
+    if secret_is_weak(admin_secret):
         return False
     if not authorization:
         return False

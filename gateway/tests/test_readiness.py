@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 import main
 import readiness
-from config import Settings
+from config import SECRET_MIN_LENGTH, Settings
 from model_registry import ModelDefinition, ModelRegistry
 
 
@@ -604,6 +604,60 @@ def test_placeholder_admin_secret_grants_no_privilege(client, monkeypatch, tmp_p
     resp = client.get("/ready", headers={"Authorization": "Bearer CHANGE_ME_ADMIN_SECRET"})
     assert resp.status_code == 503
     assert "details" not in resp.json()
+
+
+def test_weak_admin_secret_grants_no_privilege(client, monkeypatch, tmp_path):
+    """
+    Même critère que /admin/* : un secret non placeholder mais trop court
+    (« password ») désactive l'administration, il ne doit donc pas non plus
+    ouvrir la vue détaillée de /ready, qui contient des chemins.
+    """
+    weak = "password-16chars"
+    assert len(weak) < SECRET_MIN_LENGTH
+    cfg = _healthy_settings(
+        tmp_path,
+        admin_secret=weak,
+        llama_server_bin=tmp_path / "absent-binary",
+    )
+    manager = _FakeManager([_model(_gguf(tmp_path))], _local_status())
+    _wire(monkeypatch, manager, cfg)
+
+    resp = client.get("/ready", headers={"Authorization": f"Bearer {weak}"})
+    assert resp.status_code == 503
+    assert "details" not in resp.json()
+    assert "absent-binary" not in resp.text
+
+    # Contrôle positif : la même configuration avec un secret fort ouvre bien
+    # la vue détaillée — l'absence ci-dessus n'est donc pas un test inerte.
+    strong = "s" * SECRET_MIN_LENGTH
+    _wire(monkeypatch, manager, _healthy_settings(
+        tmp_path, admin_secret=strong, llama_server_bin=tmp_path / "absent-binary",
+    ))
+    resp = client.get("/ready", headers={"Authorization": f"Bearer {strong}"})
+    assert "absent-binary" in resp.text
+
+
+def test_privilege_matches_admin_route_policy(tmp_path):
+    """caller_is_privileged et require_admin partagent `secret_is_weak`."""
+    for secret in ("", "CHANGE_ME_ADMIN_SECRET", "x" * (SECRET_MIN_LENGTH - 1)):
+        cfg = _healthy_settings(tmp_path, admin_secret=secret)
+        assert cfg.admin_secret_is_weak() is True
+        assert readiness.caller_is_privileged(f"Bearer {secret}", cfg) is False
+    strong = "x" * SECRET_MIN_LENGTH
+    cfg = _healthy_settings(tmp_path, admin_secret=strong)
+    assert cfg.admin_secret_is_weak() is False
+    assert readiness.caller_is_privileged(f"Bearer {strong}", cfg) is True
+
+
+def test_weak_admin_secret_is_reported_by_secrets_check(tmp_path):
+    """Le contrôle `secrets` ne doit pas annoncer « pass » quand /admin est fermé."""
+    weak = readiness._check_secrets(
+        _healthy_settings(tmp_path, admin_secret="password-16chars")
+    )
+    assert weak.status == "warn"
+    assert "ADMIN_SECRET" in weak.message
+    assert weak.critical is False
+    assert readiness._check_secrets(_healthy_settings(tmp_path)).status == "pass"
 
 
 # ── Coût : cache et invalidation ──────────────────────────────────────────────

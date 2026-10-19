@@ -35,7 +35,7 @@ M0 socle fiable  ──  M1 planificateur  ──  M2 installation  ──  M3 p
 | **Où en est-on** | Jalons **M0 et M1 atteints**. Après fusion de la PR #13 dans `dev`, l'audit post-merge (§0.16) a réparé le contrat de l'installation réelle : runtime/service/registre alignés, artefacts d'exploitation installés, dépendances hashées, dashboard hors ligne, métriques runtime et runbook complet. M2 reste volontairement non prononcé |
 | **Ce qui bloque** | **Deux preuves P0 terrain**, pas un correctif local : exécuter la recette vrai petit GGUF (TST-004) et observer profils systemd/nginx sur le matériel de staging (OPS-001). Le `bootstrap-apply --apply` GPU/nginx et son rapport restent la preuve de sortie M2 |
 | **Ce qui vient ensuite** | Fournir une matrice `--runtime-variants` épinglée réelle, exécuter le runbook de `docs/deployment.md` sur l'hôte cible, lancer `doctor`, la recette petit GGUF puis le premier token via nginx, et archiver le rapport. Ensuite seulement : restore drill, endurance et SLO de M4/M5 |
-| **Santé des tests** | Dernier relevé documenté : **2447 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). Relevé du 2026-08-28 : **2449 tests gateway + 67 node-agent**. `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
+| **Santé des tests** | Dernier relevé documenté : **2447 gateway + 67 node-agent réussis**, 2 skips locaux attendus et documentés (§0.2). Relevé du 2026-08-28 : **2449 tests gateway + 67 node-agent**. Relevé du 2026-10-19, après fermeture des trois P0 d'audit (§0.17) : **2746 gateway (3 skips) + 110 node-agent**, parité CI Python 3.11 vérifiée. `ruff`, `pip check`, scripts bash et audit CVE bloquant sont verts, sans exception active |
 | **Reste à faire** | 25 items sur 96 (§0.3). Tous les P0 de code/supply-chain identifiés sont fermés ; TST-004 et OPS-001 restent ouverts parce que leur acceptation exige un runtime/GGUF et un staging réels |
 | **Ce qui n'est toujours pas démontré** | Aucun parcours `bootstrap-apply --apply` contre un **GPU réel**, un **nginx réel** et une **archive amont réelle**. Aucune empreinte SHA-256 de `llama-server` réelle n'existe dans ce dépôt : la vague 7 fournit le *moyen* d'en fournir, pas les valeurs. Le parcours physique jusqu'au premier token a été exercé sur CPU avec de vrais GGUF (§0.10 et §0.13), jamais par ce chemin |
 | **Ce que l'audit post-merge a appris** | Une procédure peut être juste module par module et rester inexécutable une fois installée : chemins runtime divergents, EnvironmentFile jamais promu, modèles absents activés, artefacts seulement copiés par update et documentation pointant vers un secret inexistant. Voir §0.16 |
@@ -1364,6 +1364,35 @@ l'archivage de son rapport. M4/M5 exigent encore, par définition, un restore
 drill hors hôte, l'endurance 24 h puis 72 h, la panne de nœud, les SLO/alertes,
 une release immuable/SBOM et une revue de sécurité indépendante. Aucun test
 local ne doit être présenté comme substitut à ces preuves.
+
+### 0.17 Audit du 2026-10-19 — trois P0 fermés
+
+Trois défauts P0 relevés par audit, tous vérifiés dans le code avant
+correction. Chaque test de régression a été rejoué **contre le code
+d'origine** et y échoue : aucun n'est inerte.
+
+| ID | Défaut | Ce que l'audit ne disait pas | Fermeture |
+|---|---|---|---|
+| P0-1 | Course `UNLOADING` en local : une requête arrivée pendant le déchargement pour inactivité créait un second `ServerManager`, que le callback du premier détruisait (port en service rendu au pool, VRAM non comptée) | L'**ancien port fuyait aussi** : il n'était plus référencé nulle part, et le pool rétrécissait d'un port à chaque occurrence. `_forget_failed_manager` gardait l'identité pour `_managers` mais pas pour `_allocated_ports` | Attente bornée sous `_capacity_cond` tant que l'état est `UNLOADING` (503 + `Retry-After` à l'expiration) ; callback lié à son instance et `_release_manager()` par identité, même motif que le node-agent. 5 tests sur le **vrai** `ServerManager` 🔬 |
+| P0-2 | Cluster : un `pending_load` n'était jamais purgé après un 4xx du node-agent → modèle inutilisable jusqu'au redémarrage | La doc promettait qu'un conflit d'identité était « remonté en erreur typée » : l'agent répond en fait HTTP 409, et ce chemin finissait dans le blocage. La deadline de polling repartait de zéro à chaque reprise : **aucune borne** d'incertitude, quelle que soit la cause | `NodeProtocolError.status_code` ; 409 → `ClusterLoadConflictError` + purge ; 4xx définitif → purge + failover, sans compter vers le seuil offline ; 404 après reconnaissance → abandon ; 404 sans reconnaissance → grâce de 30 s ; nœud offline → abandon ; borne absolue `created_at + deadline + 30 s`. 15 tests, dont des contrôles positifs pour 408/429/503 🔬 |
+| P0-3 | `/ready` accordait la vue détaillée (chemins) avec un `ADMIN_SECRET` que `/admin/*` refuse (« password ») | Le contrôle `secrets` de `/ready` avait le même écart : `pass` alors que l'administration était fermée | `caller_is_privileged` et `_check_secrets` utilisent `secret_is_weak`, le critère de `require_admin`. 3 tests, avec contrôle positif 🔬 |
+
+**Non traité, à reprendre :** `POST /admin/models/{id}/unload` ne purge
+toujours pas une réservation cluster en cours. Les bornes ci-dessus suffisent
+à guérir le modèle sans redémarrage. Une purge opérateur exigerait de trancher
+la course avec une opération `accepted` côté agent, qui n'a pas encore de
+manager et qu'un unload ne verrait donc pas.
+
+**Observation hors périmètre :** en local, un manager `UNLOADING` n'est pas
+compté dans `_used_vram_gb()` alors que son processus tient encore sa VRAM
+pendant le SIGTERM. Un autre modèle peut donc être admis pendant cette fenêtre.
+Le chemin de retry CUDA OOM (éviction supplémentaire) couvre déjà ce cas. Le
+changer modifierait les décisions d'éviction LRU : à traiter comme un item
+dédié, pas en passant.
+
+**Relevé :** 2746 tests gateway (3 skips attendus) + 110 node-agent, `ruff`
+vert sur les deux composants, suite gateway rejouée sous Python 3.11 avec
+dépendances fraîchement résolues (parité CI).
 
 ---
 

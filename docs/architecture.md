@@ -609,6 +609,33 @@ pin de garde couvre aussi la fenêtre entre la création de la réponse SSE et l
 démarrage effectif du générateur (relâché au premier chunk, ou après 30 s si
 le client se déconnecte avant).
 
+### Requête pendant un déchargement (`UNLOADING`)
+
+Le déchargement pour inactivité et la détection de crash partent du
+`ServerManager` lui-même : ils ne tiennent ni le verrou par modèle ni
+`_capacity_cond`. Pendant la fenêtre `UNLOADING` (SIGTERM, jusqu'à 10 s, puis
+SIGKILL), le processus tient encore son port et sa VRAM. Deux invariants
+protègent le pool :
+
+- **Un seul manager par modèle.** Une requête qui trouve son modèle en
+  `UNLOADING` attend, sous `_capacity_cond`, que le déchargement ait rendu
+  port et entrée de pool, puis recharge normalement. L'attente est bornée par
+  `CAPACITY_QUEUE_TIMEOUT_SECONDS` (503 + `Retry-After` à l'expiration) ; avec
+  `CAPACITY_QUEUE_ENABLED=false`, le refus est immédiat. Un unload qui ne
+  converge jamais laisse le modèle refusé plutôt que de lancer un second
+  `llama-server` à côté d'un processus qui tient encore sa VRAM.
+- **Libération par identité.** `_allocated_ports` est indexé par modèle : le
+  callback `on_unload` de chaque `ServerManager` est lié à son instance, et
+  `_release_manager()` ne libère que si cette instance est encore le manager
+  courant. Un callback tardif d'une instance remplacée est un no-op journalisé
+  — même motif que `node_agent._release_manager()`.
+
+Sans ces deux règles, une requête arrivée pendant `UNLOADING` créait un second
+manager ; le callback du premier rendait ensuite au pool le port du second,
+encore en service (`EADDRINUSE`, ou sonde de santé validant le serveur d'un
+autre modèle), retirait le second du pool (VRAM non comptée, budget
+sur-engagé) et l'ancien port fuyait définitivement (audit P0-1, 2026-10-19).
+
 ---
 
 ## Flux d'une requête multi-modèle
@@ -1610,8 +1637,37 @@ Conséquences opérationnelles :
   relancé sur un autre nœud.
 - **Une nouvelle définition ne peut plus servir une ancienne génération.** Si le
   digest reçu diffère de celui du modèle actif (ou de l'opération en cours), le
-  node agent refuse avec un conflit d'identité (état `conflict`), que
-  l'orchestrateur remonte en erreur typée sans écraser le placement.
+  node agent refuse le POST en **HTTP 409** (conflit d'identité ; le même code
+  signale un déchargement en cours). L'orchestrateur le remonte en
+  `ClusterLoadConflictError` (503 côté client, corps de l'agent au seul
+  journal), purge sa réservation et n'écrase pas le placement. Un état
+  terminal `conflict` publié par l'opération suit le même chemin.
+- **Réservation de chargement bornée.** Tant que l'issue d'un load n'est pas
+  connue, `pending_loads` réserve VRAM et port sur le nœud et interdit tout
+  failover concurrent. Cette réservation ne peut plus bloquer un modèle à vie :
+
+  | Issue du POST ou du polling | Interprétation | Traitement |
+  |---|---|---|
+  | POST 409 | Conflit / unload en cours côté agent | Réservation purgée, `ClusterLoadConflictError`, pas de failover |
+  | POST 4xx définitif (401, 404, 422…) | L'agent valide tout **avant** d'enregistrer l'opération : rien n'a été accepté | Réservation purgée, failover ; ne compte pas vers le seuil offline |
+  | POST 5xx, 408, 425, 429, coupure, timeout | Le POST a peut-être été traité | Polling du **même** `operation_id` |
+  | GET 404 après que l'agent a reconnu l'opération | L'agent l'a perdue (redémarrage, purge) | Abandon immédiat, réservation purgée, failover |
+  | GET 404 sans reconnaissance préalable | Le POST est peut-être encore en vol | Toléré pendant la grâce (30 s), puis abandon |
+  | Nœud marqué offline par le heartbeat | Même politique qu'un modèle READY | Abandon, replacement |
+  | `created_at + deadline_seconds + 30 s` dépassé | L'échéance appliquée par l'agent est forcément échue | Abandon, réservation purgée |
+
+  Avant ce bornage, un 4xx au POST basculait sur le polling d'une opération
+  jamais enregistrée : le GET répondait 404, la réservation restait, et chaque
+  requête suivante re-pollait la même opération. Le modèle restait inutilisable
+  jusqu'au redémarrage de la gateway, même avec un second nœud sain (audit
+  P0-2, 2026-10-19). Lors d'une reprise abandonnée, le couple modèle/nœud est
+  marqué suspect : le replacement préfère un autre nœud sain et ne revient à
+  celui-ci que faute d'alternative. Une copie que le nœud terminerait malgré
+  tout est réconciliée par le heartbeat comme doublon comptabilisé et
+  évictable.
+
+  ⚠️ `POST /admin/models/{id}/unload` ne purge **pas** une réservation en
+  cours : la purge reste pilotée par les bornes ci-dessus.
 - **Définition inchangée = chargement idempotent.** Digest et génération
   identiques → l'agent répond `already_loaded=True` sans redémarrer
   `llama-server`.

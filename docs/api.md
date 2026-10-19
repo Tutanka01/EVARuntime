@@ -1269,7 +1269,7 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
 | `403` | `model_disabled` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible via `GET /v1/models` |
 | `404` | `model_not_found` | Identifiant de modèle inconnu | Vérifier l'ID du modèle via `GET /v1/models` |
 | `429` | `rate_limit_error` | Limite de débit dépassée | Attendre 60 s ; consulter l'en-tête `Retry-After` |
-| `503` | `server_error` | Queue VRAM pleine/expirée, modèle impossible à charger ou backend temporairement indisponible | Respecter `Retry-After` si présent, sinon attendre 30 à 90 s |
+| `503` | `server_error` | Queue VRAM pleine/expirée, modèle en cours de déchargement, modèle impossible à charger ou backend temporairement indisponible | Respecter `Retry-After` si présent, sinon attendre 30 à 90 s |
 | `504` | `server_error` | Timeout de génération | Réduire `max_tokens` ou simplifier le prompt |
 | `502` | `server_error` | Moteur d'inférence injoignable | Transitoire — réessayer dans 30 s |
 | `500` | `server_error` | Erreur interne inattendue | Contacter l'admin avec le `X-Request-Id` de la réponse (voir ci-dessous) |

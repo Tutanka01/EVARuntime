@@ -45,8 +45,33 @@ class NodeUnreachableError(RuntimeError):
     """Le nœud ne répond pas (réseau, DNS, timeout, conn refused)."""
 
 
+# 4xx qui ne prouvent PAS un refus de l'agent : timeout ou limitation posés par
+# un intermédiaire, ou invitation explicite à réessayer.
+_RETRYABLE_CLIENT_STATUSES = frozenset({408, 425, 429})
+
+
 class NodeProtocolError(RuntimeError):
     """Le nœud répond mais l'échange est invalide (4xx/5xx ou payload non conforme)."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        # Statut HTTP de la réponse fautive ; None pour un payload non conforme.
+        self.status_code = status_code
+
+    @property
+    def is_rejection(self) -> bool:
+        """
+        True si l'agent a explicitement refusé la requête (4xx définitif).
+
+        Pour `POST /agent/models/load`, l'agent valide définition, identité et
+        échéance AVANT d'enregistrer l'opération : un refus prouve que rien n'a
+        été accepté, contrairement à un timeout ou à un 5xx.
+        """
+        return (
+            self.status_code is not None
+            and 400 <= self.status_code < 500
+            and self.status_code not in _RETRYABLE_CLIENT_STATUSES
+        )
 
 
 # ── Interface commune ─────────────────────────────────────────────────────────
@@ -325,14 +350,16 @@ class RemoteNodeClient:
         if resp.status_code >= 500:
             raise NodeProtocolError(
                 f"Nœud '{self.node_id}' a renvoyé {resp.status_code} sur {path} : "
-                f"{resp.text[:300]}"
+                f"{resp.text[:300]}",
+                status_code=resp.status_code,
             )
         if resp.status_code >= 400:
             # 4xx : pas un problème de transport. L'agent rejette explicitement
             # (modèle inconnu, payload invalide…). On remonte le message.
             raise NodeProtocolError(
                 f"Nœud '{self.node_id}' a refusé {path} ({resp.status_code}) : "
-                f"{resp.text[:300]}"
+                f"{resp.text[:300]}",
+                status_code=resp.status_code,
             )
         try:
             return resp.json()

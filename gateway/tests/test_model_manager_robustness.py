@@ -107,7 +107,7 @@ def add_loaded(manager, model, *, active_requests: int = 0, last_request_time=No
     manager._allocated_ports[model.id] = port
     server = FakeServerManager(
         model, port,
-        on_unload=manager._on_model_unloaded,
+        on_unload=lambda mid: manager._on_model_unloaded(mid, server),
         on_capacity_change=manager._notify_capacity_changed,
         ready=True, active_requests=active_requests, last_request_time=last_request_time,
     )

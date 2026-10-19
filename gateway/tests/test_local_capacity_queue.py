@@ -195,7 +195,7 @@ def add_loaded(
     server = FakeServerManager(
         model,
         port,
-        on_unload=manager._on_model_unloaded,
+        on_unload=lambda mid: manager._on_model_unloaded(mid, server),
         on_capacity_change=manager._notify_capacity_changed,
         ready=True,
         active_requests=active_requests,

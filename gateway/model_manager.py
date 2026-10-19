@@ -269,7 +269,10 @@ class LocalModelManager:
                 return manager
 
             async with self._capacity_cond:
-                manager = self._managers.get(model_id)
+                # Un déchargement hors model_lock (inactivité, crash) peut être
+                # en cours : attendre qu'il ait rendu port et entrée de pool,
+                # sinon un second manager coexisterait avec le premier (P0-1).
+                manager = await self._wait_for_unload_locked(model_id)
                 if manager and manager.state in (ModelState.READY, ModelState.LOADING, ModelState.UNLOADED):
                     pass
                 else:
@@ -279,12 +282,7 @@ class LocalModelManager:
                     port = self._port_pool.pop(0)
                     self._allocated_ports[model_id] = port
 
-                    manager = ServerManager(
-                        model=model,
-                        port=port,
-                        on_unload=self._on_model_unloaded,
-                        on_capacity_change=self._notify_capacity_changed,
-                    )
+                    manager = self._new_server_manager(model, port)
                     self._managers[model_id] = manager
                     log.info(
                         "Nouveau ServerManager créé pour '%s' sur port %d "
@@ -313,6 +311,77 @@ class LocalModelManager:
         if last_error:
             raise last_error
         raise RuntimeError(f"Impossible de charger '{model_id}'.")
+
+    def _new_server_manager(self, model: ModelDefinition, port: int) -> ServerManager:
+        """
+        Crée un ServerManager dont le callback de déchargement est lié à CETTE
+        instance : un callback tardif d'une instance remplacée est un no-op
+        (même motif que `node_agent._release_manager`).
+        """
+        manager_ref: ServerManager | None = None
+
+        def on_unload(model_id: str) -> None:
+            self._on_model_unloaded(model_id, manager_ref)
+
+        manager = ServerManager(
+            model=model,
+            port=port,
+            on_unload=on_unload,
+            on_capacity_change=self._notify_capacity_changed,
+        )
+        manager_ref = manager
+        return manager
+
+    async def _wait_for_unload_locked(self, model_id: str) -> ServerManager | None:
+        """
+        Attend, sous `_capacity_cond`, la fin d'un déchargement en cours du
+        modèle et retourne le manager courant (None une fois libéré).
+
+        `ServerManager.unload()` passe en UNLOADING puis tue le processus
+        (SIGTERM, jusqu'à 10 s, puis SIGKILL) sans tenir ni model_lock ni
+        `_capacity_cond` quand il vient du moniteur d'inactivité. Créer un
+        nouveau manager pendant cette fenêtre écrasait `_managers` et
+        `_allocated_ports` ; le callback de l'ancien libérait ensuite le port
+        ET l'entrée du nouveau (port réalloué en service, VRAM non comptée)
+        et l'ancien port fuyait pour toujours.
+
+        Le réveil vient de `_on_model_unloaded` → `_notify_capacity_changed`.
+        L'attente est bornée par la queue d'admission : on attend une capacité
+        en cours de libération, avec le même contrat 503 + Retry-After.
+        """
+        deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
+        while True:
+            manager = self._managers.get(model_id)
+            if manager is None or manager.state != ModelState.UNLOADING:
+                return manager
+            if not settings.capacity_queue_enabled:
+                raise RuntimeError(
+                    f"Le modèle '{model_id}' est en cours de déchargement, "
+                    "réessayez dans quelques secondes."
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._unload_wait_timeout(model_id)
+            try:
+                await asyncio.wait_for(self._capacity_cond.wait(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise self._unload_wait_timeout(model_id) from exc
+            self._admitted_model(model_id)
+
+    @staticmethod
+    def _unload_wait_timeout(model_id: str) -> CapacityQueueTimeout:
+        # Un unload qui ne converge pas (processus impossible à tuer) laisse le
+        # manager en UNLOADING : refuser plutôt que lancer un second
+        # llama-server à côté d'un processus qui tient encore sa VRAM.
+        log.error(
+            "Déchargement de '%s' non terminé après %ds — admission refusée.",
+            model_id, settings.capacity_queue_timeout_seconds,
+        )
+        return CapacityQueueTimeout(
+            f"Impossible de charger '{model_id}' : son déchargement précédent "
+            f"n'est pas terminé après {settings.capacity_queue_timeout_seconds}s. "
+            f"Réessayez dans quelques secondes."
+        )
 
     # ── Budget VRAM ───────────────────────────────────────────────────────────
 
@@ -522,13 +591,33 @@ class LocalModelManager:
 
     async def _forget_failed_manager(self, model_id: str, manager: ServerManager) -> None:
         async with self._capacity_cond:
-            if self._managers.get(model_id) is manager:
-                self._managers.pop(model_id, None)
-            port = self._allocated_ports.pop(model_id, None)
-            if port is not None and port not in self._port_pool:
-                self._port_pool.append(port)
-                log.debug("Port %d libéré après échec de chargement (modèle '%s')", port, model_id)
+            port = self._allocated_ports.get(model_id)
+            if self._release_manager(model_id, manager):
+                log.debug("Port %s libéré après échec de chargement (modèle '%s')", port, model_id)
             self._capacity_cond.notify_all()
+
+    def _release_manager(self, model_id: str, expected: ServerManager | None) -> bool:
+        """
+        Retire `expected` du pool et rend son port, UNIQUEMENT s'il est encore
+        le manager courant du modèle. `_allocated_ports` est indexé par modèle :
+        sans cette garde, une instance remplacée rendrait le port de sa
+        remplaçante, encore en service. Retourne True si quelque chose a été
+        libéré.
+        """
+        current = self._managers.get(model_id)
+        if expected is None or current is not expected:
+            if current is not None:
+                log.warning(
+                    "Libération ignorée pour '%s' : le manager appelant n'est "
+                    "plus le manager courant (callback périmé).",
+                    model_id,
+                )
+            return False
+        self._managers.pop(model_id, None)
+        port = self._allocated_ports.pop(model_id, None)
+        if port is not None and port not in self._port_pool:
+            self._port_pool.append(port)
+        return True
 
     async def _evict_lru_idle(self, exclude: str) -> bool:
         candidates = [
@@ -553,12 +642,12 @@ class LocalModelManager:
 
     # ── Callback de déchargement ──────────────────────────────────────────────
 
-    def _on_model_unloaded(self, model_id: str) -> None:
-        if model_id in self._allocated_ports:
-            port = self._allocated_ports.pop(model_id)
-            self._port_pool.append(port)
-            log.debug("Port %d libéré et retourné au pool (modèle '%s')", port, model_id)
-        self._managers.pop(model_id, None)
+    def _on_model_unloaded(self, model_id: str, expected: ServerManager | None) -> None:
+        port = self._allocated_ports.get(model_id)
+        if self._release_manager(model_id, expected):
+            log.debug("Port %s libéré et retourné au pool (modèle '%s')", port, model_id)
+        # Toujours réveiller : un waiter de `_wait_for_unload_locked` ou de la
+        # queue de capacité doit réévaluer l'état, même après un no-op.
         self._notify_capacity_changed()
 
     def _notify_capacity_changed(self) -> None:
