@@ -609,6 +609,33 @@ pin de garde couvre aussi la fenêtre entre la création de la réponse SSE et l
 démarrage effectif du générateur (relâché au premier chunk, ou après 30 s si
 le client se déconnecte avant).
 
+### Requête pendant un déchargement (`UNLOADING`)
+
+Le déchargement pour inactivité et la détection de crash partent du
+`ServerManager` lui-même : ils ne tiennent ni le verrou par modèle ni
+`_capacity_cond`. Pendant la fenêtre `UNLOADING` (SIGTERM, jusqu'à 10 s, puis
+SIGKILL), le processus tient encore son port et sa VRAM. Deux invariants
+protègent le pool :
+
+- **Un seul manager par modèle.** Une requête qui trouve son modèle en
+  `UNLOADING` attend, sous `_capacity_cond`, que le déchargement ait rendu
+  port et entrée de pool, puis recharge normalement. L'attente est bornée par
+  `CAPACITY_QUEUE_TIMEOUT_SECONDS` (503 + `Retry-After` à l'expiration) ; avec
+  `CAPACITY_QUEUE_ENABLED=false`, le refus est immédiat. Un unload qui ne
+  converge jamais laisse le modèle refusé plutôt que de lancer un second
+  `llama-server` à côté d'un processus qui tient encore sa VRAM.
+- **Libération par identité.** `_allocated_ports` est indexé par modèle : le
+  callback `on_unload` de chaque `ServerManager` est lié à son instance, et
+  `_release_manager()` ne libère que si cette instance est encore le manager
+  courant. Un callback tardif d'une instance remplacée est un no-op journalisé
+  — même motif que `node_agent._release_manager()`.
+
+Sans ces deux règles, une requête arrivée pendant `UNLOADING` créait un second
+manager ; le callback du premier rendait ensuite au pool le port du second,
+encore en service (`EADDRINUSE`, ou sonde de santé validant le serveur d'un
+autre modèle), retirait le second du pool (VRAM non comptée, budget
+sur-engagé) et l'ancien port fuyait définitivement (audit P0-1, 2026-10-19).
+
 ---
 
 ## Flux d'une requête multi-modèle
