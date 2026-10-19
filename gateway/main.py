@@ -556,7 +556,8 @@ async def ready(request: Request):
     Le corps public ne divulgue aucun chemin de fichier, URL de nœud ni secret :
     seulement des identifiants de contrôle et des codes stables. Un appelant
     présentant `ADMIN_SECRET` reçoit en plus les messages actionnables détaillés
-    (qui, eux, contiennent des chemins) — même niveau de confiance que /admin/*.
+    (qui, eux, contiennent des chemins) — même niveau de confiance que /admin/*,
+    y compris le même refus d'un secret faible (`caller_is_privileged`).
     """
     report = await evaluate_readiness(model_manager, config=settings)
 

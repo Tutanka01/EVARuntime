@@ -186,8 +186,12 @@ curl -s -H "Authorization: Bearer $ADMIN_SECRET" http://127.0.0.1:8000/ready | j
   "critical": true}]
 ```
 
-Un `ADMIN_SECRET` laissé à sa valeur d'exemple ne privilégie personne
-(fail-closed). `nginx.conf` proxifie explicitement la forme publique de
+Un `ADMIN_SECRET` faible ne privilégie personne (fail-closed), avec exactement
+le critère des routes `/admin/*` : vide, laissé à sa valeur d'exemple **ou plus
+court que 32 caractères**. Un secret que `/admin/*` refuse en 503 n'ouvre donc
+pas non plus la vue détaillée de `/ready`, qui est publique et dont nginx ne
+journalise pas les accès. Le contrôle non bloquant `secrets` le signale en
+`warn`. `nginx.conf` proxifie explicitement la forme publique de
 `/ready`, sans chemin ni détail d'infrastructure, afin qu'un load balancer
 puisse décider du routage. Les détails actionnables restent conditionnés au
 bearer admin et le plan de contrôle direct est recommandé pour leur lecture.
