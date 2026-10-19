@@ -1637,8 +1637,37 @@ Conséquences opérationnelles :
   relancé sur un autre nœud.
 - **Une nouvelle définition ne peut plus servir une ancienne génération.** Si le
   digest reçu diffère de celui du modèle actif (ou de l'opération en cours), le
-  node agent refuse avec un conflit d'identité (état `conflict`), que
-  l'orchestrateur remonte en erreur typée sans écraser le placement.
+  node agent refuse le POST en **HTTP 409** (conflit d'identité ; le même code
+  signale un déchargement en cours). L'orchestrateur le remonte en
+  `ClusterLoadConflictError` (503 côté client, corps de l'agent au seul
+  journal), purge sa réservation et n'écrase pas le placement. Un état
+  terminal `conflict` publié par l'opération suit le même chemin.
+- **Réservation de chargement bornée.** Tant que l'issue d'un load n'est pas
+  connue, `pending_loads` réserve VRAM et port sur le nœud et interdit tout
+  failover concurrent. Cette réservation ne peut plus bloquer un modèle à vie :
+
+  | Issue du POST ou du polling | Interprétation | Traitement |
+  |---|---|---|
+  | POST 409 | Conflit / unload en cours côté agent | Réservation purgée, `ClusterLoadConflictError`, pas de failover |
+  | POST 4xx définitif (401, 404, 422…) | L'agent valide tout **avant** d'enregistrer l'opération : rien n'a été accepté | Réservation purgée, failover ; ne compte pas vers le seuil offline |
+  | POST 5xx, 408, 425, 429, coupure, timeout | Le POST a peut-être été traité | Polling du **même** `operation_id` |
+  | GET 404 après que l'agent a reconnu l'opération | L'agent l'a perdue (redémarrage, purge) | Abandon immédiat, réservation purgée, failover |
+  | GET 404 sans reconnaissance préalable | Le POST est peut-être encore en vol | Toléré pendant la grâce (30 s), puis abandon |
+  | Nœud marqué offline par le heartbeat | Même politique qu'un modèle READY | Abandon, replacement |
+  | `created_at + deadline_seconds + 30 s` dépassé | L'échéance appliquée par l'agent est forcément échue | Abandon, réservation purgée |
+
+  Avant ce bornage, un 4xx au POST basculait sur le polling d'une opération
+  jamais enregistrée : le GET répondait 404, la réservation restait, et chaque
+  requête suivante re-pollait la même opération. Le modèle restait inutilisable
+  jusqu'au redémarrage de la gateway, même avec un second nœud sain (audit
+  P0-2, 2026-10-19). Lors d'une reprise abandonnée, le couple modèle/nœud est
+  marqué suspect : le replacement préfère un autre nœud sain et ne revient à
+  celui-ci que faute d'alternative. Une copie que le nœud terminerait malgré
+  tout est réconciliée par le heartbeat comme doublon comptabilisé et
+  évictable.
+
+  ⚠️ `POST /admin/models/{id}/unload` ne purge **pas** une réservation en
+  cours : la purge reste pilotée par les bornes ci-dessus.
 - **Définition inchangée = chargement idempotent.** Digest et génération
   identiques → l'agent répond `already_loaded=True` sans redémarrer
   `llama-server`.

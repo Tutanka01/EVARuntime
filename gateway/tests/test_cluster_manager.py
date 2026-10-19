@@ -23,6 +23,7 @@ import telemetry
 
 from cluster.cluster_manager import (
     ClusterManager,
+    ClusterLoadConflictError,
     ClusterLoadUncertainError,
     ClusterModelHandle,
     ClusterUnloadUncertainError,
@@ -201,6 +202,10 @@ class OperationNodeBackend(FakeNodeBackend):
         self.operation_status_calls = 0
         self.operation: dict | None = None
         self.fail_initial_request = False
+        # Refus explicite du POST : l'opération n'est jamais enregistrée.
+        self.start_exc: Exception | None = None
+        # Nombre de GET initiaux répondant 404 « Opération inconnue. ».
+        self.unknown_polls = 0
 
     async def start_load_model(
         self,
@@ -219,6 +224,8 @@ class OperationNodeBackend(FakeNodeBackend):
             "deadline_seconds": deadline_seconds,
         }
         self.start_requests.append(request)
+        if self.start_exc is not None:
+            raise self.start_exc
         self.operation = request
         if self.fail_initial_request:
             raise NodeUnreachableError("réponse POST perdue")
@@ -233,9 +240,11 @@ class OperationNodeBackend(FakeNodeBackend):
         )
 
     async def get_operation_status(self, operation_id: str) -> LoadResponse:
-        assert self.operation is not None
-        assert operation_id == self.operation["operation_id"]
         self.operation_status_calls += 1
+        if self.operation_status_calls <= self.unknown_polls or self.operation is None:
+            # Réponse réelle de node_agent.operation_status pour un id inconnu.
+            raise NodeProtocolError("Opération inconnue.", status_code=404)
+        assert operation_id == self.operation["operation_id"]
         request = self.operation
         if self.ready_after is None or self.operation_status_calls < self.ready_after:
             return LoadResponse(
@@ -997,9 +1006,182 @@ class TestLoadOperations:
             with pytest.raises(ClusterLoadUncertainError):
                 await mgr.ensure_model_loaded("m1")
             assert fallback.start_requests == []
+            # Toujours dans la fenêtre échéance + grâce : l'agent peut encore
+            # aboutir, aucun doublon n'est lancé.
             with pytest.raises(ClusterLoadUncertainError):
                 await mgr.ensure_model_loaded("m1")
             assert fallback.start_requests == []
+        finally:
+            await mgr.shutdown()
+
+    # ── P0-2 : une réservation ne doit jamais bloquer le modèle à vie ─────────
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("status", [401, 404, 422])
+    async def test_post_rejection_purges_pending_and_fails_over(self, status):
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=1)
+        first.start_exc = NodeProtocolError("refus de l'agent", status_code=status)
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback])
+        await mgr.start_health_monitor()
+        try:
+            handle = await asyncio.wait_for(mgr.ensure_model_loaded("m1"), 2.0)
+        finally:
+            await mgr.shutdown()
+
+        assert handle._info.node_id == "b"
+        assert len(first.start_requests) == 1
+        # Une opération jamais acceptée n'est pas pollée (elle répondrait 404).
+        assert first.operation_status_calls == 0
+        assert "m1" not in mgr._nodes["a"].pending_loads
+        # Un refus prouve que l'agent répond : ce n'est pas une panne de nœud.
+        assert mgr._nodes["a"].consecutive_failures == 0
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("status", [408, 429, 503])
+    async def test_ambiguous_post_status_still_resolves_same_operation(self, status):
+        """Contrôle positif : 408/429/5xx restent incertains → même operation_id."""
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=1)
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback])
+        original = first.start_load_model
+
+        async def accepted_then_ambiguous(*args, **kwargs):
+            await original(*args, **kwargs)
+            raise NodeProtocolError("réponse ambiguë", status_code=status)
+
+        first.start_load_model = accepted_then_ambiguous
+        await mgr.start_health_monitor()
+        try:
+            handle = await mgr.ensure_model_loaded("m1")
+        finally:
+            await mgr.shutdown()
+        assert handle._info.node_id == "a"
+        assert first.operation_status_calls == 1
+        assert fallback.start_requests == []
+
+    @pytest.mark.anyio
+    async def test_post_conflict_is_typed_purged_and_heals(self):
+        first = OperationNodeBackend("a", ready_after=1)
+        first.start_exc = NodeProtocolError(
+            "corps-agent /models/secret-path.gguf", status_code=409
+        )
+        mgr = make_manager([first])
+        await mgr.start_health_monitor()
+        try:
+            with pytest.raises(ClusterLoadConflictError) as excinfo:
+                await mgr.ensure_model_loaded("m1")
+            # Le corps de l'agent ne remonte pas au client.
+            assert "secret-path" not in str(excinfo.value)
+            assert "m1" not in mgr._nodes["a"].pending_loads
+            assert first.operation_status_calls == 0
+
+            # Guérison sans redémarrage de la gateway.
+            first.start_exc = None
+            handle = await mgr.ensure_model_loaded("m1")
+            assert handle._info.node_id == "a"
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_unknown_operation_after_grace_is_abandoned_and_fails_over(self):
+        """POST perdu ET jamais enregistré : 404 tolérés pendant la grâce, puis failover."""
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=1)
+        first.fail_initial_request = True
+        first.unknown_polls = 10**9
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback])
+        mgr._operation_grace_seconds = 0.3
+        await mgr.start_health_monitor()
+        try:
+            handle = await asyncio.wait_for(mgr.ensure_model_loaded("m1"), 2.0)
+        finally:
+            await mgr.shutdown()
+
+        assert handle._info.node_id == "b"
+        assert first.operation_status_calls >= 2, "404 tolérés pendant la grâce"
+        assert "m1" not in mgr._nodes["a"].pending_loads
+
+    @pytest.mark.anyio
+    async def test_unknown_operation_within_grace_adopts_late_registration(self):
+        """Le POST était encore en vol : le 404 initial ne déclenche aucun doublon."""
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=2)
+        first.fail_initial_request = True
+        first.unknown_polls = 1
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback])
+        await mgr.start_health_monitor()
+        try:
+            handle = await mgr.ensure_model_loaded("m1")
+        finally:
+            await mgr.shutdown()
+
+        assert handle._info.node_id == "a"
+        assert len(first.start_requests) == 1
+        assert fallback.start_requests == []
+
+    @pytest.mark.anyio
+    async def test_acknowledged_operation_lost_by_agent_fails_over_immediately(self):
+        """Opération acceptée puis inconnue (agent redémarré) : pas d'attente de grâce."""
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=None)
+        first.unknown_polls = 10**9
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback])
+        assert mgr._operation_grace_seconds >= 10  # la grâce par défaut n'est pas attendue
+        await mgr.start_health_monitor()
+        try:
+            handle = await asyncio.wait_for(mgr.ensure_model_loaded("m1"), 2.0)
+        finally:
+            await mgr.shutdown()
+
+        assert handle._info.node_id == "b"
+        assert first.operation_status_calls == 1
+        assert "m1" not in mgr._nodes["a"].pending_loads
+
+    @pytest.mark.anyio
+    async def test_pending_on_offline_node_is_purged_and_replaced(self):
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=None)
+        first.fail_initial_request = True
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback], failures_threshold=1)
+        mgr._load_deadline_seconds = lambda *_args: 0.05
+        await mgr.start_health_monitor()
+        try:
+            with pytest.raises(ClusterLoadUncertainError):
+                await mgr.ensure_model_loaded("m1")
+            assert "m1" in mgr._nodes["a"].pending_loads
+
+            first.fail_health = True
+            await mgr._check_node(mgr._nodes["a"])
+            assert mgr._nodes["a"].online is False
+
+            handle = await mgr.ensure_model_loaded("m1")
+            assert handle._info.node_id == "b"
+            assert "m1" not in mgr._nodes["a"].pending_loads
+        finally:
+            await mgr.shutdown()
+
+    @pytest.mark.anyio
+    async def test_uncertain_pending_expires_and_model_heals_elsewhere(self):
+        """Agent figé en « loading » : au-delà de échéance + grâce, la réservation tombe."""
+        first = OperationNodeBackend("a", total_vram=30.0, ready_after=None)
+        first.fail_initial_request = True
+        fallback = OperationNodeBackend("b", total_vram=80.0, ready_after=1)
+        mgr = make_manager([first, fallback])
+        mgr._load_deadline_seconds = lambda *_args: 0.05
+        mgr._operation_grace_seconds = 0.1
+        await mgr.start_health_monitor()
+        try:
+            with pytest.raises(ClusterLoadUncertainError):
+                await mgr.ensure_model_loaded("m1")
+            assert fallback.start_requests == []
+
+            await asyncio.sleep(0.2)
+            handle = await asyncio.wait_for(mgr.ensure_model_loaded("m1"), 2.0)
+            assert handle._info.node_id == "b"
+            assert "m1" not in mgr._nodes["a"].pending_loads
+            # Une seule opération sur a : la réservation expirée n'est pas relancée.
+            assert len(first.start_requests) == 1
         finally:
             await mgr.shutdown()
 

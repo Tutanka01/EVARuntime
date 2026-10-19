@@ -82,6 +82,27 @@ class ClusterLoadUncertainError(RuntimeError):
 class ClusterLoadConflictError(RuntimeError):
     """Le nœud possède une autre génération de la définition demandée."""
 
+
+class ClusterLoadAbandonedError(RuntimeError):
+    """
+    Un chargement distant est établi comme perdu : opération inconnue du nœud,
+    nœud offline, ou échéance négociée + grâce dépassée. Contrairement à
+    `ClusterLoadUncertainError`, la réservation peut être purgée et un
+    failover tenté — l'agent ne peut plus produire ce résultat.
+    """
+
+    def __init__(
+        self, model_id: str, node_id: str, operation_id: str, reason: str
+    ) -> None:
+        self.model_id = model_id
+        self.node_id = node_id
+        self.operation_id = operation_id
+        self.reason = reason
+        super().__init__(
+            f"Le chargement du modèle '{model_id}' sur le nœud '{node_id}' "
+            f"est abandonné (opération {operation_id}) : {reason}."
+        )
+
 # ── État interne par modèle chargé sur un nœud ───────────────────────────────
 
 @dataclass
@@ -130,6 +151,14 @@ class _PendingLoad:
     vram_gb: float
     progress: float = 0.0
     deadline_seconds: float | None = None
+    # Origine de la borne absolue d'incertitude : l'agent applique sa propre
+    # échéance depuis la réception, une réservation ne peut donc pas lui
+    # survivre indéfiniment.
+    created_at: float = field(default_factory=time.monotonic)
+    # L'agent a prouvé connaître l'opération (réponse au POST ou au GET). Un
+    # 404 ultérieur signifie alors qu'il l'a perdue (redémarrage, purge), et
+    # non qu'un POST serait encore en vol.
+    acknowledged: bool = False
 
 
 # ── État interne par nœud ─────────────────────────────────────────────────────
@@ -274,6 +303,12 @@ class ClusterManager:
     """
     Singleton multi-nœuds — remplace LocalModelManager quand CLUSTER_MODE=cluster.
     """
+
+    # Grâce accordée à l'agent (a) pour enregistrer une opération dont le POST
+    # est incertain avant qu'un 404 soit tenu pour définitif, et (b) au-delà de
+    # l'échéance négociée pour publier un état terminal. Couvre l'attente du
+    # verrou de modèle côté agent pendant un unload (SIGTERM 10 s + SIGKILL).
+    _operation_grace_seconds: float = 30.0
 
     def __init__(
         self,
@@ -504,6 +539,8 @@ class ClusterManager:
                 vram_gb=registry_model.vram_gb,
                 progress=model.progress,
                 deadline_seconds=model.deadline_seconds,
+                # Rapportée par l'agent lui-même : elle existe de son côté.
+                acknowledged=True,
             )
 
         # Un status READY du control-plane ne prouve pas que le port data-plane
@@ -780,11 +817,27 @@ class ClusterManager:
 
             if pending_to_resume is not None:
                 pending_node, pending = pending_to_resume
-                async with pending_node.operation_lock:
-                    response = await self._poll_load_operation(
-                        pending_node, pending, None
+                try:
+                    async with pending_node.operation_lock:
+                        response = await self._poll_load_operation(
+                            pending_node, pending, None
+                        )
+                except ClusterLoadAbandonedError as exc:
+                    # Le nœud ne peut plus produire ce résultat : sans purge, le
+                    # modèle resterait inutilisable jusqu'au redémarrage de la
+                    # gateway, même avec un autre nœud sain (P0-2).
+                    log.warning(
+                        "Reprise du chargement de '%s' : %s Réservation purgée, "
+                        "nouveau placement.",
+                        model_id,
+                        exc,
                     )
-                if response.state == "ready":
+                    async with self._lock:
+                        # Préférer un autre nœud sain au replacement ; ce nœud
+                        # reste un repli si aucune alternative n'a la capacité.
+                        pending_node.suspect_models.add(model_id)
+                    response = None
+                if response is not None and response.state == "ready":
                     return await self._finish_pending_load(
                         pending_node, model, pending, response
                     )
@@ -841,14 +894,42 @@ class ClusterManager:
         pending: _PendingLoad,
         initial: LoadResponse | None,
     ) -> LoadResponse:
-        """Résout le résultat d'un load accepté, sans changer d'opération."""
+        """
+        Résout le résultat d'un load accepté, sans changer d'opération.
+
+        Trois issues : un état terminal de l'agent ; `ClusterLoadUncertainError`
+        (réservation conservée, aucun failover — l'agent peut encore aboutir) ;
+        `ClusterLoadAbandonedError` (réservation purgeable — il ne le peut
+        plus). L'incertitude est bornée : au-delà de
+        `created_at + deadline_seconds + _operation_grace_seconds`, l'échéance
+        appliquée par l'agent est forcément échue. Sans cette borne, une
+        réservation orpheline survivait jusqu'au redémarrage de la gateway.
+        """
         response = initial
         if response is not None:
             self._validate_load_identity(response, pending)
+            pending.acknowledged = True
             if response.state in {
                 "ready", "failed", "conflict", "deadline_exceeded"
             }:
                 return response
+
+        budget = pending.deadline_seconds or 300.0
+        expires_at = pending.created_at + budget + self._operation_grace_seconds
+        # Un POST incertain peut encore être en cours de traitement côté agent
+        # (attente de son verrou de modèle) : un 404 n'est définitif qu'après
+        # la grâce, ou dès que l'agent a prouvé connaître l'opération.
+        unknown_grace_until = min(
+            pending.created_at + self._operation_grace_seconds, expires_at
+        )
+
+        def abandon(reason: str) -> ClusterLoadAbandonedError:
+            return ClusterLoadAbandonedError(
+                pending.model_id, node_state.node_id, pending.operation_id, reason
+            )
+
+        if time.monotonic() >= expires_at:
+            raise abandon("échéance négociée et délai de grâce dépassés")
 
         getter = getattr(node_state.client, "get_operation_status", None)
         if getter is None:
@@ -856,9 +937,17 @@ class ClusterManager:
                 pending.model_id, node_state.node_id, pending.operation_id
             )
 
-        deadline = time.monotonic() + (pending.deadline_seconds or 300.0)
+        deadline = min(time.monotonic() + budget, expires_at)
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            if now >= expires_at:
+                raise abandon("échéance négociée et délai de grâce dépassés")
+            if not node_state.online:
+                # Même politique que pour un modèle READY sur un nœud offline :
+                # replacement. Une copie revenue plus tard est réconciliée comme
+                # doublon comptabilisé et évictable.
+                raise abandon("nœud offline")
+            remaining = deadline - now
             if remaining <= 0:
                 raise ClusterLoadUncertainError(
                     pending.model_id, node_state.node_id, pending.operation_id
@@ -877,11 +966,20 @@ class ClusterManager:
                 await asyncio.sleep(min(0.2, max(0.0, remaining)))
                 continue
             except NodeProtocolError as exc:
+                if exc.status_code == 404:
+                    if (
+                        pending.acknowledged
+                        or time.monotonic() >= unknown_grace_until
+                    ):
+                        raise abandon("opération inconnue du nœud") from exc
+                    await asyncio.sleep(min(0.2, max(0.0, remaining)))
+                    continue
                 raise ClusterLoadUncertainError(
                     pending.model_id, node_state.node_id, pending.operation_id
                 ) from exc
 
             self._validate_load_identity(response, pending)
+            pending.acknowledged = True
             async with self._lock:
                 current = node_state.pending_loads.get(pending.model_id)
                 if current is pending:
@@ -911,7 +1009,28 @@ class ClusterManager:
                 )
             except asyncio.CancelledError:
                 raise
-            except (NodeUnreachableError, NodeProtocolError):
+            except NodeProtocolError as exc:
+                if exc.status_code == 409:
+                    # Conflit d'identité (autre génération active) ou unload en
+                    # cours côté agent. Le corps de l'agent reste au journal :
+                    # ce message remonte jusqu'au client.
+                    log.warning(
+                        "Chargement de '%s' refusé par '%s' (409) : %s",
+                        model.id, node_state.node_id, exc,
+                    )
+                    raise ClusterLoadConflictError(
+                        f"Le chargement du modèle '{model.id}' est refusé par le "
+                        "nœud : conflit de génération ou déchargement en cours. "
+                        "Réessayez dans quelques secondes."
+                    ) from exc
+                if exc.is_rejection:
+                    # Refus explicite (404, 422, 401…) : l'agent n'a rien
+                    # enregistré, un polling ne pourrait que répondre 404 et
+                    # bloquer le modèle (P0-2). Échec franc → failover.
+                    raise
+                # 5xx, 408/429, JSON invalide : le POST a peut-être été traité.
+                return await self._poll_load_operation(node_state, pending, None)
+            except NodeUnreachableError:
                 # Le POST a peut-être été reçu. Résoudre avec le même identifiant
                 # avant de considérer un échec ou un failover.
                 return await self._poll_load_operation(node_state, pending, None)
@@ -1161,10 +1280,13 @@ class ClusterManager:
                     await self._clear_pending_load(chosen_state, pending)
                     raise
                 except Exception as exc:
+                    # Inclut ClusterLoadAbandonedError et les refus 4xx : l'agent
+                    # ne produira pas ce résultat, la réservation est purgée.
                     load_outcome = "error"
                     await self._clear_pending_load(chosen_state, pending)
-                    async with self._lock:
-                        self._record_failure_locked(chosen_state, exc)
+                    if self._counts_as_node_failure(exc):
+                        async with self._lock:
+                            self._record_failure_locked(chosen_state, exc)
                     failed_nodes.add(chosen_state.node_id)
                     failures.append(f"{chosen_state.node_id}: {exc}")
                     log.warning(
@@ -1283,7 +1405,8 @@ class ClusterManager:
             except Exception as exc:
                 await self._clear_pending_load(node_state, pending)
                 async with self._lock:
-                    self._record_failure_locked(node_state, exc)
+                    if self._counts_as_node_failure(exc):
+                        self._record_failure_locked(node_state, exc)
                     if self._placement.get(model.id) == node_state.node_id:
                         self._placement.pop(model.id, None)
                 log.warning(
@@ -1598,6 +1721,17 @@ class ClusterManager:
             )
         if needs_status:
             await self._reconcile_node_status(state)
+
+    @staticmethod
+    def _counts_as_node_failure(exc: Exception) -> bool:
+        """
+        Un refus explicite (4xx définitif, conflit) prouve que l'agent répond :
+        le compter vers le seuil offline sortirait du placement un nœud sain
+        pour une définition qu'il refuse, et ses autres modèles avec lui.
+        """
+        if isinstance(exc, ClusterLoadConflictError):
+            return False
+        return not (isinstance(exc, NodeProtocolError) and exc.is_rejection)
 
     def _record_failure_locked(self, state: _NodeState, exc: Exception) -> None:
         """Comptabilise uniformément toute panne de plan de contrôle."""
