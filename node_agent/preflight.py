@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import ssl
 import stat
 import sys
 from pathlib import Path
@@ -120,7 +121,19 @@ async def validate_runtime_version(configured: AgentSettings) -> list[str]:
 async def check_local_health(configured: AgentSettings, timeout: float) -> None:
     """Vérifie l'agent local après restart sans exposer AGENT_SECRET à `ps`."""
     url = local_health_url(configured)
-    async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
+    # Le certificat est ÉPINGLÉ plutôt que non vérifié : la sonde porte
+    # AGENT_SECRET, le secret partagé qui contrôle tous les nœuds. Avec
+    # `verify=False`, n'importe quel processus local capable de se lier au port
+    # (agent arrêté, port libre) recevait ce secret — la sonde prouvait qu'un
+    # serveur répondait, pas que c'était le bon.
+    #
+    # `check_hostname=False` est volontaire et sans perte ici : l'appel vise
+    # 127.0.0.1/::1 (cf. local_health_url) alors que le certificat est émis pour
+    # le nom du nœud. Ce qu'on authentifie, c'est la clé publique épinglée, pas
+    # le nom d'hôte de la boucle locale.
+    context = ssl.create_default_context(cafile=str(configured.agent_tls_cert))
+    context.check_hostname = False
+    async with httpx.AsyncClient(verify=context, timeout=timeout) as client:
         response = await client.get(
             url,
             headers={"Authorization": f"Bearer {configured.agent_secret}"},

@@ -159,6 +159,9 @@ server {
 
     # Headers de sécurité HTTP. Pas de HSTS hors TLS : il n'est légitime
     # qu'une fois le bloc 443 réellement actif (voir la recette HTTPS).
+    # `server_tokens off` : ne pas annoncer `Server: nginx/<version>` sur un
+    # poste de développement joint par le LAN (même arbitrage que deploy/nginx.conf).
+    server_tokens off;
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options DENY always;
 

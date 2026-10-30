@@ -538,12 +538,11 @@ def test_revoke_key_known_prefix_succeeds_and_key_becomes_inactive(
     keys = asyncio.run(db.list_keys_for_user(user["id"]))
     assert keys[0]["is_active"] == 0
 
-    # Écart de comportement constaté (non corrigé, voir rapport) : revoke_key()
-    # fait un UPDATE ... WHERE key_prefix LIKE ? SANS filtrer sur is_active=1,
-    # donc rowcount reste > 0 même si la clé est déjà révoquée. Une seconde
-    # révocation du même préfixe renvoie donc encore 200, PAS 404. On verrouille
-    # ici le comportement réel plutôt que le comportement idéalisé attendu.
+    # Fraîcheur de l'état actif : une seconde révocation du même préfixe ne
+    # révoque plus rien, donc la route répond 404. C'était l'inverse avant la
+    # correction du `LIKE` (SEC-A-01) : `rowcount` restait > 0 parce que le
+    # `UPDATE ... WHERE key_prefix LIKE ?` ne filtrait pas `is_active = 1`.
     second_response = client.delete(
         f"/admin/keys/{key_row['key_prefix']}", headers=admin_headers,
     )
-    assert second_response.status_code == 200
+    assert second_response.status_code == 404

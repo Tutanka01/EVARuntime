@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import logging.config
+import secrets
 import time
 import asyncio
 from contextlib import asynccontextmanager
@@ -185,9 +186,25 @@ async def lifespan(app: FastAPI):
             SECRET_MIN_LENGTH,
         )
     if settings.cluster_mode == "local" and settings.internal_api_key_is_placeholder():
-        log.critical(
-            "INTERNAL_API_KEY non configurée (vide ou CHANGE_ME_*) — la clé "
-            "gateway ↔ llama-server est prévisible. Définissez un secret fort."
+        # Clé absente ou laissée à l'exemple : plutôt que d'avertir et de
+        # démarrer quand même avec une constante publiée dans le code source, on
+        # en tire une aléatoire pour ce processus. Les llama-server du pool
+        # reçoivent la valeur tirée (`build_child_env`) et la gateway la présente
+        # (`auth_headers`), donc le canal gateway ↔ backend reste fermé.
+        #
+        # Fail-closed serait plus strict, mais casserait les déploiements
+        # manuels documentés (`uvicorn main:app`) pour un risque qui n'existe
+        # qu'en loopback : la clé aléatoire supprime le risque sans bloquer.
+        # En mode cluster, la clé doit rester partagée avec les node-agents :
+        # elle n'est jamais générée ici, et `_build_manager` refuse un
+        # AGENT_SECRET faible côté nœuds.
+        settings.internal_api_key = secrets.token_urlsafe(32)
+        log.warning(
+            "INTERNAL_API_KEY non configurée (vide ou CHANGE_ME_*) — une clé "
+            "aléatoire a été générée pour ce processus. Les llama-server déjà "
+            "lancés par une instance précédente ne sont plus joignables : "
+            "définissez INTERNAL_API_KEY dans l'environnement pour un "
+            "déploiement durable."
         )
 
     # Afficher le registre des modèles et le budget VRAM
@@ -524,16 +541,33 @@ async def dashboard_chart_asset():
 
 
 @app.get("/health", include_in_schema=False)
-async def health():
-    """Health check utilisé par nginx et le monitoring."""
+async def health(request: Request):
+    """
+    Health check utilisé par nginx et le monitoring.
+
+    Liveness pure : `status` suffit à décider si le processus répond, et nginx
+    comme le smoke test n'interrogent que le code HTTP. Le détail (identifiants
+    des modèles chargés, VRAM utilisée) n'est donc renvoyé qu'à un appelant
+    privilégié.
+
+    Pourquoi restreindre : `/health` est publique et traversait le `deny all`
+    qui protège `/admin/`. Elle publiait à tout venant l'inventaire des modèles
+    réellement chargés et l'occupation VRAM, alors que le reste du code prend
+    soin de ne pas révéler l'existence d'un modèle (`/v1/models/{id}` renvoie le
+    même 404 pour un identifiant inconnu et pour un modèle désactivé, cf.
+    `model_response`). Un scanner réseau n'a pas besoin de la liste des modèles
+    pour savoir que la gateway est vivante.
+    """
     status = model_manager.status()
+    body: dict = {"status": "ok"}
+    if not caller_is_privileged(request.headers.get("authorization"), settings):
+        return body
+
     loaded = [m["id"] for m in status["models"] if m["state"] == "ready"]
-    return {
-        "status": "ok",
-        "models_loaded": loaded,
-        "vram_used_gb": status["vram_budget"]["used_gb"],
-        "vram_available_gb": status["vram_budget"]["available_gb"],
-    }
+    body["models_loaded"] = loaded
+    body["vram_used_gb"] = status["vram_budget"]["used_gb"]
+    body["vram_available_gb"] = status["vram_budget"]["available_gb"]
+    return body
 
 
 @app.get("/ready", include_in_schema=False)

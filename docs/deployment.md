@@ -1323,6 +1323,14 @@ CAPACITY_QUEUE_TIMEOUT_SECONDS=120
 CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 
+# ── Borne de génération par requête ──────────────────────────────────────────
+# Nombre maximal de tokens demandables en une requête (max_tokens,
+# max_completion_tokens ou n_predict). 0 = aucune borne (comportement historique).
+# Un client qui dépasse reçoit un 400 explicite : la valeur n'est jamais écrêtée
+# en silence. Utile sur un GPU partagé : une requête à 10^8 tokens immobilise un
+# slot pendant toute la durée du timeout d'inférence (600 s).
+MAX_NEW_TOKENS_PER_REQUEST=0
+
 # ── Rétention RGPD ────────────────────────────────────────────────────────────
 # usage_log : suppression au-delà de N jours, au démarrage puis toutes les 24 h
 # (0 = désactivé). Sauvegardes pre-migration : N plus récentes conservées (≥ 1).

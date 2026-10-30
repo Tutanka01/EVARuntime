@@ -44,6 +44,64 @@ def format_url_host(host: str) -> str:
     return f"[{host}]" if ":" in host and not host.startswith("[") else host
 
 
+# ── Environnement du sous-processus llama-server ──────────────────────────────
+#
+# llama-server est un binaire C++ qui parse des GGUF non fiables : le dépôt
+# cite lui-même les overflows de parsing menant au RCE (cf. model_registry.py).
+# Le processus ne doit donc hériter d'AUCUN secret de la gateway. `os.environ`
+# porte ADMIN_SECRET, AGENT_SECRET et INTERNAL_API_KEY (EnvironmentFile de
+# l'unité systemd) : les recopier donnait à une compromission du backend la
+# lecture de /proc/self/environ, donc le contrôle total de /admin et de tous
+# les node-agents. On construit donc un environnement minimal, explicitement
+# autorisé, et on n'y ajoute que ce que llama.cpp a réellement besoin de lire.
+#
+# LD_LIBRARY_PATH est conservé : une compilation llama.cpp liée à des bibliothèques
+# hors /usr/lib échouerait au chargement sans lui. TMPDIR et HOME aussi, le
+# binaire y écrivant ses fichiers temporaires et son cache.
+CHILD_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "LD_LIBRARY_PATH",
+)
+
+
+def build_child_env() -> dict[str, str]:
+    """
+    Environnement transmis à llama-server : allowlist + réglages explicites.
+
+    Aucune variable héritée hors `CHILD_ENV_ALLOWLIST` n'est propagée. Toute
+    variable ajoutée ici est un choix, jamais un héritage accidentel — c'est la
+    différence entre une fuite qui se voit en revue et une fuite qui arrive par
+    une unité systemd modifiée six mois plus tard.
+    """
+    env = {
+        key: os.environ[key]
+        for key in CHILD_ENV_ALLOWLIST
+        if key in os.environ
+    }
+    env["CUDA_VISIBLE_DEVICES"] = settings.cuda_visible_devices
+    # Clé interne passée par variable d'environnement (équivalent --api-key)
+    # plutôt qu'en argument : les arguments sont visibles de tous les
+    # utilisateurs locaux via ps/procfs et finiraient aussi dans les logs.
+    env["LLAMA_API_KEY"] = settings.internal_api_key
+    return env
+
+
+# Taille de lecture par itération du drainage des pipes. `readline()` n'est
+# volontairement pas utilisé : il lève ValueError au-delà de la limite interne
+# du StreamReader (64 Kio par défaut), et cette limite est atteignable par une
+# simple ligne de journal de llama-server (prompt refusé, très long).
+DRAIN_CHUNK_BYTES = 65_536
+# Longueur maximale conservée pour une ligne de diagnostic. Au-delà, la ligne
+# est tronquée : le but est de garder le contexte d'un crash, pas de recopier
+# un prompt entier dans `_stderr_tail`.
+DRAIN_MAX_LINE_BYTES = 8_192
+
+
 # Marqueurs de saturation GPU/CUDA recherchés dans le stderr de llama-server.
 # Source unique : LocalModelManager._is_load_capacity_error s'appuie sur la
 # même liste pour déclencher sa retry après éviction réelle.
@@ -375,12 +433,7 @@ class ServerManager:
         )
         log.info("Lancement llama-server '%s' : %s", self._model.id, " ".join(cmd))
 
-        env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = settings.cuda_visible_devices
-        # Clé interne passée par variable d'environnement (équivalent --api-key)
-        # plutôt qu'en argument : les arguments sont visibles de tous les
-        # utilisateurs locaux via ps/procfs et finiraient aussi dans les logs.
-        env["LLAMA_API_KEY"] = settings.internal_api_key
+        env = build_child_env()
 
         self._process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -394,25 +447,78 @@ class ServerManager:
         asyncio.create_task(self._drain_stream(self._process.stderr))
         asyncio.create_task(self._drain_stream(self._process.stdout))
 
+    def _append_tail(self, raw: bytes, llama_log: logging.Logger) -> None:
+        """
+        Conserve une ligne de diagnostic bornée et la journalise.
+
+        `_stderr_tail` sert à expliquer un crash de llama-server : on y garde
+        la ligne entière si elle est raisonnable, et seulement son début plus
+        une marque de troncature sinon. Recopier une ligne de 300 Kio dans un
+        deque de 30 éléments reviendrait à retenir 9 Mo de sortie pour un
+        diagnostic qui tient en une phrase.
+        """
+        if len(raw) > DRAIN_MAX_LINE_BYTES:
+            decoded = raw[:DRAIN_MAX_LINE_BYTES].decode(errors="replace").rstrip()
+            decoded += f" [… tronqué, {len(raw)} octets au total]"
+        else:
+            decoded = raw.decode(errors="replace").rstrip()
+        self._stderr_tail.append(decoded)
+        llama_log.debug(decoded)
+
     async def _drain_stream(self, stream: asyncio.StreamReader | None) -> None:
         """
         Lit un pipe (stdout ou stderr) de llama-server en continu pour éviter
         son blocage. Alimente _stderr_tail (30 lignes max) pour diagnostic
         en cas de crash.
+
+        Lecture par blocs plutôt que `readline()` : ce dernier lève ValueError
+        dès qu'une ligne dépasse la limite interne du StreamReader (64 Kio), et
+        l'ancien `except Exception: pass` laissait alors la tâche de drainage
+        mourir en silence. Personne ne vidait plus le pipe, llama-server se
+        bloquait sur son écriture, et `process.wait()` — qui ne rend que pipes
+        fermés — ne répondait plus jamais : le modèle restait en UNLOADING et
+        son éviction LRU restait bloquée. Un simple prompt très long journalisé
+        par le backend suffisait à figer la gateway.
+
+        Ici, aucun octet ne peut faire échouer la boucle : les lignes sont
+        recollées à la main, une ligne démesurée est tronquée puis le tampon
+        est vidé, et toute erreur inattendue est journalisée au lieu d'être
+        avalée.
         """
         if stream is None:
             return
         llama_log = logging.getLogger(f"llama-server.{self._model.id}")
+        pending = b""
         try:
             while True:
-                line = await stream.readline()
-                if not line:
+                chunk = await stream.read(DRAIN_CHUNK_BYTES)
+                if not chunk:
                     break
-                decoded = line.decode(errors="replace").rstrip()
-                self._stderr_tail.append(decoded)
-                llama_log.debug(decoded)
-        except Exception:
-            pass
+                pending += chunk
+                while True:
+                    line, sep, rest = pending.partition(b"\n")
+                    if not sep:
+                        break
+                    self._append_tail(line, llama_log)
+                    pending = rest
+                # Ligne toujours ouverte après un bloc complet : elle dépasse la
+                # borne. On l'émet tronquée et on repart à zéro, sans jamais
+                # cesser de lire le pipe.
+                if len(pending) > DRAIN_MAX_LINE_BYTES:
+                    self._append_tail(pending, llama_log)
+                    pending = b""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Un drainage interrompu doit être visible : c'est exactement le
+            # silence qui rendait le défaut impossible à diagnostiquer.
+            log.error(
+                "Drainage %s de llama-server '%s' interrompu : %s",
+                "d'un pipe", self._model.id, exc,
+            )
+        finally:
+            if pending:
+                self._append_tail(pending, llama_log)
 
     async def _wait_for_health(self) -> None:
         """
@@ -432,7 +538,12 @@ class ServerManager:
         timeout = self._model.load_timeout_seconds or settings.model_load_timeout_seconds
         deadline = time.monotonic() + timeout
 
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        # trust_env=False : la sonde vise 127.0.0.1 et ne doit jamais passer par
+        # un proxy d'environnement (HTTP_PROXY/ALL_PROXY lus par httpx). Derrière
+        # un proxy campus, la sonde partait vers le proxy, qui ne peut pas
+        # joindre le loopback de la gateway : tout chargement finissait en
+        # timeout alors que le serveur était prêt.
+        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
             while time.monotonic() < deadline:
                 if self._process and self._process.returncode is not None:
                     # Laisser _drain_stream vider les pipes avant de lire le tail
@@ -571,13 +682,52 @@ class ServerManager:
             except asyncio.TimeoutError:
                 log.warning("SIGTERM ignoré, SIGKILL → '%s' PID %d", self._model.id, pid)
                 os.killpg(pgid, signal.SIGKILL)
-                await self._process.wait()
-                log.debug("llama-server '%s' tué (PID %d)", self._model.id, pid)
+                await self._reap_after_kill(self._process, pid)
 
         except ProcessLookupError:
             pass
 
         self._process = None
+
+    async def _reap_after_kill(
+        self, process: asyncio.subprocess.Process, pid: int
+    ) -> None:
+        """
+        Attend le reap après SIGKILL, sans dépendre du drainage des pipes.
+
+        `Process.wait()` d'asyncio ne rend qu'une fois les pipes refermés, pas
+        seulement le processus mort. Si le drainage a été interrompu (tâche
+        annulée, erreur de transport), le pipe garde son tampon et `wait()`
+        bloque pour toujours : le modèle reste en UNLOADING et son éviction LRU
+        bloque les autres chargements sous le verrou de capacité. On ferme donc
+        explicitement les transports en dernier recours — le processus est déjà
+        mort, perdre la fin de son journal est sans conséquence.
+        """
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10.0)
+            log.debug("llama-server tué (PID %d)", pid)
+            return
+        except asyncio.TimeoutError:
+            log.error(
+                "SIGKILL envoyé mais le reap de llama-server (PID %d) ne rend "
+                "pas : fermeture forcée des pipes pour libérer l'éviction.",
+                pid,
+            )
+        for stream in (process.stdout, process.stderr):
+            transport = getattr(stream, "_transport", None) if stream is not None else None
+            if transport is not None:
+                try:
+                    transport.close()
+                except Exception:
+                    pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except Exception:
+            log.critical(
+                "Reap de llama-server (PID %d) toujours bloqué après fermeture "
+                "des pipes : état du sous-processus abandonné.",
+                pid,
+            )
 
     # ── Moniteur d'inactivité ─────────────────────────────────────────────────
 

@@ -214,7 +214,11 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     chmod 600 "$CONFIG_FILE"
 
     warn "Configuration générée dans $CONFIG_FILE"
-    warn "ADMIN_SECRET = $ADMIN_SECRET — notez-le maintenant."
+    # Le secret n'est PAS affiché : la sortie d'un installeur finit dans un
+    # journal, un `tee` ou l'historique de console, alors que le fichier est
+    # protégé (chmod 600). Même arbitrage que deploy/install.sh.
+    warn "ADMIN_SECRET généré dans $CONFIG_FILE (chmod 600)."
+    warn "Le lire avec : grep '^ADMIN_SECRET=' $CONFIG_FILE"
 else
     info "Configuration existante conservée : $CONFIG_FILE"
 fi

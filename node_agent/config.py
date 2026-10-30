@@ -270,6 +270,19 @@ class AgentSettings(BaseSettings):
             errors.append("INTERNAL_API_KEY doit être une clé non-placeholder d'au moins 32 caractères")
         if self.agent_tls_cert is None or self.agent_tls_key is None:
             errors.append("AGENT_TLS_CERT et AGENT_TLS_KEY sont obligatoires pour l'agent réseau")
+        # ALLOWED_MODEL_DIRS borne ce que l'orchestrateur peut faire charger sur
+        # CE nœud. Vide, la contrainte disparaît silencieusement : `ModelRegistry`
+        # n'applique son contrôle que `if self._allowed_dirs`, donc un agent
+        # démarré sans répertoire autorisé accepte n'importe quel chemin GGUF
+        # absolu lisible par le service — y compris hors de /models. Le déploiement
+        # livré définit déjà `/models` (env.example, install-agent.sh) : rendre le
+        # réglage obligatoire ne casse que les configurations construites à la main,
+        # et c'est exactement celles qu'un contrôle de sécurité doit rattraper.
+        if not self.allowed_model_dirs_list():
+            errors.append(
+                "ALLOWED_MODEL_DIRS doit lister au moins un répertoire de modèles "
+                "(chemin absolu) : sans lui, le nœud charge n'importe quel chemin"
+            )
         try:
             data_plane_ip = ipaddress.ip_address(self.llama_server_host)
         except ValueError:

@@ -128,14 +128,21 @@ que ce soit d'autre dans les requêtes.
 
 ### Vérifier l'état du service
 
-Cet endpoint ne requiert pas d'authentification et indique si le service est opérationnel,
-quels modèles sont actuellement en mémoire GPU et combien de VRAM est disponible.
+Cet endpoint ne requiert pas d'authentification et indique si le service est opérationnel.
+Les identifiants des modèles chargés et l'occupation VRAM ne sont renvoyés qu'à un
+appelant qui présente `ADMIN_SECRET` — sans quoi `/health`, qui est publique et
+traverse le filtrage IP de `/admin/`, publierait l'inventaire des modèles à tout venant.
 
 ```bash
 curl -s http://127.0.0.1:8000/health
 ```
 
-Réponse attendue :
+Réponse attendue (appel anonyme) :
+```json
+{"status": "ok"}
+```
+
+Avec `Authorization: Bearer $ADMIN_SECRET` :
 ```json
 {
   "status": "ok",

@@ -13,6 +13,9 @@ def make_settings(**overrides) -> AgentSettings:
     values = {
         "agent_secret": "a" * 32,
         "internal_api_key": "b" * 32,
+        # Requis depuis SEC-CLU-101 : sans répertoire autorisé, le node-agent
+        # chargeait n'importe quel chemin GGUF absolu.
+        "allowed_model_dirs": "/models",
     }
     values.update(overrides)
     return AgentSettings(_env_file=None, **values)
