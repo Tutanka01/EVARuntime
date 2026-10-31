@@ -97,6 +97,40 @@ def test_known_formats_survive_the_anchoring(output: str, expected: int) -> None
     assert parse_llama_version(output) == expected
 
 
+def test_le_format_semantique_de_llama_cpp_rend_le_vrai_build() -> None:
+    """
+    Sortie réelle du binaire officiel b12020. L'ancien motif lisait « version: 0 »,
+    donc un build 0 sous tout plancher : la gateway refusait de démarrer sur le
+    dernier llama.cpp, en l'accusant d'être potentiellement vulnérable.
+    """
+    sortie = (
+        "version: 0.8.0-dev (build 12020, commit 0ec4027a2)\n"
+        "built with GNU 14.2.0 for Linux aarch64\n"
+    )
+    assert parse_llama_build(sortie) == (12020, "0ec4027a2")
+    assert parse_llama_build(CUDA_PREAMBLE.replace(
+        "version: 6120 (a1b2c3d)", "version: 0.9.1 (build 6120, commit A1B2C3D)",
+    )) == (6120, "a1b2c3d")
+
+
+@pytest.mark.parametrize("sortie", [
+    "version: 0.8.0-dev",
+    "version: 0.8.0",
+    "version: 10.2",
+    "version 0.8.0",
+    "version: 0.8.0 (commit 0ec4027a2)",
+])
+def test_une_version_semantique_sans_build_n_atteste_rien(sortie: str) -> None:
+    """Le plancher porte sur le build : mieux vaut None qu'un numéro de version mineur."""
+    assert parse_llama_version(sortie) is None
+
+
+def test_le_format_semantique_ambigu_reste_refuse() -> None:
+    assert parse_llama_version(
+        "version: 0.8.0 (build 12020, commit 0ec4027a2)\nversion: 6120 (a1b2c3d)"
+    ) is None
+
+
 # ── Politique fail-closed ─────────────────────────────────────────────────────
 
 def _probe(monkeypatch, version: LlamaVersion) -> None:
