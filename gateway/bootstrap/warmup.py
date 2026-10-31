@@ -5,7 +5,7 @@ Le problème
 -----------
 Après une installation ou une mise à jour, le premier utilisateur qui arrive
 déclenche le chargement du modèle et attend — jusqu'à cinq minutes sur le
-registre livré. §10 de `codex-analyse.md` tranche : on charge AVANT d'ouvrir le
+registre livré. Décision : on charge AVANT d'ouvrir le
 trafic. « Cela améliore beaucoup plus le premier token utilisateur qu'un
 heartbeat pendant un chargement de dix minutes. »
 

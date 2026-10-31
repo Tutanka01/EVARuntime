@@ -771,21 +771,14 @@ Le hot-reload décharge le modèle et le relance avec `--cpu-moe` à la prochain
 Quand llama-server s'arrête prématurément (exit code ≠ 0), la raison est dans
 son stderr : CUDA OOM, mauvais chemin de modèle, driver incompatible, etc.
 
-`ServerManager` maintient un buffer circulaire des 30 dernières lignes de stderr
-(`deque(maxlen=30)` alimenté par `_drain_logs`). Quand `_wait_for_health` détecte
-un returncode non nul, il attend 150ms pour laisser le drain vider le pipe, puis
-construit le message d'erreur avec le tail :
+`ServerManager` maintient un buffer circulaire des 30 dernières lignes de sortie
+(`deque(maxlen=30)` alimenté par `_drain_stream`, lignes tronquées à 8 Kio). Quand
+`_wait_for_health` détecte un returncode non nul, il attend 150 ms pour laisser le
+drain vider le pipe.
 
-```python
-raise RuntimeError(
-    f"llama-server '{model.id}' s'est terminé prématurément (code {returncode}).\n"
-    f"Stderr (dernières {n} lignes) :\n  {tail_text}"
-)
-```
-
-Ce message est propagé dans les logs gateway au niveau ERROR et dans la réponse
-HTTP 503 retournée au client, ce qui rend le diagnostic immédiat sans avoir à
-ouvrir le fichier de log du sous-processus.
+Le tail complet part dans le journal de la gateway au niveau ERROR. Le client
+reçoit un `503` au message générique, sans stderr ni chemin de fichier : le
+diagnostic se fait donc dans `journalctl -u llm-gateway`.
 
 ---
 
@@ -839,7 +832,7 @@ Gateway ──────► INTERNAL_API_KEY ───────────
                 (injectée dans chaque                           │
                  llama-server du pool)         (127.0.0.1 only) │
                                                                 │
-DB stocke uniquement : key_hash, key_prefix (8 chars)  ◄───────┘
+DB stocke uniquement : key_hash, key_prefix (14 chars) ◄───────┘
                        jamais : raw_key
 ```
 
@@ -856,6 +849,23 @@ DB stocke uniquement : key_hash, key_prefix (8 chars)  ◄───────�
 | Accès non autorisé | `require_admin` sur tous les endpoints `/admin/models/*` |
 | Injection model_id | Regex `^[a-z0-9][a-z0-9._-]{0,62}$` sur tous les model_id |
 | GGUF substitué / corrompu | Champ `sha256` optionnel — attestation fail-closed au démarrage puis à chaque transition vers LOADING (SEC-ART-001) |
+
+### Isolation de llama-server
+
+`llama-server` parse des GGUF : il reçoit donc le moins possible de la gateway.
+
+| Mesure | Mise en œuvre |
+|--------|---------------|
+| Environnement minimal | `child_env.CHILD_ENV_ALLOWLIST`, plus `CUDA_VISIBLE_DEVICES` et `LLAMA_API_KEY`. Aucun secret de la gateway n'est transmis, y compris pendant la calibration du bootstrap. |
+| Clé interne jamais prévisible | En mode local, un `INTERNAL_API_KEY` vide ou `CHANGE_ME_*` est remplacé au démarrage par une clé aléatoire, valable pour ce processus. |
+| Appels internes hors proxy | `trust_env=False` sur les clients d'inférence, de sonde, de métriques et de plan de contrôle : un `HTTP_PROXY` ne voit passer ni prompt ni secret. |
+| Sortie toujours drainée | `_drain_stream` lit par blocs et tronque les lignes démesurées : un pipe plein gèlerait le backend. |
+
+**Limite : même utilisateur système.** `llama-server` tourne sous le même UID que
+la gateway. L'allowlist retire les secrets de son propre environnement, mais un
+processus compromis peut encore lire `/proc/<gateway>/environ` et l'EnvironmentFile
+(640 `root:llmservice`), donc `ADMIN_SECRET` et `AGENT_SECRET`. La fermeture de ce
+chemin est suivie dans la [roadmap](../ROADMAP.md) (`SEC-018`).
 
 ### Durcissement de llama.cpp (supply-chain)
 

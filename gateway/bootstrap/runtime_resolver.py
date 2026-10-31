@@ -145,7 +145,7 @@ _BACKEND_BUILD_FLAG: dict[str, str] = {
 
 # ── Niveaux de preuve de la matrice d'artefacts ───────────────────────────────
 
-# Affirmé par `codex-analyse.md` §6.
+# Affirmé par la spécification de la matrice, sans preuve d'exécution.
 EVIDENCE_SPEC = schema.EVIDENCE_SPEC
 # Plausible, non vérifié : ce module n'a pas d'accès réseau et ne consulte donc
 # aucune page de release. À confirmer contre la matrice amont avant de s'en

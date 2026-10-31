@@ -4,7 +4,7 @@ AUT-008 — calibration RÉELLE de la RAM et de la VRAM d'un modèle (§9, jalon
 Ce que ce module est
 --------------------
 L'exécuteur de `schema.ACTION_CALIBRATE_MODEL`. Il applique littéralement les
-neuf étapes de `codex-analyse.md` §9 « Calibration réelle » : relever le repos,
+neuf étapes de la calibration réelle : relever le repos,
 charger à contexte réduit, relever les pics **pendant** la charge, faire un
 prompt court, répéter au contexte et au parallélisme cibles, conserver le
 maximum observé, ajouter une marge, écrire les mesures dans un rapport séparé,

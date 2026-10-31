@@ -9,7 +9,7 @@ Deux voies existent :
 | Voie | À qui elle convient | Limite principale |
 |---|---|---|
 | [Homebrew](#voie-homebrew-brew-install-llamacpp) | Test rapide, station de développement | Version imposée par la formule, backend Metal parfois absent du bottle, plancher supply-chain non maîtrisé |
-| [Depuis les sources](#voie-recommandée-build-depuis-les-sources) | Production (**recommandée**) | Temps de compilation (~5–15 min) |
+| [Depuis les sources](#voie-recommandée--build-depuis-les-sources) | Production (**recommandée**) | Temps de compilation (~5–15 min) |
 
 La version Homebrew est un compromis pratique : la formule suit les tags
 officiels `bNNNN` de llama.cpp mais avec un décalage volontaire, et le bottle

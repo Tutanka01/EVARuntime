@@ -4,7 +4,7 @@ AUT-009 — recette automatique du premier token (jalon M2).
 Ce que ce module prouve
 -----------------------
 Qu'une installation **sert**, et pas seulement qu'elle **répond**. La distinction
-est celle de §10 de `codex-analyse.md`, et elle porte le nom du jalon : le chemin
+porte le nom du jalon : le chemin
 public complet doit être traversé de bout en bout —
 
 ```text

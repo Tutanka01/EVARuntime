@@ -22,8 +22,10 @@ subprocesses.
   historical entry point that links to it; do not maintain a second copy.
 - `docs/architecture.md`, `docs/api.md`, `docs/deployment.md`, and
   `docs/observability.md` describe behavior already delivered.
-- `codex-analyse.md` is a historical implementation log. Use it only when
-  reconstructing an old change; its counters and statuses are not authoritative.
+- Do not add audit reports, analysis logs or research notes to the repository.
+  Findings belong in `ROADMAP.md`, GitHub Issues and PR descriptions; lasting
+  behavior and limits belong in the essential docs above. Old material remains
+  available through Git history (`git log -- codex-analyse.md`).
 - Use GitHub Issues for scoped, actionable work with acceptance criteria. Keep
   broad initiatives as epics and use checklists or linked issues for their
   current slice. Use a discussion/RFC for an unresolved architectural choice,
@@ -289,5 +291,3 @@ When you need context, start here:
 7. `gateway/model_registry.py`
 8. `gateway/cluster/*` for cluster behavior
 9. `node_agent/main.py`
-10. `codex-analyse.md` only when historical implementation context is needed;
-    it is not the current tracker.

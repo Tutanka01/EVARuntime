@@ -4,7 +4,7 @@ AUT-004 — adaptateur LLMfit : CLI épinglée, sortie JSON validée à la front
 Ce que ce module fait, et pourquoi si peu
 -----------------------------------------
 LLMfit (MIT, https://github.com/AlexsJones/llmfit) détecte le matériel et
-recommande une quantification. §7 de `codex-analyse.md` retient de l'adopter
+recommande une quantification. EVARuntime l'adopte
 **par sa CLI versionnée et sa sortie JSON**, sans réimplémenter son moteur ni le
 forker. Ce module est donc un adaptateur, pas une intégration : il localise un
 binaire déjà installé, vérifie son empreinte, l'exécute avec un délai maximal,

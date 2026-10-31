@@ -1,8 +1,11 @@
 """
 `eva-bootstrap` — planificateur d'amorçage (Lot B, jalon M1).
 
+Les renvois `§N` de ces modules visent le plan de consolidation retiré du dépôt,
+consultable par `git log -- codex-analyse.md`.
+
 Ce paquet est la couche NON privilégiée du parcours « machine vierge → premier
-token » (§5 de `codex-analyse.md`). `gateway/deploy/install.sh` reste la couche
+token ». `gateway/deploy/install.sh` reste la couche
 privilégiée : utilisateurs système, répertoires, venv, systemd, nginx. Ici on ne
 fait qu'inventorier, résoudre, recommander et **écrire un plan** — jamais
 l'appliquer. Aucun module de ce paquet ne doit acquérir de privilèges, ni écrire

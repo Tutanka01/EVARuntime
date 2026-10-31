@@ -3,8 +3,7 @@ AUT-002 — inventaire matériel automatique : CPU, RAM, disque, GPU, backends.
 
 Ce que produit ce module
 ------------------------
-Un `HardwareProfile` conforme au contrat de données de `codex-analyse.md` §5
-(« Données d'inventaire minimales »), projeté vers la section `hardware` du plan
+Un `HardwareProfile` conforme au contrat de données d'inventaire, projeté vers la section `hardware` du plan
 de bootstrap. C'est le premier maillon du pipeline §5 : tout ce qui suit —
 résolution du runtime (AUT-003), recommandation LLMfit (AUT-004), filtre
 catalogue (AUT-005) — raisonne sur ce profil et sur rien d'autre.
@@ -49,7 +48,7 @@ force le résolveur de runtime à refuser plutôt qu'à se rabattre.
 
 VRAM nominale contre VRAM exposée — décision assumée
 -----------------------------------------------------
-`codex-analyse.md` §0.9 relève un écart réel : `TOTAL_VRAM_GB=48.0` posé par
+Un écart réel a été relevé : `TOTAL_VRAM_GB=48.0` posé par
 `install.sh` contre ~45,0 Go réellement exposés par une L40S. L'item demandait
 d'envisager un constat déclenché par l'écart au « nominal commercial déduit du
 nom du modèle ».
@@ -136,8 +135,7 @@ _CUDA_13_MIN_DRIVER = 580
 # les autres — c'est-à-dire sur celles où la question se pose.
 DEFAULT_MODELS_DIR = Path("/models")
 
-# Requête EXACTEMENT telle que spécifiée par `codex-analyse.md` §5, à l'identique
-# de `doctor._NVIDIA_SMI_QUERY`. Aucun secret ne transite par argv.
+# Requête à l'identique de `doctor._NVIDIA_SMI_QUERY`. Aucun secret ne transite par argv.
 NVIDIA_SMI_QUERY = "--query-gpu=index,uuid,name,memory.total,driver_version,compute_cap"
 NVIDIA_SMI_FORMAT = "--format=csv,noheader,nounits"
 
@@ -1159,8 +1157,8 @@ def load_hardware_profile(
     except json.JSONDecodeError as exc:
         raise InventoryError(
             f"{origin} : JSON illisible ({exc.msg}, ligne {exc.lineno}, "
-            f"colonne {exc.colno}). Attendu : le document décrit par "
-            f"codex-analyse.md §5."
+            f"colonne {exc.colno}). Attendu : un profil matériel, voir "
+            f"--hardware-profile dans docs/admin.md."
         ) from exc
 
     errors = validate_profile_document(document)

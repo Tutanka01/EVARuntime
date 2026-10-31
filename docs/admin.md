@@ -266,6 +266,16 @@ Réponse de l'API :
   `force` et `period` gardent une valeur lisible ; la valeur de tout autre
   paramètre, présent ou futur, est rédigée par défaut.
 
+- **Effacement sur disque.** Chaque connexion SQLite active `secure_delete` : les
+  données effacées sont remplacées par des zéros dans `gateway.db`. Trois limites
+  à connaître :
+  - un nom anonymisé **avant** l'activation de ce réglage peut subsister dans les
+    pages libres : lancez `purge-usage` (section 5), qui fait un `VACUUM` ;
+  - les sauvegardes antérieures gardent leur contenu jusqu'à leur purge ;
+  - tant qu'une autre connexion est ouverte, l'ancienne valeur peut rester dans
+    `gateway.db-wal`. Une sauvegarde par `llm-gateway-backup.sh` n'est pas
+    concernée ; une copie brute de `gateway.db` et de son WAL peut l'être.
+
 > **Désactiver ≠ anonymiser.** `disable-user` bloque l'accès en conservant toutes
 > les données et se réactive avec `enable-user`. `anonymize-user` efface les
 > données personnelles définitivement et ne s'annule pas. Pour une suspension
@@ -296,11 +306,11 @@ llmgw create-key alice --name "local-dev" --expires "2026-01-01"
 #   Clé API créée avec succès
 #   Utilisateur : alice
 #   Nom         : these-2025
-#   Préfixe     : llmgw-xK8mP
+#   Préfixe     : llmgw-xK8mPq2R
 #   Expire le   : jamais
 #
 #   CLEF API (à copier maintenant — non récupérable) :
-#   llmgw-xK8mP3rNvQw9...
+#   llmgw-xK8mPq2R3rNvQw9...
 # ╚══════════════════════════════════════════════════╝
 
 # API REST
@@ -311,8 +321,8 @@ curl -s -X POST "$GW/admin/users/alice/keys" \
 
 # Réponse :
 # {
-#   "api_key": "llmgw-xK8mP3rNvQw9...",   ← à transmettre à Alice
-#   "key_prefix": "llmgw-xK8mP",
+#   "api_key": "llmgw-xK8mPq2R3rNvQw9...",   ← à transmettre à Alice
+#   "key_prefix": "llmgw-xK8mPq2R",
 #   "name": "these-2025",
 #   "created_at": "2025-03-01T10:00:00",
 #   "expires_at": null
@@ -329,8 +339,8 @@ llmgw list-keys alice
 # ┌────────────────┬────────────────┬────────┬──────────────────────┬────────────┐
 # │ Préfixe        │ Nom            │ Active │ Dernière utilisation  │ Expire le  │
 # ├────────────────┼────────────────┼────────┼──────────────────────┼────────────┤
-# │ llmgw-xK8mP   │ these-2025     │ oui    │ 2025-03-15 14:32:00  │ jamais     │
-# │ llmgw-aB2cD   │ local-dev      │ oui    │ jamais               │ 2026-01-01 │
+# │ llmgw-xK8mPq2R │ these-2025     │ oui    │ 2025-03-15 14:32:00  │ jamais     │
+# │ llmgw-aB2cDe4F │ local-dev      │ oui    │ jamais               │ 2026-01-01 │
 # └────────────────┴────────────────┴────────┴──────────────────────┴────────────┘
 
 # API REST
@@ -345,13 +355,17 @@ La révocation est **immédiate** : la prochaine requête avec cette clé reçoi
 ```bash
 # Identifier le préfixe de la clé à révoquer (depuis list-keys)
 # CLI
-llmgw revoke-key llmgw-xK8mP
+llmgw revoke-key llmgw-xK8mPq2R
 
 # API REST
-curl -s -X DELETE "$GW/admin/keys/llmgw-xK8mP" \
+curl -s -X DELETE "$GW/admin/keys/llmgw-xK8mPq2R" \
   -H "Authorization: Bearer $ADMIN_SECRET"
-# → {"message": "Clé 'llmgw-xK8mP' révoquée avec succès."}
+# → {"message": "Clé 'llmgw-xK8mPq2R' révoquée avec succès."}
 ```
+
+Le préfixe doit être **complet** (`llmgw-` + 8 caractères, tel que l'affiche
+`list-keys`) : la comparaison est une égalité stricte. Un préfixe partiel, inconnu
+ou celui d'une clé déjà révoquée répond `404`.
 
 ---
 

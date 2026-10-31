@@ -680,10 +680,11 @@ response = client.chat.completions.create(
 > `max_tokens`, `max_completion_tokens` et `n_predict` n'acceptent qu'un
 > **entier positif ou nul**. Une valeur négative (notamment `n_predict: -1`,
 > convention llama.cpp pour « jusqu'à remplir le contexte »), un booléen ou une
-> chaîne sont refusés en `400` : la gateway ne tronque jamais silencieusement.
-> Omettre le champ demande le comportement par défaut du backend. Le déploiement
-> peut en outre fixer `MAX_NEW_TOKENS_PER_REQUEST` (voir
-> [deployment.md](deployment.md), section « Référence de configuration »).
+> chaîne sont refusés en `400`.
+> Omettre le champ demande le comportement par défaut du backend. Si le déploiement
+> fixe `MAX_NEW_TOKENS_PER_REQUEST` (voir [deployment.md](deployment.md), section
+> « Référence de configuration »), une valeur au-delà est refusée en `400` et une
+> requête sans borne reçoit cette limite : `finish_reason` vaut alors `length`.
 
 #### Recommandations par cas d'usage
 
@@ -1241,6 +1242,7 @@ Ce modèle est-il chargé en VRAM ?
 ### Gérer ce délai dans votre code
 
 ```python
+import os
 import time
 from openai import OpenAI, APIStatusError
 import httpx
@@ -1259,23 +1261,15 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Bonjour"}],
 )
 
-# Option 2 — interroger /health en amont pour anticiper l'état du service.
-# Appel anonyme : liveness seulement.
-def get_service_status() -> dict:
-    r = httpx.get("https://gateway.example.com/health", timeout=5)
-    return r.json()
-
-status = get_service_status()
-assert status == {"status": "ok"}
-
-# Détail (modèles chargés, VRAM) : réservé au porteur d'ADMIN_SECRET.
-detail = httpx.get(
-    "https://gateway.example.com/health",
-    headers={"Authorization": f"Bearer {os.environ['ADMIN_SECRET']}"},
+# Option 2 — interroger la queue d'admission pour anticiper l'attente.
+# /health ne renvoie qu'une liveness anonyme : les modèles chargés et la VRAM ne
+# sont pas exposés aux clients.
+capacity = httpx.get(
+    "https://gateway.example.com/v1/capacity",
+    headers={"Authorization": f"Bearer {os.environ['EVA_API_KEY']}"},
     timeout=5,
 ).json()
-print("Modèles actuellement chargés :", detail["models_loaded"])
-print("VRAM disponible :", detail["vram_available_gb"], "Go")
+print("Requêtes en attente :", capacity["waiters"])
 ```
 
 ---

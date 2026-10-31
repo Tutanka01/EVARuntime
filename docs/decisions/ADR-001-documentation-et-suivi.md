@@ -20,8 +20,9 @@ contradictions et rend le dépôt difficile à reprendre.
   chantiers et les checklists évitent les micro-issues prématurées.
 - Les choix non tranchés passent par une RFC/Discussion, puis une ADR lors de
   la décision.
-- `codex-analyse.md` est conservé comme archive historique et n’est plus le
-  tracker courant.
+- Le dépôt ne conserve ni archive d’analyse ni rapport d’audit. `codex-analyse.md`,
+  d’abord gardé comme archive, a été retiré le 31 octobre 2026 ; il reste
+  consultable dans l’historique Git.
 
 ## Conséquences
 

@@ -18,13 +18,13 @@
 cluster:
   # Vérification TLS des certificats agents.
   # Options :
-  #   true                      → vérification système (certificat signé par CA reconnue)
+  #   true                      → AC publiques du paquet certifi, pas le magasin système
   #   false                     → désactivée (LAN strict, dev uniquement — DÉCONSEILLÉ en prod)
   #   /chemin/vers/ca-bundle.pem → bundle CA personnalisé (certificats auto-signés ou PKI locale)
   #
   # Deux options :
-  #   a) Certificats signés par une AC reconnue → tls_verify: true
-  #   b) Certificats auto-signés (générés par install-agent.sh) → tls_verify: /etc/ssl/certs/nodes-ca.pem
+  #   a) Certificats signés par une AC publique → tls_verify: true
+  #   b) Certificats auto-signés (install-agent.sh) ou AC interne → tls_verify: /etc/ssl/certs/nodes-ca.pem
   #      Concaténer les .crt des agents dans ce fichier :
   #        cat /etc/ssl/certs/gpu-node-a.crt /etc/ssl/certs/gpu-node-b.crt > /etc/ssl/certs/nodes-ca.pem
   tls_verify: /etc/ssl/certs/llm-gateway-nodes-ca.pem

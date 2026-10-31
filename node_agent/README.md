@@ -47,15 +47,22 @@ Le script :
   vérification opérateur du firewall.
 
 Le secret doit être celui préparé côté orchestrateur. Transférez-le dans un
-fichier root-only; ne placez jamais sa valeur dans la ligne de commande :
+fichier root-only; ne placez jamais sa valeur dans la ligne de commande.
 
-```bash
-sudo bash node_agent/deploy/install-agent.sh \
-  --node-id dgx-a \
-  --llama-min-build <premier_build_corrige> \
-  --agent-secret-file /root/agent-secret \
-  --orchestrator-cidr 10.42.0.10/32
-```
+| Option | Rôle | Défaut |
+|---|---|---|
+| `--node-id ID` | Identifiant présent dans `nodes.yaml` | obligatoire |
+| `--llama-min-build N` | Premier build corrigé accepté (> 0) | obligatoire |
+| `--agent-secret-file PATH` | Secret partagé, lu dans un fichier root-only | secret généré |
+| `--orchestrator-cidr CIDR` | Source autorisée dans UFW | aucune règle |
+| `--host IP`, `--port PORT` | Écoute HTTPS de l'agent | `0.0.0.0`, `9443` |
+| `--llama-host IP` | Écoute du plan de données | `0.0.0.0` |
+| `--llama-server-bin PATH` | Binaire attesté | `/opt/llama.cpp/current/llama-server` |
+| `--base-llama-port PORT` | Premier port du plan de données | `8081` |
+| `--max-loaded-models N` | Taille du pool de ports | `5` |
+
+Toutes les variables de l'agent sont décrites dans la
+[référence de configuration](../docs/deployment.md#node-agent-etcllm-gateway-agentenv).
 
 Puis copiez le certificat public vers l'orchestrateur, renseignez le nœud dans
 `nodes.yaml`, et démarrez :
@@ -67,8 +74,11 @@ sudo /opt/llm-gateway/venv-agent/bin/python \
   --env /etc/llm-gateway-agent/env --check-health
 ```
 
-`ALLOWED_MODEL_DIRS` accepte `/models`, une liste CSV
-(`/models,/srv/gguf`) ou un tableau JSON. Tous les chemins doivent être absolus.
+`ALLOWED_MODEL_DIRS` est **obligatoire**. Il accepte `/models`, une liste CSV
+(`/models,/srv/gguf`) ou un tableau JSON, et tous les chemins doivent être absolus.
+
+`AGENT_TLS_CERT` peut être le certificat auto-signé généré par l'installeur, une
+feuille d'AC seule ou une fullchain : le health-check l'épingle tel quel.
 
 ## Inventaire GPU et VRAM
 
@@ -105,6 +115,12 @@ logs et modèles. Il construit un venv neuf en staging, vérifie le code et les
 dépendances, sauvegarde code + ancien venv + unité systemd, redémarre puis sonde
 l'agent. Un échec restaure automatiquement la version précédente. Le dernier
 rollback connu bon reste dans `/opt/llm-gateway/.agent-rollback`.
+
+`update-agent.sh` ne modifie jamais `/etc/llm-gateway-agent/env` : si une clé
+obligatoire manque, comme `ALLOWED_MODEL_DIRS`, le préflight refuse la mise à jour
+avant toute écriture. Ajoutez-la à la main, ou relancez `install-agent.sh`, qui
+complète les clés absentes (`ALLOWED_MODEL_DIRS=/models` : adaptez cette valeur si
+vos GGUF sont ailleurs).
 
 Utilisez `--no-pull` quand le checkout a déjà été mis à jour par votre outil de
 déploiement. Un service volontairement inactif reste inactif.
