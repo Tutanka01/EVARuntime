@@ -455,8 +455,26 @@ def test_ready_503_when_all_cluster_nodes_offline(client, monkeypatch, tmp_path)
 
 
 def test_health_unchanged_and_ok(client):
-    """/health reste une liveness simple, toujours 200 avec le format connu."""
+    """/health reste une liveness simple : 200, `status: ok`, sans rien qui fuite."""
     resp = client.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    # Un appelant anonyme n'obtient QUE la liveness. L'inventaire des modèles
+    # chargés et l'occupation VRAM sont réservés au porteur d'ADMIN_SECRET, comme
+    # le détail de /ready : /health est publique et traverse le `deny all` qui
+    # protège /admin/.
+    assert body == {"status": "ok"}
+
+
+def test_health_donne_le_detail_a_un_appelant_privilegie(client, admin_headers):
+    """
+    Contrôle positif du test précédent : le détail doit rester ATTEIGNABLE.
+
+    Sans lui, une régression qui viderait /health pour tout le monde passerait
+    le test d'anonymisation sans que personne ne s'en aperçoive.
+    """
+    resp = client.get("/health", headers=admin_headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"

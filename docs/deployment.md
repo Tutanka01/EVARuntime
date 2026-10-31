@@ -5,6 +5,15 @@ sûr et choisi par défaut, et l'**orchestrateur cluster**, explicitement opt-in
 Le premier lance `llama-server` sur l'hôte gateway; le second ne requiert aucun
 GPU local et pilote des node-agents installés séparément.
 
+| Votre besoin | Commencez ici |
+|---|---|
+| Premier token sur Linux avec GPU NVIDIA | [Déploiement local — premier token](#déploiement-local--premier-token-linux) |
+| Installation sur Mac Apple Silicon | [Déploiement macOS](#déploiement-macos-apple-silicon) |
+| Référence complète d'un hôte de production | [Table des matières](#table-des-matières) |
+| Plusieurs nœuds GPU | [Section 13](#13-déploiement-multi-nœuds-optionnel--avancé) |
+| Mettre à jour une installation existante | [Section 11](#11-mise-à-jour) |
+| Retrouver une variable d'environnement | [Section 18](#18-référence-de-configuration-variables-denvironnement) |
+
 ## Déploiement macOS (Apple Silicon)
 
 > **Note importante** : Le mode cluster n'est PAS supporté sur macOS. Seul le mode local (mono-nœud) est fonctionnel.
@@ -369,7 +378,7 @@ launchctl list com.evaruntime.gateway   # PID "-" = le processus ne tient pas
 ```
 
 Corrigez la cause affichée (voir aussi
-[doctor-macos.sh](#doctormacossh--diagnostic-complet)), puis relancez :
+[doctor-macos.sh](#doctor-macossh--diagnostic-complet)), puis relancez :
 
 ```bash
 sudo launchctl kickstart -k system/com.evaruntime.gateway
@@ -634,7 +643,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 
 ## Table des matières
 
-0. [Déploiement local — premier token](#déploiement-local--premier-token)
+0. [Déploiement local — premier token](#déploiement-local--premier-token-linux)
 1. [Prérequis](#1-prérequis)
 2. [Installation de llama.cpp](#2-installation-de-llamacpp)
 3. [Téléchargement des modèles](#3-téléchargement-des-modèles)
@@ -1114,10 +1123,11 @@ Le script effectue automatiquement :
 8. Enregistrement du service systemd et activation
 9. Initialisation de la base de données SQLite
 
-À la fin du script, les prochaines étapes sont affichées avec les valeurs générées.
+À la fin du script, les prochaines étapes sont affichées. Les secrets générés ne
+le sont pas, pour ne pas finir dans un journal de provisioning.
 
-> **Important :** Noter l'`ADMIN_SECRET` affiché à la fin du script.
-> Il ne sera plus visible ensuite (stocké dans `/etc/llm-gateway/env`).
+> **Important :** lire l'`ADMIN_SECRET` dans le fichier protégé :
+> `sudo grep '^ADMIN_SECRET=' /etc/llm-gateway/env`.
 
 L'installateur conserve tout fichier `env`, `models.yaml` ou `nodes.yaml`
 existant. Il déduplique uniquement les clés de mode qu'il gère et ne régénère
@@ -1322,6 +1332,14 @@ CAPACITY_QUEUE_ENABLED=true
 CAPACITY_QUEUE_TIMEOUT_SECONDS=120
 CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
+
+# ── Borne de génération par requête ──────────────────────────────────────────
+# Nombre maximal de tokens demandables en une requête (max_tokens,
+# max_completion_tokens ou n_predict). 0 = aucune borne (comportement historique).
+# Un client qui dépasse reçoit un 400 explicite ; une requête de génération sans
+# borne reçoit cette limite (finish_reason: length). Utile sur un GPU partagé : une
+# génération non bornée immobilise un slot pendant le timeout d'inférence (600 s).
+MAX_NEW_TOKENS_PER_REQUEST=0
 
 # ── Rétention RGPD ────────────────────────────────────────────────────────────
 # usage_log : suppression au-delà de N jours, au démarrage puis toutes les 24 h
@@ -1672,7 +1690,19 @@ Configuration VRAM
 curl http://127.0.0.1:8000/health
 ```
 
-Réponse attendue (aucun modèle chargé au démarrage) :
+Réponse attendue pour un appel anonyme :
+
+```json
+{"status": "ok"}
+```
+
+Le détail (modèles chargés, VRAM) exige `ADMIN_SECRET` — comme `/ready` — pour
+ne pas publier l'inventaire des modèles sur une route publique :
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_SECRET" \
+  http://127.0.0.1:8000/health
+```
 
 ```json
 {
@@ -2216,6 +2246,36 @@ peut avoir évolué et écraser la base sans arbitrage humain serait plus risqu�
 qu'utile. La sauvegarde `gateway-pre-update-*.db` reste disponible pour une
 restauration manuelle (voir [Sauvegardes SQLite](#14-sauvegardes-sqlite-et-restauration)).
 
+### Mettre à jour la configuration nginx
+
+Par défaut, `update.sh` ne touche pas au site nginx. L'option `--nginx` le
+**réécrit entièrement depuis le template livré** : `server_name`, chemins de
+certificats et adaptations locales sont remplacés. Sur un site personnalisé,
+comparez d'abord et reportez à la main ce que vous voulez garder :
+
+```bash
+diff /etc/nginx/sites-available/llm-gateway gateway/deploy/nginx.conf
+sudoedit /etc/nginx/sites-available/llm-gateway
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Comportements à vérifier avant une mise à jour
+
+Ces changements de durcissement peuvent concerner vos clients, vos scripts ou
+votre configuration. Aucun ne modifie le schéma de la base.
+
+| Changement | À vérifier sur votre installation |
+|---|---|
+| `/health` anonyme ne renvoie plus que `{"status": "ok"}` | Un monitoring ou un client qui lit `models_loaded` ou la VRAM doit passer à l'[exposition Prometheus](observability.md#2-exposition-prometheus) ou présenter `ADMIN_SECRET`. |
+| `max_tokens`, `max_completion_tokens` et `n_predict` négatifs, booléens ou non entiers sont refusés en `400` | Un client qui envoie `max_tokens: -1` doit omettre le champ. |
+| `DELETE /admin/keys/{prefix}` compare le préfixe à l'identique | Un script qui passe un préfixe partiel, ou qui révoque deux fois la même clé, reçoit `404`. |
+| `llama-server` ne reçoit plus que `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TZ`, `LD_LIBRARY_PATH`, `CUDA_VISIBLE_DEVICES` et `LLAMA_API_KEY` | Toute autre variable de l'environnement du service ne lui parvient plus. Sans `CUDA_DEVICE_ORDER`, les index de GPU peuvent changer : désignez les cartes par UUID dans `CUDA_VISIBLE_DEVICES`. |
+| La gateway et le node-agent ignorent `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` et `SSL_CERT_FILE` pour leurs appels internes | Avec une AC interne et `tls_verify: true`, déclarez le chemin du bundle dans `nodes.yaml` ([section 13](#13-déploiement-multi-nœuds-optionnel--avancé)). |
+| `ALLOWED_MODEL_DIRS` est obligatoire sur le node-agent | Sans cette clé, `update-agent.sh` refuse la mise à jour avant toute écriture. Ajoutez-la à la main, ou relancez `install-agent.sh`, qui écrit `/models` : adaptez la valeur si vos GGUF sont ailleurs. |
+| Le health-check de `update-agent.sh` vérifie désormais le certificat de l'agent | Auto-signé, feuille d'AC et fullchain sont acceptés. Lancez `preflight.py --check-health` depuis le nouveau checkout pour le confirmer avant la mise à jour. |
+| `server_tokens off` est livré dans le template nginx | Il n'est appliqué qu'avec `--nginx` ou par un ajout manuel dans chaque bloc `server`. |
+| `secure_delete` s'applique aux écritures futures | Si des comptes ont déjà été anonymisés, voir [l'effacement sur disque](admin.md#2-gestion-des-utilisateurs). |
+
 ### Mettre à jour llama.cpp
 
 ```bash
@@ -2245,7 +2305,9 @@ installé un build patché, épinglez-le :
 
 ```bash
 # Vérifier le build installé
-/opt/llama.cpp/current/llama-server --version   # → version: <build> (<hash>)
+# Selon le build : version: <build> (<hash>)
+#            ou : version: 0.8.0 (build <build>, commit <hash>)
+/opt/llama.cpp/current/llama-server --version
 
 # Fixer le minimum accepté dans /etc/llm-gateway/env (et sur chaque node-agent)
 LLAMA_SERVER_MIN_BUILD=<build_patché>
@@ -2367,6 +2429,7 @@ Causes fréquentes :
 | `llama-server: command not found` | llama.cpp non installé | Refaire l'étape 2 |
 | Timeout après 180s | Modèle trop lent à charger | Augmenter `MODEL_LOAD_TIMEOUT_SECONDS=300` dans `env` |
 | `Port already in use` | Deux modèles sur le même port | Vérifier `BASE_LLAMA_PORT` et `MAX_LOADED_MODELS` |
+| `smoke_test.sh` ou `curl` échoue sur `127.0.0.1` alors que le service répond | `curl` passe par le proxy défini dans `http_proxy` | `export NO_PROXY=127.0.0.1,localhost` avant de relancer. La gateway elle-même ignore ces variables. |
 | Démarrage refusé pour un modèle vision | `mmproj_path` ou `mmproj_sha256` absent/invalide | Configurer le projecteur CLIP (`.gguf`) et son empreinte SHA-256 |
 | Génération très lente, TTFT de plusieurs dizaines de secondes, **aucune erreur** ; `pgmajfault` grimpe dans `/sys/fs/cgroup/system.slice/llm-gateway.service/memory.stat` ; disque à 100 % | Le working set RAM hôte d'un modèle `cpu_moe: true` dépasse `MemoryHigh`/`MemoryMax` (ou la RAM installée) : le noyau recycle en boucle les pages `mmap` propres des experts FFN → refault NVMe à chaque token | Désactiver le modèle ou l'exécuter sur un hôte plus grand. Vérifier la table de dimensionnement [§15.1](#151-couple-modelsyaml--limites-mémoire-systemd). Ne pas se contenter de relever `MemoryMax` au-delà de la RAM physique |
 | `Failed to set up mount namespacing`, l'unité ne démarre pas | Un chemin de `ReadWritePaths` n'existe pas (ex. `/data/models` non provisionné) | Créer le répertoire, ou le préfixer par `-` dans l'unité (déjà fait pour les répertoires de modèles) |
@@ -2507,6 +2570,13 @@ L'installateur exige un build minimal positif et sonde le binaire canonique
 doit être déclaré explicitement avec `--llama-server-bin` ; un build illisible
 ou inférieur au plancher fait échouer le préflight.
 
+`ALLOWED_MODEL_DIRS` doit lister au moins un répertoire absolu : sans lui, le
+node-agent chargeait n'importe quel chemin GGUF lisible par le service. Le
+déploiement livré écrit `/models` (installation neuve) et l'installateur ajoute
+la clé aux configurations existantes ; si vous maintenez l'EnvironmentFile à la
+main, ajoutez `ALLOWED_MODEL_DIRS=/models` avant `update-agent.sh`, sinon le
+préflight refuse la mise à jour.
+
 Le node-agent mesure aussi la VRAM par UUID en respectant
 `CUDA_VISIBLE_DEVICES`. Cette sonde est best-effort et ne complique pas une
 installation CPU-only : `GPU_PROBE_TIMEOUT_SECONDS` (défaut `5`) borne chaque
@@ -2554,6 +2624,19 @@ cat /etc/ssl/certs/gpu-node-a.crt \
 sudo nano /etc/llm-gateway/nodes.yaml
 ```
 
+**Valeurs de `tls_verify` dans `nodes.yaml` :**
+
+| Valeur | Effet |
+|---|---|
+| Chemin d'un bundle | Vérifie contre ce fichier. À utiliser pour des certificats auto-signés ou une AC interne. |
+| `true` | Vérifie contre les AC publiques du paquet `certifi`. Ni le magasin système ni `SSL_CERT_FILE` ne sont lus : une AC interne y exige un bundle. |
+| `false` | Aucune vérification. Avertissement au démarrage, ou refus avec `CLUSTER_STRICT_TLS_VERIFY=true`. À éviter en production. |
+
+Sur le nœud, `AGENT_TLS_CERT` peut être auto-signé, une feuille d'AC seule ou une
+fullchain : le health-check local l'épingle tel quel. Le bundle de l'orchestrateur
+doit, lui, contenir de quoi valider le nom du nœud : racine de l'AC, ou certificat
+auto-signé portant ce nom en SAN.
+
 ### Démarrage et vérification
 
 ```bash
@@ -2588,9 +2671,11 @@ curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
 
 Avant la première mise à jour d'un agent installé avec l'ancien défaut
 `LLAMA_SERVER_MIN_BUILD=0`, attestez le runtime puis relevez explicitement son
-plancher dans `/etc/llm-gateway-agent/env`. Le préflight de la nouvelle release
-refuse une valeur nulle, un binaire illisible ou un build trop ancien **avant**
-de toucher au service :
+plancher dans `/etc/llm-gateway-agent/env`. Vérifiez aussi que
+`ALLOWED_MODEL_DIRS` contient au moins un répertoire absolu (le déploiement
+livré écrit `/models`). Le préflight de la nouvelle release refuse une valeur
+nulle, un binaire illisible, un build trop ancien ou une allowlist vide
+**avant** de toucher au service :
 
 ```bash
 /opt/llama.cpp/current/llama-server --version
@@ -2834,7 +2919,7 @@ Le script lit les variables d'environnement (surchargées par
 | Variable | Défaut | Rôle |
 |----------|--------|------|
 | `DB_PATH` | `/var/lib/llm-gateway/gateway.db` | Base source |
-| `BACKUP_DIR` | `/var/lib/llm-gateway/backups` | Destination |
+| `BACKUP_DIR` | `/var/lib/llm-gateway/backups` | Destination. Chemin absolu sans quote simple ni saut de ligne, sinon le script refuse. |
 | `BACKUP_RETENTION_DAYS` | `14` | Rotation : suppression au-delà de N jours |
 
 Après chaque sauvegarde, un `PRAGMA integrity_check` est exécuté ; une copie
@@ -3010,7 +3095,7 @@ Pour l'activer :
 
 1. hôte avec **≥ 320 Go de RAM** (working set ~236 Go sous `MemoryHigh=80 %`) et
    ~250 Go d'espace NVMe rapide ;
-2. `enabled: true` dans `models.yaml` (ou `POST /admin/models/{id}/enable`) ;
+2. `enabled: true` dans `models.yaml` (ou `PATCH /admin/models/{id}` avec `{"enabled": true}`) ;
 3. mettre à jour la table ci-dessus **et** le profil correspondant dans
    `gateway/tests/test_deploy_memory_profiles.py` (le test échoue sinon) ;
 4. vérifier après chargement : `systemctl show llm-gateway -p MemoryCurrent` et
@@ -3290,6 +3375,21 @@ le runtime de la gateway locale.
 | `HTTPX_MAX_KEEPALIVE` | `100` | Connexions keep-alive conservées au repos (`0` = illimité). |
 | `HTTPX_KEEPALIVE_EXPIRY` | `30.0` | Durée de vie (s) d'une connexion keep-alive inactive. |
 
+### Réseau, limites par défaut et inactivité
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `LLAMA_SERVER_HOST` | `127.0.0.1` | Adresse d'écoute des `llama-server` en mode local. |
+| `IDLE_CHECK_INTERVAL_SECONDS` | `30` | Période du contrôle d'inactivité des modèles chargés. |
+| `DEFAULT_RPM_LIMIT` | `20` | Requêtes par minute d'un nouvel utilisateur (de `1` à `1000`). |
+| `DEFAULT_MONTHLY_TOKEN_LIMIT` | `0` | Quota mensuel d'un nouvel utilisateur (`0` = illimité). |
+
+### Bornes de génération
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `MAX_NEW_TOKENS_PER_REQUEST` | `0` | Nombre maximal de tokens demandables via `max_tokens`, `max_completion_tokens` ou `n_predict`. `0` = aucune borne (comportement historique). Un dépassement, une valeur négative, un booléen ou un type non entier est refusé en `400`. Une requête de génération sans borne reçoit cette limite (`finish_reason: length`). |
+
 ### Robustesse du cycle de vie (shutdown, VRAM, orphelins)
 
 | Variable | Défaut | Rôle |
@@ -3319,6 +3419,25 @@ inertes sans GPU / `nvidia-smi` / port occupé. Détails :
 (défaut `10`) et `CLUSTER_HEALTH_FAILURES_TO_OFFLINE` (défaut `3`) pilotent le
 heartbeat.
 
-> Ces variables s'appliquent à l'**orchestrateur**. Le node-agent lit sa propre
-> config (`node_agent/config.py` : `NODE_ID`, `AGENT_PORT`, `AGENT_SECRET`,
-> `TOTAL_VRAM_GB`, `LLAMA_SERVER_BIN`, `LLAMA_SERVER_MIN_BUILD`…).
+Ces variables s'appliquent à l'**orchestrateur**.
+
+### Node-agent (`/etc/llm-gateway-agent/env`)
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `NODE_ID` | — | Identifiant du nœud, identique à celui de `nodes.yaml`. |
+| `AGENT_HOST`, `AGENT_PORT` | `0.0.0.0`, `9443` | Écoute HTTPS du plan de contrôle. |
+| `AGENT_TLS_CERT`, `AGENT_TLS_KEY` | `/etc/llm-gateway-agent/tls/agent.crt`, `agent.key` | Certificat et clé de l'agent. Obligatoires. |
+| `AGENT_SECRET` | — | Secret partagé avec l'orchestrateur. Obligatoire, 32 caractères minimum. |
+| `INTERNAL_API_KEY` | — | Clé du plan de données, propre au nœud. Obligatoire, 32 caractères minimum. |
+| `ALLOWED_MODEL_DIRS` | — | Répertoires de GGUF autorisés (absolus, CSV ou JSON). **Obligatoire.** |
+| `LLAMA_SERVER_BIN` | `/opt/llama.cpp/current/llama-server` | Binaire lancé par l'agent. |
+| `LLAMA_SERVER_MIN_BUILD` | `0` | Plancher de build. `install-agent.sh` exige une valeur positive. |
+| `LLAMA_SERVER_HOST`, `LLAMA_SERVER_HEALTH_HOST` | `0.0.0.0`, `127.0.0.1` | Écoute du plan de données et adresse des sondes locales. |
+| `BASE_LLAMA_PORT`, `MAX_LOADED_MODELS` | `8081`, `5` | Premier port et taille du pool. |
+| `TOTAL_VRAM_GB`, `VRAM_OVERHEAD_GB`, `VRAM_SAFETY_MARGIN` | `120.0`, `4.0`, `0.03` | Budget VRAM du nœud. |
+| `MODEL_LOAD_TIMEOUT_SECONDS` | `180` | Attente maximale d'un chargement. |
+| `IDLE_CHECK_INTERVAL_SECONDS` | `30` | Période de la boucle de surveillance de l'agent. |
+| `CUDA_VISIBLE_DEVICES` | `0` | GPU visibles par `llama-server` (index ou UUID). |
+| `GPU_PROBE_TIMEOUT_SECONDS`, `GPU_PROBE_INTERVAL_SECONDS` | `5.0`, `60.0` | Sonde `nvidia-smi` (`0` désactive le rafraîchissement). |
+| `LOG_DIR` | `/var/log/llm-gateway-agent` | Répertoire des journaux. |

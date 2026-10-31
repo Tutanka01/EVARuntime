@@ -410,16 +410,12 @@ curl -s https://llm.eva.univ-pau.fr/health
 
 Réponse attendue :
 \begin{lstlisting}[style=jsonstyle, caption={Réponse de l'endpoint /health}]
-{
-  "status": "ok",
-  "models_loaded": [],
-  "vram_used_gb": 0.0,
-  "vram_available_gb": 43.6
-}
+{"status": "ok"}
 \end{lstlisting}
 
-Si \texttt{"status": "ok"} apparaît, le service est opérationnel. Le champ
-\texttt{models\_loaded} indique les modèles actuellement en mémoire GPU.
+Si \texttt{"status": "ok"} apparaît, le service est opérationnel. Cette route ne
+renseigne pas les modèles chargés : pour connaître les modèles disponibles, utilisez
+\texttt{GET /v1/models} ci-dessous.
 
 \subsection{Lister les modèles disponibles}
 

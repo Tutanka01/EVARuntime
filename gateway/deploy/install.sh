@@ -326,7 +326,13 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     chown root:"$SERVICE_USER" "$CONFIG_FILE"
 
     warn "Configuration générée dans $CONFIG_FILE"
-    warn "ADMIN_SECRET = $ADMIN_SECRET — notez-le maintenant."
+    # Le secret n'est PAS affiché : la sortie d'un installeur finit dans un
+    # journal de provisioning, un `tee`, un historique de console — et le fichier,
+    # lui, est correctement protégé (640 root:$SERVICE_USER). Afficher la valeur
+    # annulait cette protection par la bande. Même choix que install-agent.sh
+    # pour AGENT_SECRET : on indique OÙ lire, pas la valeur.
+    warn "ADMIN_SECRET généré dans $CONFIG_FILE (chmod 640, root:$SERVICE_USER)."
+    warn "Le lire avec : sudo grep '^ADMIN_SECRET=' $CONFIG_FILE"
 else
     info "Configuration existante conservée : $CONFIG_FILE"
 fi

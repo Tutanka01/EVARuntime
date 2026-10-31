@@ -13,6 +13,9 @@ def make_settings(**overrides) -> AgentSettings:
     values = {
         "agent_secret": "a" * 32,
         "internal_api_key": "b" * 32,
+        # Requis depuis SEC-CLU-101 : sans répertoire autorisé, le node-agent
+        # chargeait n'importe quel chemin GGUF absolu.
+        "allowed_model_dirs": "/models",
     }
     values.update(overrides)
     return AgentSettings(_env_file=None, **values)
@@ -54,6 +57,18 @@ def test_runtime_security_requires_tls_pair():
     configured = make_settings(agent_tls_cert=None, agent_tls_key=None)
 
     with pytest.raises(RuntimeError, match="TLS"):
+        configured.validate_runtime_security()
+
+
+def test_runtime_security_rejects_empty_allowed_model_dirs():
+    """
+    CLU-101 : une liste vide désactivait silencieusement le contrôle de chemin
+    du ModelRegistry (`if self._allowed_dirs`). Le node-agent doit refuser de
+    démarrer sans répertoire autorisé.
+    """
+    configured = make_settings(allowed_model_dirs=[])
+
+    with pytest.raises(RuntimeError, match="ALLOWED_MODEL_DIRS"):
         configured.validate_runtime_security()
 
 

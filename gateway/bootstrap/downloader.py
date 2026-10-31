@@ -4,8 +4,8 @@ AUT-006 — téléchargement sûr des artefacts du catalogue (jalon M2).
 Ce que ce module est
 --------------------
 L'exécuteur de trois actions du contrat de `schema` : `download_model`,
-`verify_artifact` et `accept_license`. Il applique littéralement la sous-section
-« Téléchargement » de §8 de `codex-analyse.md` :
+`verify_artifact` et `accept_license`. Il applique littéralement la politique de
+téléchargement :
 
     révision figée · liste exacte de fichiers · reprise · prévision de l'espace
     disque · jeton hors argv · fichier temporaire · vérification SHA-256 ·

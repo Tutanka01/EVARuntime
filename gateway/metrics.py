@@ -315,7 +315,10 @@ async def _collect_llama_metrics_local() -> dict[str, dict]:
     if not ready_managers:
         return {}
 
-    async with httpx.AsyncClient(timeout=3.0) as client:
+    # trust_env=False : même raison que le client d'inférence (proxy.py). Cette
+    # sonde porte `auth_headers()` — la clé interne — vers des URL loopback ;
+    # un HTTP_PROXY d'environnement recevrait la clé et le texte des métriques.
+    async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
         for model_id, mgr in ready_managers:
             try:
                 resp = await client.get(

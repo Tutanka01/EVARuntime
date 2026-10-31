@@ -29,7 +29,9 @@ fonctions de test synchrones normales.
 """
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 _AGENT_DIR = Path(__file__).resolve().parents[1]
@@ -46,8 +48,21 @@ for _stale in (str(_AGENT_DIR), str(_GATEWAY_DIR)):
 sys.path.insert(0, str(_AGENT_DIR))
 sys.path.insert(1, str(_GATEWAY_DIR))
 
-import main  # noqa: E402,F401 — déclenche le reste du sys.path.insert de main.py (repo root)
+# `validate_runtime_security()` exige un répertoire de modèles autorisé depuis
+# SEC-CLU-101 : sans lui, le node-agent acceptait n'importe quel chemin GGUF
+# absolu. Le déploiement livré définit `/models` (env.example, install-agent.sh),
+# valeur que les fixtures de ce dossier réutilisent (`/models/<id>.gguf`) ; les
+# tests FailFast écrivent, eux, dans l'arbre temporaire de pytest. Les deux sont
+# donc autorisés ici : sinon les tests de chargement échouent — ou bouclent — sur
+# le contrôle de chemin, pour une raison sans rapport avec ce qu'ils vérifient.
+# Posé AVANT l'import de `main` : `AgentSettings` est construit paresseusement
+# puis mis en cache par `get_settings()`, une variable posée plus tard n'aurait
+# plus aucun effet.
+os.environ.setdefault(
+    "ALLOWED_MODEL_DIRS", f"/models,{tempfile.gettempdir()}"
+)
 
+import main  # noqa: E402,F401 — déclenche le reste du sys.path.insert de main.py (repo root)
 assert sys.modules["config"].__file__ == str(_AGENT_DIR / "config.py"), (
     "Collision de module 'config' : gateway/config.py a été chargé à la place de "
     "node_agent/config.py — sys.path mal ordonné."

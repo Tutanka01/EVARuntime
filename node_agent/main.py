@@ -111,27 +111,46 @@ def _make_validator_registry() -> ModelRegistry:
     try:
         return ModelRegistry(
             config_path=tmp_path,
-            allowed_model_dirs=settings.allowed_model_dirs_list() or None,
+            # Pas de `or None` : une liste vide doit être passée telle quelle.
+            # C'est `validate_runtime_security()` qui refuse désormais un agent
+            # démarré sans répertoire autorisé (SEC-CLU-101) ; convertir le vide
+            # en None ici aurait seulement rendu la contrainte implicite.
+            allowed_model_dirs=settings.allowed_model_dirs_list(),
         )
     finally:
         tmp_path.unlink(missing_ok=True)
 
 
 def _validate_model_files(model) -> None:
-    """Fail-fast sur les artefacts présents sur CE nœud, avant toute réservation."""
+    """
+    Fail-fast sur les artefacts présents sur CE nœud, avant toute réservation.
+
+    Le corps HTTP ne nomme pas le chemin : `NodeProtocolError` de l'orchestrateur
+    relaie le `detail` tel quel jusqu'aux routes admin, et un opérateur n'a pas
+    à recevoir l'arborescence d'un nœud GPU par une erreur 422. Le chemin complet
+    reste dans le journal de l'agent, où il sert réellement au diagnostic.
+    """
     files = [("GGUF", model.path)]
     if model.mmproj_path is not None:
         files.append(("projecteur multimodal", model.mmproj_path))
     for label, path in files:
         if not path.is_file():
+            log.error(
+                "Artefact %s introuvable sur le nœud pour '%s' : %s",
+                label, model.id, path,
+            )
             raise HTTPException(
                 status_code=422,
-                detail=f"Fichier {label} introuvable sur le nœud : {path}",
+                detail=f"Fichier {label} introuvable sur le nœud.",
             )
         if not os.access(path, os.R_OK):
+            log.error(
+                "Artefact %s non lisible par le node-agent pour '%s' : %s",
+                label, model.id, path,
+            )
             raise HTTPException(
                 status_code=422,
-                detail=f"Fichier {label} non lisible par le node-agent : {path}",
+                detail=f"Fichier {label} non lisible par le node-agent.",
             )
 
 
@@ -160,6 +179,17 @@ class _LoadOperation:
     error_status: int = 500
     error_detail: str = ""
     completed_at: float | None = None
+
+
+def _build_llama_metrics_client() -> httpx.AsyncClient:
+    """
+    Client de collecte des métriques llama-server du nœud.
+
+    Les URL sont en HTTP loopback/privé et portent `INTERNAL_API_KEY` : un
+    `HTTP_PROXY`/`ALL_PROXY` de l'environnement ne doit jamais les voir. Même
+    règle que le collecteur de la gateway (`gateway/metrics.py`).
+    """
+    return httpx.AsyncClient(timeout=3.0, trust_env=False)
 
 
 class _AgentState:
@@ -931,7 +961,7 @@ class _AgentState:
         result: dict = {}
         if not ready:
             return result
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        async with _build_llama_metrics_client() as client:
             for model_id, mgr in ready:
                 try:
                     resp = await client.get(

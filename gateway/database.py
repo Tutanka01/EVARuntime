@@ -95,12 +95,19 @@ PRAGMA temp_store   = MEMORY;
 # PRAGMAs de robustesse appliqués à CHAQUE connexion (pas seulement à l'init) :
 # - busy_timeout : attend au lieu d'échouer immédiatement en « database is locked ».
 # - wal_autocheckpoint / journal_size_limit : bornent la croissance du WAL.
+# - secure_delete : SQLite zérote le contenu des cellules supprimées ou réécrites
+#   au lieu de le laisser dans les pages libérées du fichier. Sans lui, un nom
+#   d'utilisateur effacé par `anonymize_user` restait lisible dans `gateway.db`
+#   (`strings`), donc dans toute copie produite APRÈS l'anonymisation — ce qui
+#   vidait DEC-001 de son sens. Il couvre aussi la purge de rétention, qui
+#   supprime des lignes de `usage_log`.
 # Ce sont des réglages de session, légers, compatibles WAL (aucun changement de mode).
 _SESSION_PRAGMAS = """
 PRAGMA foreign_keys        = ON;
 PRAGMA busy_timeout        = 5000;
 PRAGMA wal_autocheckpoint  = 1000;
 PRAGMA journal_size_limit  = 67108864;
+PRAGMA secure_delete       = ON;
 """
 
 
@@ -683,11 +690,28 @@ async def lookup_key(raw_key: str) -> dict | None:
 
 
 async def revoke_key(key_prefix: str) -> bool:
-    """Révoque toutes les clés ayant ce préfixe. Retourne True si au moins une révoquée."""
+    """
+    Révoque la clé active portant exactement ce préfixe.
+
+    Comparaison d'égalité, pas de motif : le préfixe est de longueur fixe
+    (`generate_api_key` : `"llmgw-" + 8` caractères) et identifie une seule clé.
+    L'ancien `WHERE key_prefix LIKE ?` interprétait les jokers SQL du préfixe
+    reçu du chemin d'URL : `DELETE /admin/keys/%25` produisait `LIKE '%%'` et
+    révoquait TOUTES les clés actives de TOUS les comptes en une requête, en
+    répondant 200 sans dire combien de comptes venaient d'être coupés. `_` était
+    aussi un joker mono-caractère.
+
+    `is_active = 1` rend la révocation franchement idempotente : une seconde
+    demande sur une clé déjà révoquée renvoie False, donc un 404 côté route —
+    ce que l'appelant attend d'une ressource qui n'existe plus à l'état actif.
+
+    Le paramètre est cherché tel quel dans la base : un préfixe qui n'est pas
+    exactement celui stocké ne révoque rien.
+    """
     async with get_db() as db:
         cursor = await db.execute(
-            "UPDATE api_keys SET is_active = 0 WHERE key_prefix LIKE ?",
-            (key_prefix + "%",),
+            "UPDATE api_keys SET is_active = 0 WHERE key_prefix = ? AND is_active = 1",
+            (key_prefix,),
         )
         await db.commit()
         return cursor.rowcount > 0
@@ -742,6 +766,16 @@ async def anonymize_user(user_id: int) -> dict | None:
         )).fetchone()
         if row is None:
             return None
+
+        # L'effacement est irréversible au niveau du FICHIER, pas seulement de
+        # l'API : `_SESSION_PRAGMAS` pose `secure_delete = ON` sur chaque
+        # connexion (voir sa définition), donc la cellule de l'index
+        # `username TEXT UNIQUE` et les pages libérées sont zérotées. Sans lui,
+        # `strings gateway.db` retrouvait le nom que cette fonction venait
+        # d'effacer, et toute copie produite APRÈS l'anonymisation (sauvegarde
+        # pre-migration, llm-gateway-backup.sh, copie remise au DPO) le
+        # contenait encore : le contrat « irréversible » n'était vrai que pour
+        # l'API.
 
         # `WHERE anonymized_at IS NULL` : le premier horodatage est préservé sans
         # relecture préalable, donc sans fenêtre de course avec un second appel.

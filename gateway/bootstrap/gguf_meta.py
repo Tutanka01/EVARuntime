@@ -4,8 +4,8 @@ AUT-013 — inspection du header GGUF : lecture bornée, agrégée, non autorita
 Ce que ce module fait
 ---------------------
 Il lit l'en-tête d'un fichier GGUF — magie, version, compteurs, métadonnées
-clé/valeur, table des tenseurs — et en tire les champs que §9 de
-`codex-analyse.md` désigne comme utiles à une estimation mémoire : architecture,
+clé/valeur, table des tenseurs — et en tire les champs utiles à
+une estimation mémoire : architecture,
 nombre de blocs, dimension d'embedding, têtes KV (GQA/MQA), contexte maximal
 déclaré, quantisation des tenseurs, métadonnées MoE.
 

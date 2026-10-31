@@ -128,14 +128,21 @@ que ce soit d'autre dans les requêtes.
 
 ### Vérifier l'état du service
 
-Cet endpoint ne requiert pas d'authentification et indique si le service est opérationnel,
-quels modèles sont actuellement en mémoire GPU et combien de VRAM est disponible.
+Cet endpoint ne requiert pas d'authentification et indique si le service est opérationnel.
+Les identifiants des modèles chargés et l'occupation VRAM ne sont renvoyés qu'à un
+appelant qui présente `ADMIN_SECRET` — sans quoi `/health`, qui est publique et
+traverse le filtrage IP de `/admin/`, publierait l'inventaire des modèles à tout venant.
 
 ```bash
 curl -s http://127.0.0.1:8000/health
 ```
 
-Réponse attendue :
+Réponse attendue (appel anonyme) :
+```json
+{"status": "ok"}
+```
+
+Avec `Authorization: Bearer $ADMIN_SECRET` :
 ```json
 {
   "status": "ok",
@@ -670,6 +677,15 @@ response = client.chat.completions.create(
 )
 ```
 
+> `max_tokens`, `max_completion_tokens` et `n_predict` n'acceptent qu'un
+> **entier positif ou nul**. Une valeur négative (notamment `n_predict: -1`,
+> convention llama.cpp pour « jusqu'à remplir le contexte »), un booléen ou une
+> chaîne sont refusés en `400`.
+> Omettre le champ demande le comportement par défaut du backend. Si le déploiement
+> fixe `MAX_NEW_TOKENS_PER_REQUEST` (voir [deployment.md](deployment.md), section
+> « Référence de configuration »), une valeur au-delà est refusée en `400` et une
+> requête sans borne reçoit cette limite : `finish_reason` vaut alors `length`.
+
 #### Recommandations par cas d'usage
 
 | Cas d'usage | temperature | top_p | max_tokens |
@@ -750,7 +766,7 @@ de longues séquences.
 | Paramètre | Défaut | Description |
 |---|---|---|
 | `seed` | aléatoire | Graine pour une génération reproductible (ex. : `42`) |
-| `n_predict` | — | Alias de `max_tokens` |
+| `n_predict` | — | Alias de `max_tokens` (entier ≥ 0 ; `-1` est refusé) |
 | `ignore_eos` | false | Ignorer le token de fin de séquence (génération forcée) |
 | `stop` | — | Séquences d'arrêt — pour les modèles Qwen/ChatML : `["<\|im_end\|>", "<\|endoftext\|>"]` |
 
@@ -1226,6 +1242,7 @@ Ce modèle est-il chargé en VRAM ?
 ### Gérer ce délai dans votre code
 
 ```python
+import os
 import time
 from openai import OpenAI, APIStatusError
 import httpx
@@ -1244,14 +1261,15 @@ response = client.chat.completions.create(
     messages=[{"role": "user", "content": "Bonjour"}],
 )
 
-# Option 2 — interroger /health en amont pour anticiper l'état du service.
-def get_service_status() -> dict:
-    r = httpx.get("https://gateway.example.com/health", timeout=5)
-    return r.json()
-
-status = get_service_status()
-print("Modèles actuellement chargés :", status["models_loaded"])
-print("VRAM disponible :", status["vram_available_gb"], "Go")
+# Option 2 — interroger la queue d'admission pour anticiper l'attente.
+# /health ne renvoie qu'une liveness anonyme : les modèles chargés et la VRAM ne
+# sont pas exposés aux clients.
+capacity = httpx.get(
+    "https://gateway.example.com/v1/capacity",
+    headers={"Authorization": f"Bearer {os.environ['EVA_API_KEY']}"},
+    timeout=5,
+).json()
+print("Requêtes en attente :", capacity["waiters"])
 ```
 
 ---
@@ -1264,6 +1282,7 @@ print("VRAM disponible :", status["vram_available_gb"], "Go")
 |---|---|---|---|
 | `200` | — | Succès | — |
 | `400` | `invalid_request_error` | JSON malformé ou paramètre invalide | Vérifier le corps de la requête |
+| `400` | `invalid_request_error` | `max_tokens`, `max_completion_tokens` ou `n_predict` négatif, booléen, non entier ou au-delà de `MAX_NEW_TOKENS_PER_REQUEST` | Omettre le champ ou envoyer un entier positif dans la borne du déploiement |
 | `400` | `invalid_request_error` | Modèle sans la capability exigée par la route (`/v1/embeddings`) | Choisir un modèle qui déclare `embeddings` dans `models.yaml` |
 | `401` | `authentication_error` | Clé absente, invalide ou révoquée | Vérifier la clé ; contacter l'admin si révoquée |
 | `403` | `model_disabled` | Modèle désactivé par l'administrateur | Utiliser un modèle disponible via `GET /v1/models` |

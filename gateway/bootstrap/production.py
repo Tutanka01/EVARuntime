@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator, Mapping, Sequence
 
 import httpx
 
+from child_env import inherited_child_env
 from llama_version import probe_llama_version
 
 from . import calibration
@@ -1065,11 +1066,12 @@ class LlamaServerCalibrationProbes:
             command.extend(("--mmproj", str(target.mmproj_path)))
         return command
 
-    def _process_env(self) -> dict[str, str] | None:
-        if self.visible_gpu_uuids is None:
-            return None
-        environment = dict(os.environ)
-        environment["CUDA_VISIBLE_DEVICES"] = ",".join(self.visible_gpu_uuids)
+    def _process_env(self) -> dict[str, str]:
+        # Même règle que le pool de production (`server_manager.build_child_env`) :
+        # ce llama-server parse un GGUF, il n'hérite d'aucun secret de l'opérateur.
+        environment = inherited_child_env("CUDA_VISIBLE_DEVICES")
+        if self.visible_gpu_uuids is not None:
+            environment["CUDA_VISIBLE_DEVICES"] = ",".join(self.visible_gpu_uuids)
         return environment
 
     async def _drain(self, stream: asyncio.StreamReader | None) -> None:

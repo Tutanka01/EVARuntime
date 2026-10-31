@@ -7,8 +7,8 @@ Les fichiers de `tests/fixtures/llmfit/` sont **SYNTHÉTIQUES**, tous préfixés
 `synthetic-`. Aucun n'est une capture d'un LLMfit réel : la forme exacte de
 `llmfit recommend --json` n'est pas documentée publiquement (le dépôt et
 `docs/cli.md` annoncent « top picks as JSON » sans fixer les champs — vérifié le
-31 juillet 2026). Leur forme est **dérivée de la description de §7 de
-`codex-analyse.md`**, pas observée. Elles doivent être remplacées par de vraies
+31 juillet 2026). Leur forme est **dérivée de la description du plan
+d'amorçage**, pas observée. Elles doivent être remplacées par de vraies
 captures avant mise en production ; voir `tests/fixtures/llmfit/README.md`.
 
 Aucun test de ce fichier n'exécute LLMfit : le binaire est absent de la machine

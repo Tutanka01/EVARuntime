@@ -84,7 +84,16 @@ def _build_http_client() -> httpx.AsyncClient:
         max_keepalive_connections=settings.httpx_max_keepalive or None,
         keepalive_expiry=settings.httpx_keepalive_expiry,
     )
-    return httpx.AsyncClient(timeout=_INFERENCE_TIMEOUT, limits=limits)
+    # trust_env=False : sans lui, httpx lit HTTP_PROXY/HTTPS_PROXY/ALL_PROXY et
+    # y route AUSSI les URL loopback. Sur un hôte configuré avec un proxy
+    # d'environnement (proxy campus, Environment= dans l'unité), chaque prompt
+    # et chaque complétion partait en clair vers ce proxy, avec l'en-tête
+    # Authorization qui ouvre tous les llama-server. Le « loopback seulement »
+    # n'était alors qu'une convention. Le téléchargement des modèles applique
+    # déjà cette règle (SEC-014) ; le data-plane d'inférence doit la suivre.
+    return httpx.AsyncClient(
+        timeout=_INFERENCE_TIMEOUT, limits=limits, trust_env=False
+    )
 
 
 def init_http_client() -> httpx.AsyncClient:
@@ -244,6 +253,82 @@ def _schedule_usage_log(
     ), name="log_usage_stream")
 
 
+# Champs qui bornent une génération. Les trois formes coexistent dans
+# l'écosystème (OpenAI `max_tokens` / `max_completion_tokens`, llama.cpp natif
+# `n_predict`) et sont toutes forwardées telles quelles au backend : `proxy.py`
+# ne revalide pas le corps OpenAI, donc c'est ici — et seulement ici — qu'on
+# peut refuser une demande déraisonnable AVANT d'immobiliser de la VRAM.
+_GENERATION_BOUND_FIELDS = ("max_tokens", "max_completion_tokens", "n_predict")
+# Routes qui génèrent des tokens : embeddings et (dé)tokenisation n'en font pas.
+_GENERATION_ROUTES = frozenset({"/v1/chat/completions", "/v1/completions", "/completion"})
+
+
+def _validate_generation_bounds(body: dict) -> JSONResponse | None:
+    """
+    Refuse une borne de génération absurde ou qui n'est pas un entier positif.
+
+    `n_predict: -1` (ou `max_tokens: 10**8`) est le cas qui compte : llama.cpp
+    interprète un négatif comme « jusqu'à remplir le contexte » et une valeur
+    gigantesque comme un plafond inatteignable. Dans les deux cas, un porteur de
+    clé unique immobilise un slot GPU pendant tout le timeout d'inférence
+    (600 s), en série, sans que le quota mensuel — compté après coup — ne
+    freine quoi que ce soit.
+
+    Un booléen est refusé explicitement : `bool` étant une sous-classe de `int`,
+    `"max_tokens": true` deviendrait silencieusement 1 token. Omettre le champ
+    reste possible : `_apply_generation_cap` y applique la borne du déploiement.
+    """
+    for field in _GENERATION_BOUND_FIELDS:
+        if field not in body or body[field] is None:
+            continue
+        value = body[field]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return _openai_error(
+                400,
+                f"Le champ '{field}' doit être un entier, "
+                f"reçu : {type(value).__name__}.",
+                "invalid_request_error",
+            )
+        if value < 0:
+            return _openai_error(
+                400,
+                f"Le champ '{field}' ne peut pas être négatif (reçu : {value}). "
+                "Une génération non bornée n'est pas acceptée : omettez le champ "
+                "pour le comportement par défaut du modèle.",
+                "invalid_request_error",
+            )
+        cap = settings.max_new_tokens_per_request
+        if cap > 0 and value > cap:
+            return _openai_error(
+                400,
+                f"Le champ '{field}' dépasse la borne de ce déploiement "
+                f"({cap} tokens, MAX_NEW_TOKENS_PER_REQUEST).",
+                "invalid_request_error",
+            )
+    return None
+
+
+def _apply_generation_cap(body: dict, path: str) -> dict:
+    """
+    Pose `max_tokens` quand le client ne borne pas lui-même sa génération.
+
+    Refuser les valeurs au-delà de `MAX_NEW_TOKENS_PER_REQUEST` ne suffit pas :
+    sans champ, llama.cpp applique `n_predict = -1` (jusqu'à remplir le contexte)
+    et la borne était contournée en omettant simplement le champ. Le client voit
+    la limite atteinte : `finish_reason` vaut `length`.
+
+    `max_completion_tokens` seul est recopié dans `max_tokens`, le seul alias que
+    llama.cpp lit à côté de `n_predict` sur toutes ses routes.
+    """
+    cap = settings.max_new_tokens_per_request
+    if cap <= 0 or path not in _GENERATION_ROUTES:
+        return body
+    if body.get("max_tokens") is not None or body.get("n_predict") is not None:
+        return body
+    requested = body.get("max_completion_tokens")
+    return {**body, "max_tokens": cap if requested is None else requested}
+
+
 def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
     """
     Résout l'ID du modèle à utiliser pour une requête.
@@ -304,6 +389,14 @@ async def proxy_request(
         return _openai_error(400, "Le corps JSON doit être un objet.", "invalid_request_error")
     if "model" in body and body["model"] is not None and not isinstance(body["model"], str):
         return _openai_error(400, "Le champ 'model' doit être une chaîne.", "invalid_request_error")
+
+    # ── Bornes de génération (avant tout travail de VRAM) ─────────────────────
+    # Placé ici pour que le refus ne coûte ni chargement ni éviction : un client
+    # mal formé ne doit pas pouvoir forcer un cold start.
+    bounds_refusal = _validate_generation_bounds(body)
+    if bounds_refusal is not None:
+        return bounds_refusal
+    body = _apply_generation_cap(body, path)
 
     # ── Résoudre le modèle ────────────────────────────────────────────────────
     model_id = _resolve_model_id(body, model_manager)

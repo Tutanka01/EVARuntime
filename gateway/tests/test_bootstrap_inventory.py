@@ -3,7 +3,7 @@ Tests d'AUT-002 — inventaire matériel automatique.
 
 Ce que ces tests verrouillent
 -----------------------------
-- le CONTRAT DE DONNÉES de `codex-analyse.md` §5 : chaque clé attendue est
+- le contrat de données du profil matériel : chaque clé attendue est
   présente, typée, et le document reste sérialisable JSON ;
 - le filtrage par `CUDA_VISIBLE_DEVICES` dans ses quatre formes (absente, vide,
   index, UUID) et la troncature CUDA au premier jeton invalide ;
@@ -500,7 +500,7 @@ def test_malformed_json_is_refused_with_a_locatable_message():
     with pytest.raises(inventory.InventoryError) as excinfo:
         inventory.load_hardware_profile("{\n  \"os\": \n}")
     assert "ligne" in str(excinfo.value)
-    assert "§5" in str(excinfo.value)
+    assert "--hardware-profile" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(("overrides", "expected"), [

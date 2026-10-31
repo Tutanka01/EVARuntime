@@ -26,6 +26,17 @@ err()  { echo "[backup][ERROR] $*" >&2; exit 1; }
 command -v sqlite3 >/dev/null 2>&1 || err "sqlite3 introuvable (brew install sqlite)."
 [[ -f "$DB_PATH" ]] || err "Base introuvable : $DB_PATH"
 
+# `$DEST` est ensuite interpolé DANS une commande sqlite3 délimitée par des
+# quotes simples (`.backup '$DEST'`) : une quote dans BACKUP_DIR fermerait la
+# chaîne et permettrait d'y ajouter une commande shell sqlite3, le `chmod 600`
+# portant alors sur un autre fichier que celui réellement écrit. Le vecteur
+# suppose de maîtriser l'environnement (fichier root), donc l'élévation reste
+# faible — mais l'interpolation n'a aucune raison d'exister : on refuse la
+# valeur plutôt que de la laisser traverser une frontière de quoting.
+[[ "$BACKUP_DIR" == /* ]] || err "BACKUP_DIR doit être un chemin absolu : $BACKUP_DIR"
+[[ "$BACKUP_DIR" != *"'"* ]] || err "BACKUP_DIR ne doit pas contenir de quote simple : $BACKUP_DIR"
+[[ "$BACKUP_DIR" != *$'\n'* ]] || err "BACKUP_DIR ne doit pas contenir de saut de ligne."
+
 # ── Préparation du répertoire de destination ──────────────────────────────────
 mkdir -p "$BACKUP_DIR"
 chmod 750 "$BACKUP_DIR" 2>/dev/null || true

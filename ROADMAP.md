@@ -42,7 +42,7 @@ Il n’existe qu’une source de vérité par type d’information :
 | Décision d’architecture | `docs/decisions/ADR-*.md` ou une RFC GitHub |
 | Travail actionnable | GitHub Issues et GitHub Project |
 | Incident ou vulnérabilité | Issue dédiée ou GitHub Security Advisory |
-| Historique d’audit détaillé | `codex-analyse.md` (archive, non canonique) |
+| Historique d’audit et d’implémentation | Descriptions de PR et historique Git |
 
 Une idée ne devient pas automatiquement une issue. Elle devient une issue
 lorsqu’elle possède un périmètre, un responsable possible, des critères
@@ -93,6 +93,9 @@ proposés ; ils peuvent être regroupés dans les epics GitHub.
 
 | ID | Priorité | Constat | Conséquence | Acceptation minimale |
 |---|:---:|---|---|---|
+| `SEC-018` | P1 | `llama-server` tourne sous le même UID que la gateway ou l’agent | Un backend compromis lit `/proc/<parent>/environ` et l’EnvironmentFile, donc `ADMIN_SECRET` et `AGENT_SECRET` | UID dédié au backend, ou EnvironmentFile en 600 et parent non dumpable, vérifié sur une pile réelle |
+| `SEC-019` | P2 | Une `INTERNAL_API_KEY` courte mais non placeholder reste acceptée en mode local | Clé devinable sur le loopback, alors que le node-agent exige 32 caractères | Générer ou refuser une clé de moins de 32 caractères |
+| `SEC-020` | P3 | Le 422 du node-agent pour un chemin hors allowlist cite le chemin et les répertoires autorisés | Détail de l’arborescence d’un nœud visible des routes admin | Message sans chemin, détail dans le journal de l’agent |
 | `CLU-001` ✅ | P0 | `ClusterManager.unload_model()` ignore l’échec booléen de `_do_unload()` | L’admin peut annoncer une VRAM libérée alors que l’ancien serveur tourne toujours | Erreur typée/503, placement conservé et état `unload_uncertain` |
 | `SEC-ART-001` ✅ | P0 | Le SHA-256 est vérifié au démarrage, mais pas à chaque transition vers `LOADING` | Un GGUF peut être remplacé après le démarrage puis chargé sans nouvelle attestation | Vérification fail-closed juste avant chaque chargement |
 | `CLU-002` ✅ | P0 | Le hash d'un gros GGUF est synchrone dans le seul event loop du node agent | `/health`, unload et heartbeat peuvent être bloqués pendant plusieurs minutes | Hash hors event loop, single-flight et cache attesté |
@@ -153,7 +156,8 @@ Les issues GitHub historiques déjà ouvertes sont à conserver :
 
 ### Backlog déjà identifié dans l’ancien tracker
 
-Ces éléments existaient déjà dans `codex-analyse.md`. Ils restent dans la
+Ces éléments viennent de l’ancien tracker, retiré du dépôt et consultable par
+`git log -- codex-analyse.md`. Ils restent dans la
 roadmap, mais doivent être traités comme des sous-tâches d’une epic plutôt que
 comme une nouvelle forêt d’issues :
 
@@ -278,9 +282,8 @@ la mémoire GPU. Les endpoints HTTP nécessitent toutefois le mode développemen
 et ne doivent pas être exposés directement :
 [vLLM Sleep Mode](https://docs.vllm.ai/en/latest/features/sleep_mode/).
 
-La conclusion historique de `docs/recherche/veille-technique.md` selon laquelle
-vLLM ne peut pas rendre sa VRAM n’est donc plus valide. Elle doit être lue
-comme une note historique et non comme une décision actuelle.
+L’ancienne conclusion selon laquelle vLLM ne peut pas rendre sa VRAM n’est donc
+plus valide.
 
 Sources moteur :
 
@@ -660,12 +663,10 @@ EVARuntime ne doit pas essayer de devenir :
 - `docs/api.md` : contrat OpenAI ;
 - `docs/deployment.md` : installation et rollback ;
 - `docs/observability.md` : sondes et métriques ;
-- `docs/decisions/ADR-*.md` : décisions stables ;
-- `docs/recherche/veille-technique.md` : notes de veille, toujours datées.
+- `docs/decisions/ADR-*.md` : décisions stables.
 
-`codex-analyse.md` reste une archive d’implémentation historique. Il ne doit
-plus être utilisé pour connaître le statut courant ; tout futur agent doit
-commencer par `ROADMAP.md`.
+Tout futur agent doit commencer par `ROADMAP.md`. Le dépôt ne conserve pas de
+rapport d’audit : les constats vont dans cette roadmap, les issues et les PR.
 
 ## 16. Références techniques
 

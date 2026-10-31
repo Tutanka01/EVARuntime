@@ -48,15 +48,29 @@ log = logging.getLogger(__name__)
 #  2. si plusieurs lignes candidates annoncent des numéros **différents**, la
 #     sortie est ambiguë et la sonde REFUSE explicitement (retour None) plutôt
 #     que de départager au hasard. Fail-closed en aval fait le reste.
+#
+# Depuis fin 2026, llama.cpp annonce une version sémantique et place le build
+# entre parenthèses : `version: 0.8.0-dev (build 12020, commit 0ec4027a2)`. Les
+# motifs historiques refusent donc un numéro suivi de `.<chiffre>` : sans cela, ce
+# format se lisait « build 0 » et tout binaire récent était refusé au démarrage.
+# Une version sémantique sans build ne rend rien : le plancher ne porte que sur le
+# numéro de build.
+_SEMVER_BUILD_LINE_RE = re.compile(
+    r"^[ \t]*version[ \t]*:[ \t]*v?\d+(?:\.\d+)+\S*[ \t]*"
+    r"\([ \t]*build[ \t]+(?P<build>\d+)"
+    r"(?:[ \t]*,[ \t]*commit[ \t]+(?P<commit>[0-9a-fA-F]{7,40}))?[ \t]*\)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 _BUILD_LINE_RE = re.compile(
-    r"^[ \t]*(?:version|build)[ \t]*:[ \t]*(?P<build>\d+)"
+    r"^[ \t]*(?:version|build)[ \t]*:[ \t]*(?P<build>\d+)(?!\d|\.\d)"
     r"(?:[ \t]*\((?P<commit>[0-9a-fA-F]{7,40})\))?",
     re.IGNORECASE | re.MULTILINE,
 )
 
 # Repli tolérant, toujours ancré : « VERSION 999 », « build = 4567 ».
 _LOOSE_BUILD_RE = re.compile(
-    r"^[ \t]*(?:version|build)[ \t]*[:=]?[ \t]*(?P<build>\d+)\b",
+    r"^[ \t]*(?:version|build)[ \t]*[:=]?[ \t]*(?P<build>\d+)\b(?!\.\d)",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -70,7 +84,8 @@ class LlamaVersion:
     Résultat de la sonde. `build` est None si la version n'a pas pu être lue.
 
     `commit` porte le SHA court rendu entre parenthèses par la ligne canonique
-    (`version: 4567 (abc1234)`). Il vaut None si la sortie ne le donne pas ; il
+    (`version: 4567 (abc1234)` ou `version: 0.8.0 (build 4567, commit abc1234)`).
+    Il vaut None si la sortie ne le donne pas ; il
     permet de recouper un manifeste de provenance contre le binaire réel (SEC-009).
     """
     build: int | None
@@ -90,7 +105,10 @@ def parse_llama_build(output: str) -> tuple[int | None, str | None]:
     if not output:
         return None, None
 
-    canonical = list(_BUILD_LINE_RE.finditer(output))
+    canonical = [
+        *_SEMVER_BUILD_LINE_RE.finditer(output),
+        *_BUILD_LINE_RE.finditer(output),
+    ]
     if canonical:
         builds = {m.group("build") for m in canonical}
         if len(builds) > 1:

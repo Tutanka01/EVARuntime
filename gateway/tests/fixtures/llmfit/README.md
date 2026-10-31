@@ -12,8 +12,8 @@ le dépôt <https://github.com/AlexsJones/llmfit> et `docs/cli.md` annoncent
 « top picks as JSON (agent/script consumption) » sans fixer les noms de champs
 ni un exemple de sortie. Vérifié le 31 juillet 2026.
 
-Les clés consommées ici sont donc **dérivées de la description de §7 de
-`codex-analyse.md`** (quantification recommandée, tenue en VRAM, MoE,
+Les clés consommées ici sont donc **dérivées de la description du plan
+d'amorçage** (quantification recommandée, tenue en VRAM, MoE,
 multi-GPU) et non d'une capture. C'est une hypothèse assumée, pas une
 observation.
 

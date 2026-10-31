@@ -613,6 +613,17 @@ class TestAgentMetrics:
         result = asyncio.run(fake_state.agent_metrics())
         assert result == {}
 
+    def test_metrics_client_ignore_les_proxies_d_environnement(self):
+        """
+        La collecte interroge llama-server en HTTP avec INTERNAL_API_KEY : un
+        HTTP_PROXY/ALL_PROXY d'environnement ne doit jamais recevoir la clé.
+        """
+        client = main._build_llama_metrics_client()
+        try:
+            assert client._trust_env is False
+        finally:
+            asyncio.run(client.aclose())
+
     def test_metrics_endpoint_requires_secret(self, monkeypatch):
         """Sans en-tête Authorization → 401 (HTTPBearer auto_error)."""
         monkeypatch.setattr(main, "ServerManager", FakeServerManager)

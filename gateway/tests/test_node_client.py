@@ -49,6 +49,25 @@ def make_client(handler) -> RemoteNodeClient:
     return client
 
 
+@pytest.mark.anyio
+async def test_remote_client_ignore_les_proxies_d_environnement():
+    """
+    Le client du plan de contrôle porte AGENT_SECRET, le secret partagé de tous
+    les nœuds. Sans `trust_env=False`, httpx route aussi les URL privées via
+    HTTPS_PROXY/ALL_PROXY : le proxy verrait le secret (surtout avec
+    `tls_verify: false`, qui autorise un MITM).
+    """
+    client = RemoteNodeClient(
+        node_id="test-node",
+        base_url="https://node.test:9443",
+        agent_secret="s3cret",
+    )
+    try:
+        assert client._client._trust_env is False
+    finally:
+        await client.close()
+
+
 HEALTH_OK = {
     "status": "ok",
     "agent_version": "1.0.0",
