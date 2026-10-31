@@ -6,18 +6,21 @@ le comportement fautif reproduit avant correction. Le nom du test dit ce qui
 était cassé, pas seulement ce qui doit marcher — c'est ce qui permet de savoir,
 dans deux ans, si le test protège encore quelque chose.
 
-Les identifiants `SEC-A-01`, `DP-001`, `DP-002`… renvoient au rapport d'audit
-(`docs/audits/2026-10-audit-securite.md`).
+Les identifiants `SEC-A-01`, `DP-001`, `DP-002`… renvoient à la description de
+la PR #54.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
+import signal
 import sys
 from collections import deque
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
@@ -26,8 +29,10 @@ import database as db
 import main
 import proxy
 import server_manager
+from auth import get_current_user
 from cluster.node_client import RemoteNodeClient
 from config import settings
+from rate_limiter import check_rate_limit
 from server_manager import DRAIN_MAX_LINE_BYTES, build_child_env
 
 
@@ -233,7 +238,6 @@ def test_une_borne_de_generation_invalide_est_refusee(corps):
 def test_une_borne_de_generation_valide_ou_absente_passe(monkeypatch):
     """
     Contrôle positif : la validation ne casse pas les clients légitimes.
-    Omettre le champ reste la façon de demander le défaut du backend.
     """
     monkeypatch.setattr(settings, "max_new_tokens_per_request", 0)
 
@@ -400,3 +404,174 @@ def test_une_ligne_demesuree_est_tronquee_dans_le_diagnostic():
     conservee = faux._stderr_tail[0]
     assert "tronqué" in conservee
     assert len(conservee) < DRAIN_MAX_LINE_BYTES * 2
+
+
+# ── DP-003 : la borne ne doit pas se contourner en omettant le champ ─────────
+
+class _ModeleFactice:
+    id = "modele-borne"
+    capabilities = ["text_generation", "embeddings"]
+    enabled = True
+    description = ""
+
+
+class _ServeurBorne:
+    model = _ModeleFactice()
+    port = 8081
+
+    def pin(self) -> None: ...
+
+    def unpin(self) -> None: ...
+
+    def llama_url(self, path: str) -> str:
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def auth_headers(self) -> dict[str, str]:
+        return {"Authorization": "Bearer test-internal"}
+
+
+class _GestionnaireBorne:
+    class registry:
+        @staticmethod
+        def get(_model_id: str) -> _ModeleFactice:
+            return _ModeleFactice()
+
+        @staticmethod
+        def first_enabled_id() -> str:
+            return _ModeleFactice.id
+
+    async def ensure_model_loaded(self, _model_id: str) -> _ServeurBorne:
+        return _ServeurBorne()
+
+
+@pytest.fixture
+def backend_capture(monkeypatch):
+    """Route réelle, backend factice : rend les corps JSON que llama-server recevrait."""
+    corps: list[dict] = []
+
+    def repondre(requete: httpx.Request) -> httpx.Response:
+        corps.append(json.loads(requete.content))
+        if corps[-1].get("stream"):
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                content=b"data: [DONE]\n\n",
+            )
+        return httpx.Response(200, json={"usage": {}, "data": [], "tokens": []})
+
+    async def utilisateur() -> dict:
+        return {"user_id": 7, "key_id": 3, "username": "test", "rpm_limit": 0}
+
+    def ignorer(coro, name=None):
+        coro.close()
+
+    async def journal_inerte(**_kwargs) -> None:
+        return None
+
+    saved = proxy._http_client
+    proxy.set_http_client(
+        httpx.AsyncClient(transport=httpx.MockTransport(repondre), timeout=5.0)
+    )
+    monkeypatch.setattr(main, "model_manager", _GestionnaireBorne())
+    monkeypatch.setattr(proxy.db, "log_usage", journal_inerte)
+    monkeypatch.setattr(proxy, "fire_and_forget", ignorer)
+    main.app.dependency_overrides[check_rate_limit] = utilisateur
+    main.app.dependency_overrides[get_current_user] = utilisateur
+    yield corps
+    main.app.dependency_overrides.clear()
+    proxy.set_http_client(saved)
+
+
+@pytest.mark.parametrize("route", [
+    "/v1/chat/completions", "/v1/completions", "/completion", "/v1/completion",
+])
+@pytest.mark.parametrize("stream", [False, True])
+def test_omettre_la_borne_ne_contourne_plus_le_plafond(
+    client, backend_capture, monkeypatch, route, stream,
+):
+    """
+    Défaut corrigé : sans champ, rien n'était validé ni posé, et llama.cpp génère
+    jusqu'à remplir le contexte. Un plafond de 100 ne plafonnait donc que les
+    clients qui le respectaient déjà.
+    """
+    monkeypatch.setattr(settings, "max_new_tokens_per_request", 100)
+
+    reponse = client.post(route, json={"model": "modele-borne", "stream": stream})
+
+    assert reponse.status_code == 200
+    assert backend_capture[-1]["max_tokens"] == 100
+
+
+def test_la_borne_du_client_est_respectee_sous_le_plafond(
+    client, backend_capture, monkeypatch,
+):
+    """Contrôle positif : le plafond ne remplace jamais une demande plus petite."""
+    monkeypatch.setattr(settings, "max_new_tokens_per_request", 100)
+
+    for corps in ({"max_tokens": 5}, {"n_predict": 5}, {"max_completion_tokens": 5}):
+        client.post("/v1/chat/completions", json={"model": "modele-borne", **corps})
+
+    assert backend_capture[0]["max_tokens"] == 5
+    assert backend_capture[1]["n_predict"] == 5 and "max_tokens" not in backend_capture[1]
+    # `max_completion_tokens` seul est recopié là où llama.cpp le lit.
+    assert backend_capture[2]["max_tokens"] == 5
+
+
+def test_sans_plafond_le_corps_du_client_n_est_pas_modifie(
+    client, backend_capture, monkeypatch,
+):
+    """`MAX_NEW_TOKENS_PER_REQUEST=0` reste le comportement historique."""
+    monkeypatch.setattr(settings, "max_new_tokens_per_request", 0)
+
+    client.post("/v1/chat/completions", json={"model": "modele-borne"})
+
+    assert "max_tokens" not in backend_capture[-1]
+
+
+def test_les_routes_sans_generation_ne_recoivent_pas_de_plafond(
+    client, backend_capture, monkeypatch,
+):
+    monkeypatch.setattr(settings, "max_new_tokens_per_request", 100)
+
+    client.post("/v1/embeddings", json={"model": "modele-borne", "input": "x"})
+    client.post("/v1/tokenize", json={"model": "modele-borne", "content": "x"})
+
+    assert len(backend_capture) == 2
+    assert all("max_tokens" not in corps for corps in backend_capture)
+
+
+# ── DP-005 : le reap ne dépend pas du drainage ───────────────────────────────
+
+def test_le_reap_aboutit_sur_un_pipe_jamais_draine(monkeypatch):
+    """
+    Sur Python < 3.13, `wait()` attend la fermeture des pipes : sans drainage, il
+    ne rend jamais après SIGKILL et le modèle reste en UNLOADING. `_reap_after_kill`
+    borne cette attente. Sur 3.13+, `wait()` rend directement et ce test ne prouve
+    que l'absence de régression : c'est la CI (3.11) qui exerce le blocage.
+    """
+    monkeypatch.setattr(server_manager, "REAP_WAIT_SECONDS", 0.2)
+
+    async def scenario() -> int | None:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, "-c",
+            "import sys, time\n"
+            "print('pret', flush=True)\n"
+            "sys.stdout.buffer.write(b'x' * 2_000_000)\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(60)\n",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        # Attendre la sortie : tué avant d'écrire, le processus laisserait un pipe
+        # vide dont l'EOF se lit normalement, et le test ne prouverait rien.
+        assert await asyncio.wait_for(process.stdout.readline(), timeout=20) == b"pret\n"
+        await asyncio.sleep(0.5)
+        os.killpg(process.pid, signal.SIGKILL)
+        await asyncio.wait_for(
+            server_manager.ServerManager._reap_after_kill(None, process, process.pid),
+            timeout=15,
+        )
+        return process.returncode
+
+    assert asyncio.run(scenario()) == -signal.SIGKILL

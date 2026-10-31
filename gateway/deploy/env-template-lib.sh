@@ -123,6 +123,7 @@ CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 # ── Borne de génération par requête ──────────────────────────────────────────
 # max_tokens / max_completion_tokens / n_predict. 0 = aucune borne.
 # Un dépassement ou une valeur négative/non entière est refusé en 400.
+# Une génération sans borne reçoit cette limite (finish_reason: length).
 MAX_NEW_TOKENS_PER_REQUEST=0
 
 # ── DURCISSEMENT 1/3 — allowlist des répertoires de modèles (SEC-002) ────────

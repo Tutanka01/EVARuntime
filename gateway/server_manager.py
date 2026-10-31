@@ -31,6 +31,7 @@ from enum import Enum
 
 import httpx
 
+from child_env import inherited_child_env
 from config import settings
 from integrity import attest_model_artifacts
 from model_registry import IntegrityError, ModelDefinition
@@ -53,36 +54,24 @@ def format_url_host(host: str) -> str:
 # l'unité systemd) : les recopier donnait à une compromission du backend la
 # lecture de /proc/self/environ, donc le contrôle total de /admin et de tous
 # les node-agents. On construit donc un environnement minimal, explicitement
-# autorisé, et on n'y ajoute que ce que llama.cpp a réellement besoin de lire.
+# autorisé (`child_env.py`), et on n'y ajoute que ce que llama.cpp a réellement
+# besoin de lire.
 #
-# LD_LIBRARY_PATH est conservé : une compilation llama.cpp liée à des bibliothèques
-# hors /usr/lib échouerait au chargement sans lui. TMPDIR et HOME aussi, le
-# binaire y écrivant ses fichiers temporaires et son cache.
-CHILD_ENV_ALLOWLIST: tuple[str, ...] = (
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "LANG",
-    "LC_ALL",
-    "TZ",
-    "LD_LIBRARY_PATH",
-)
+# Limite : le processus garde le même UID que la gateway. Cette allowlist retire
+# les secrets de SON environnement, elle ne l'empêche pas de lire ceux de son
+# parent ou l'EnvironmentFile (voir docs/architecture.md, « Isolation de llama-server »).
 
 
 def build_child_env() -> dict[str, str]:
     """
     Environnement transmis à llama-server : allowlist + réglages explicites.
 
-    Aucune variable héritée hors `CHILD_ENV_ALLOWLIST` n'est propagée. Toute
+    Aucune variable héritée hors `child_env.CHILD_ENV_ALLOWLIST` n'est propagée. Toute
     variable ajoutée ici est un choix, jamais un héritage accidentel — c'est la
     différence entre une fuite qui se voit en revue et une fuite qui arrive par
     une unité systemd modifiée six mois plus tard.
     """
-    env = {
-        key: os.environ[key]
-        for key in CHILD_ENV_ALLOWLIST
-        if key in os.environ
-    }
+    env = inherited_child_env()
     env["CUDA_VISIBLE_DEVICES"] = settings.cuda_visible_devices
     # Clé interne passée par variable d'environnement (équivalent --api-key)
     # plutôt qu'en argument : les arguments sont visibles de tous les
@@ -100,6 +89,8 @@ DRAIN_CHUNK_BYTES = 65_536
 # est tronquée : le but est de garder le contexte d'un crash, pas de recopier
 # un prompt entier dans `_stderr_tail`.
 DRAIN_MAX_LINE_BYTES = 8_192
+# Attente du reap après SIGKILL, avant de fermer les pipes de force.
+REAP_WAIT_SECONDS = 10.0
 
 
 # Marqueurs de saturation GPU/CUDA recherchés dans le stderr de llama-server.
@@ -474,11 +465,10 @@ class ServerManager:
         Lecture par blocs plutôt que `readline()` : ce dernier lève ValueError
         dès qu'une ligne dépasse la limite interne du StreamReader (64 Kio), et
         l'ancien `except Exception: pass` laissait alors la tâche de drainage
-        mourir en silence. Personne ne vidait plus le pipe, llama-server se
-        bloquait sur son écriture, et `process.wait()` — qui ne rend que pipes
-        fermés — ne répondait plus jamais : le modèle restait en UNLOADING et
-        son éviction LRU restait bloquée. Un simple prompt très long journalisé
-        par le backend suffisait à figer la gateway.
+        mourir en silence. Personne ne vidait plus le pipe et llama-server gelait
+        dès que ses journaux le remplissaient : observé sous uvloop après 51
+        requêtes, sans aucune erreur. Sur la boucle asyncio de Python < 3.13,
+        `process.wait()` ne rendait en plus jamais après SIGKILL.
 
         Ici, aucun octet ne peut faire échouer la boucle : les lignes sont
         recollées à la main, une ligne démesurée est tronquée puis le tampon
@@ -513,8 +503,8 @@ class ServerManager:
             # Un drainage interrompu doit être visible : c'est exactement le
             # silence qui rendait le défaut impossible à diagnostiquer.
             log.error(
-                "Drainage %s de llama-server '%s' interrompu : %s",
-                "d'un pipe", self._model.id, exc,
+                "Drainage d'un pipe de llama-server '%s' interrompu : %s",
+                self._model.id, exc,
             )
         finally:
             if pending:
@@ -695,16 +685,17 @@ class ServerManager:
         """
         Attend le reap après SIGKILL, sans dépendre du drainage des pipes.
 
-        `Process.wait()` d'asyncio ne rend qu'une fois les pipes refermés, pas
-        seulement le processus mort. Si le drainage a été interrompu (tâche
+        Sur Python < 3.13, `Process.wait()` d'asyncio ne rend qu'une fois les pipes
+        refermés, pas seulement le processus mort. Si le drainage a été interrompu (tâche
         annulée, erreur de transport), le pipe garde son tampon et `wait()`
         bloque pour toujours : le modèle reste en UNLOADING et son éviction LRU
-        bloque les autres chargements sous le verrou de capacité. On ferme donc
-        explicitement les transports en dernier recours — le processus est déjà
-        mort, perdre la fin de son journal est sans conséquence.
+        bloque les autres chargements sous le verrou de capacité. L'attente est donc
+        bornée : un second `wait()` rend dès que le code de retour est connu. Les
+        transports sont fermés pour rendre leurs descripteurs — le processus est
+        déjà mort, perdre la fin de son journal est sans conséquence.
         """
         try:
-            await asyncio.wait_for(process.wait(), timeout=10.0)
+            await asyncio.wait_for(process.wait(), timeout=REAP_WAIT_SECONDS)
             log.debug("llama-server tué (PID %d)", pid)
             return
         except asyncio.TimeoutError:

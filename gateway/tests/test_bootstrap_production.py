@@ -468,6 +468,24 @@ def test_processus_calibration_force_les_uuid_gpu_du_plan(monkeypatch, tmp_path)
     assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-PLAN-0,GPU-PLAN-2"
 
 
+def test_processus_calibration_n_herite_d_aucun_secret(monkeypatch, tmp_path):
+    """DP-001 : ce llama-server parse un GGUF, comme ceux du pool de production."""
+    monkeypatch.setenv("ADMIN_SECRET", "secret-admin")
+    monkeypatch.setenv("HF_TOKEN", "secret-hf")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "GPU-OPERATEUR")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    probes = prod.LlamaServerCalibrationProbes(
+        binary=tmp_path / "llama-server", targets={}, port=19091,
+        load_timeout_seconds=30,
+    )
+    environment = probes._process_env()
+    assert "ADMIN_SECRET" not in environment
+    assert "HF_TOKEN" not in environment
+    # Contrôle positif : l'environnement utile est bien transmis, sans plan GPU.
+    assert environment["PATH"] == "/usr/bin"
+    assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-OPERATEUR"
+
+
 def test_attestation_refuse_runtime_ou_pilote_gpu_courant_different(
     monkeypatch, tmp_path
 ):

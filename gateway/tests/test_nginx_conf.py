@@ -406,3 +406,18 @@ def test_admin_reste_restreint_au_reseau_campus(conf_text):
     assert fallback is not None and fallback.pattern == "/"
     assert fallback.directives.get("return") == "404"
     assert "proxy_pass" not in fallback.directives
+
+
+@pytest.mark.parametrize("conf", [SHIPPED_NGINX_CONF, SHIPPED_NGINX_CONF_MACOS])
+def test_aucun_bloc_server_n_annonce_la_version_de_nginx(conf):
+    """
+    CLU-105 : la redirection du port 80 répond à tout venant, comme le port 443.
+    Un bloc oublié annonce `Server: nginx/<version>` sur chacune de ses réponses.
+    """
+    statements = parse_statements(conf.read_text(encoding="utf-8"))
+    # Sans argument : `server 127.0.0.1:8000` dans un `upstream` n'est pas un bloc.
+    servers = [name for name, args in statements if name == "server" and not args]
+    tokens = [args for name, args in statements if name == "server_tokens"]
+    # Contrôle positif : le parsing voit bien les blocs `server`.
+    assert servers
+    assert tokens == [("off",)] * len(servers)

@@ -131,8 +131,18 @@ async def check_local_health(configured: AgentSettings, timeout: float) -> None:
     # 127.0.0.1/::1 (cf. local_health_url) alors que le certificat est émis pour
     # le nom du nœud. Ce qu'on authentifie, c'est la clé publique épinglée, pas
     # le nom d'hôte de la boucle locale.
+    #
+    # Les réglages par défaut de `create_default_context` changent avec Python et
+    # visent une PKI publique, pas un certificat épinglé. Sans PARTIAL_CHAIN,
+    # Python < 3.13 exige une chaîne jusqu'à une racine auto-signée : un certificat
+    # d'AC (feuille seule, fullchain sans racine) échouait. Avec X509_STRICT,
+    # actif dès 3.13, une racine sans keyUsage ou un auto-signé sans identifiant
+    # de clé échouait. Dans les deux cas, chaque sonde ratait et `update-agent.sh`
+    # repartait en rollback sur un nœud sain.
     context = ssl.create_default_context(cafile=str(configured.agent_tls_cert))
     context.check_hostname = False
+    context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
+    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
     # trust_env=False : la sonde porte AGENT_SECRET vers 127.0.0.1/::1. Un
     # HTTPS_PROXY d'environnement la détournerait vers un proxy (httpx route
     # aussi le loopback) et casserait la mise à jour, avec un risque de fuite

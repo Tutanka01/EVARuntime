@@ -259,6 +259,8 @@ def _schedule_usage_log(
 # ne revalide pas le corps OpenAI, donc c'est ici — et seulement ici — qu'on
 # peut refuser une demande déraisonnable AVANT d'immobiliser de la VRAM.
 _GENERATION_BOUND_FIELDS = ("max_tokens", "max_completion_tokens", "n_predict")
+# Routes qui génèrent des tokens : embeddings et (dé)tokenisation n'en font pas.
+_GENERATION_ROUTES = frozenset({"/v1/chat/completions", "/v1/completions", "/completion"})
 
 
 def _validate_generation_bounds(body: dict) -> JSONResponse | None:
@@ -274,7 +276,7 @@ def _validate_generation_bounds(body: dict) -> JSONResponse | None:
 
     Un booléen est refusé explicitement : `bool` étant une sous-classe de `int`,
     `"max_tokens": true` deviendrait silencieusement 1 token. Omettre le champ
-    reste la façon de demander le comportement par défaut du backend.
+    reste possible : `_apply_generation_cap` y applique la borne du déploiement.
     """
     for field in _GENERATION_BOUND_FIELDS:
         if field not in body or body[field] is None:
@@ -304,6 +306,27 @@ def _validate_generation_bounds(body: dict) -> JSONResponse | None:
                 "invalid_request_error",
             )
     return None
+
+
+def _apply_generation_cap(body: dict, path: str) -> dict:
+    """
+    Pose `max_tokens` quand le client ne borne pas lui-même sa génération.
+
+    Refuser les valeurs au-delà de `MAX_NEW_TOKENS_PER_REQUEST` ne suffit pas :
+    sans champ, llama.cpp applique `n_predict = -1` (jusqu'à remplir le contexte)
+    et la borne était contournée en omettant simplement le champ. Le client voit
+    la limite atteinte : `finish_reason` vaut `length`.
+
+    `max_completion_tokens` seul est recopié dans `max_tokens`, le seul alias que
+    llama.cpp lit à côté de `n_predict` sur toutes ses routes.
+    """
+    cap = settings.max_new_tokens_per_request
+    if cap <= 0 or path not in _GENERATION_ROUTES:
+        return body
+    if body.get("max_tokens") is not None or body.get("n_predict") is not None:
+        return body
+    requested = body.get("max_completion_tokens")
+    return {**body, "max_tokens": cap if requested is None else requested}
 
 
 def _resolve_model_id(body: dict, model_manager: ModelManager) -> str:
@@ -373,6 +396,7 @@ async def proxy_request(
     bounds_refusal = _validate_generation_bounds(body)
     if bounds_refusal is not None:
         return bounds_refusal
+    body = _apply_generation_cap(body, path)
 
     # ── Résoudre le modèle ────────────────────────────────────────────────────
     model_id = _resolve_model_id(body, model_manager)

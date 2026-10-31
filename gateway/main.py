@@ -558,12 +558,12 @@ async def health(request: Request):
     `model_response`). Un scanner réseau n'a pas besoin de la liste des modèles
     pour savoir que la gateway est vivante.
     """
-    status = model_manager.status()
     body: dict = {"status": "ok"}
     if not caller_is_privileged(request.headers.get("authorization"), settings):
         return body
 
-    loaded = [m["id"] for m in status["models"] if m["state"] == "ready"]
+    status = model_manager.status()
+    loaded =[m["id"] for m in status["models"] if m["state"] == "ready"]
     body["models_loaded"] = loaded
     body["vram_used_gb"] = status["vram_budget"]["used_gb"]
     body["vram_available_gb"] = status["vram_budget"]["available_gb"]

@@ -74,6 +74,7 @@ def test_check_local_health_epingle_le_certificat_et_ignore_les_proxies(
 
     class FakeContext:
         check_hostname = True
+        verify_flags = preflight.ssl.VerifyFlags(0)
 
     class FakeResponse:
         def raise_for_status(self) -> None:

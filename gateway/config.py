@@ -243,9 +243,9 @@ class Settings(BaseSettings):
     # ── Bornes de génération (par requête) ─────────────────────────────────────
     # Nombre maximal de tokens demandables en une requête (`max_tokens`,
     # `max_completion_tokens` ou `n_predict`). 0 = aucune borne, comportement
-    # historique. Un client qui dépasse la borne reçoit un 400 explicite : la
-    # valeur n'est jamais écrêtée en silence, parce qu'un texte tronqué sans
-    # avertissement est plus difficile à diagnostiquer qu'un refus.
+    # historique. Un client qui dépasse la borne reçoit un 400 explicite plutôt
+    # qu'un texte tronqué ; une génération sans borne reçoit cette limite, sinon
+    # il suffirait d'omettre le champ pour y échapper (`proxy._apply_generation_cap`).
     #
     # Utilité : sur un GPU partagé, une requête à 10^8 tokens immobilise un slot
     # pendant toute la durée du timeout d'inférence. Ce réglage borne la
