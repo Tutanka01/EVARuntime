@@ -133,10 +133,16 @@ class RemoteNodeClient:
         # du plan de contrôle car un gros GGUF peut prendre plusieurs minutes.
         self._load_timeout = load_timeout_seconds
 
+        # trust_env=False : ce client porte AGENT_SECRET, le secret partagé qui
+        # contrôle TOUS les nœuds. Sans lui, httpx lit HTTPS_PROXY/ALL_PROXY et
+        # y route aussi les URL privées : un proxy d'environnement (ou un MITM
+        # rendu possible par `tls_verify: false`) recevrait le secret du plan de
+        # contrôle. Même règle que le data plane (`proxy.py`) et `metrics.py`.
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             timeout=timeout_seconds,
             verify=verify,
+            trust_env=False,
             headers={
                 "Authorization": f"Bearer {agent_secret}",
                 "User-Agent": "llm-gateway-orchestrator",

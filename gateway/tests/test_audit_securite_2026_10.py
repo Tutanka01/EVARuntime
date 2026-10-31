@@ -12,6 +12,7 @@ Les identifiants `SEC-A-01`, `DP-001`, `DP-002`… renvoient au rapport d'audit
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from collections import deque
@@ -19,11 +20,13 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 import database as db
 import main
 import proxy
 import server_manager
+from cluster.node_client import RemoteNodeClient
 from config import settings
 from server_manager import DRAIN_MAX_LINE_BYTES, build_child_env
 
@@ -152,6 +155,25 @@ def test_le_sous_processus_llama_server_n_herite_d_aucun_secret(monkeypatch):
     assert env["LD_LIBRARY_PATH"] == "/opt/llama/lib"
 
 
+# ── SEC-A-02 : clé interne laissée au placeholder ───────────────────────────
+
+def test_la_cle_interne_placeholder_est_remplacee_au_demarrage(monkeypatch):
+    """
+    Défaut corrigé : un `INTERNAL_API_KEY` vide ou `CHANGE_ME_*` ne produisait
+    qu'un log et le processus continuait avec la constante publiée dans le code
+    source. Au démarrage local, une clé aléatoire est désormais tirée et c'est
+    elle que reçoit chaque llama-server.
+    """
+    monkeypatch.setattr(settings, "internal_api_key", "CHANGE_ME_INTERNAL_KEY")
+    monkeypatch.setattr(settings, "cluster_mode", "local")
+
+    with TestClient(main.app):
+        assert not settings.internal_api_key_is_placeholder()
+        assert len(settings.internal_api_key) >= 32
+        # Contrôle positif : la clé tirée est bien celle transmise au backend.
+        assert build_child_env()["LLAMA_API_KEY"] == settings.internal_api_key
+
+
 # ── DP-002 : le data-plane suivait les proxies d'environnement ───────────────
 
 def test_le_client_d_inference_ignore_les_proxies_d_environnement():
@@ -166,6 +188,24 @@ def test_le_client_d_inference_ignore_les_proxies_d_environnement():
         assert client._trust_env is False
     finally:
         asyncio.run(client.aclose())
+
+
+def test_le_client_du_plan_de_controle_cluster_ignore_les_proxies():
+    """
+    Même défaut que DP-002, mais avec `AGENT_SECRET`, le secret partagé qui
+    contrôle tous les nœuds. Le client du plan de contrôle doit aussi ignorer
+    HTTPS_PROXY/ALL_PROXY — surtout avec `tls_verify: false`, où un proxy peut
+    intercepter TLS.
+    """
+    client = RemoteNodeClient(
+        node_id="audit-node",
+        base_url="https://node.test:9443",
+        agent_secret="agent-secret-de-test-32-caracteres",
+    )
+    try:
+        assert client._client._trust_env is False
+    finally:
+        asyncio.run(client.close())
 
 
 # ── DP-003 : bornes de génération non validées ──────────────────────────────
@@ -212,6 +252,35 @@ def test_la_borne_configurable_refuse_au_dela(monkeypatch):
     assert refus is not None and refus.status_code == 400
 
 
+def test_la_route_refuse_une_borne_negative_avant_tout_chargement():
+    """
+    Contrôle de câblage : la validation doit être appelée par `proxy_request`
+    AVANT toute résolution/chargement de modèle. Un test uniquement unitaire
+    laisserait passer une suppression de l'appel dans le handler.
+    """
+    corps = json.dumps({"model": "modele-test", "n_predict": -1}).encode()
+
+    async def receive():
+        return {"type": "http.request", "body": corps, "more_body": False}
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+        },
+        receive,
+    )
+
+    reponse = asyncio.run(
+        proxy.proxy_request(request, "/v1/chat/completions", {}, None)
+    )
+
+    assert reponse.status_code == 400
+    assert "n_predict" in reponse.body.decode()
+
+
 # ── SEC-A-03 : l'anonymisation n'effaçait pas le fichier ────────────────────
 
 def test_le_nom_efface_ne_survit_pas_dans_le_fichier_sqlite(temp_db):
@@ -223,10 +292,16 @@ def test_le_nom_efface_ne_survit_pas_dans_le_fichier_sqlite(temp_db):
 
     Le WAL est inclus dans la recherche : une écriture récente peut y vivre
     encore, et c'est aussi une copie du fichier.
+
+    Le marqueur est volontairement long et unique : un champ court comme
+    « bureau 204 » est recouvert par la réécriture de la ligne même SANS
+    `secure_delete`, ce qui rendrait le test vert sur le code fautif. Le
+    préfixe du marqueur, lui, subsiste dans l'espace libéré sans le pragma.
     """
     nom = "charles.marcheur.731"
+    marqueur_notes = "SECRET-NOTES-CHARLES-731-" + ("Z" * 400)
     utilisateur = asyncio.run(db.create_user(
-        username=nom, email="charles@example.org", notes="bureau 204",
+        username=nom, email="charles@example.org", notes=marqueur_notes,
     ))
     asyncio.run(db.create_api_key(utilisateur["id"], name="poste-charles"))
 
@@ -245,7 +320,9 @@ def test_le_nom_efface_ne_survit_pas_dans_le_fichier_sqlite(temp_db):
     assert nom.encode() not in bytes(octets), (
         "le nom anonymisé est encore lisible dans le fichier de base"
     )
-    assert b"bureau 204" not in bytes(octets), "les notes anonymisées sont encore lisibles"
+    assert b"SECRET-NOTES-CHARLES-731-" not in bytes(octets), (
+        "les notes anonymisées sont encore lisibles dans l'espace libéré"
+    )
 
 
 # ── DP-005 : une ligne de journal démesurée tuait le drainage des pipes ─────

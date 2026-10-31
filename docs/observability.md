@@ -53,13 +53,26 @@ curl -s http://127.0.0.1:8000/health
 ```
 
 ```json
+{"status": "ok"}
+```
+
+Un appel anonyme ne reçoit que la liveness. Les identifiants des modèles chargés
+et l'occupation VRAM sont réservés à un appelant qui présente `ADMIN_SECRET`
+(même politique que `/ready`) :
+
+```bash
+curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
+  http://127.0.0.1:8000/health
+```
+
+```json
 {"status": "ok", "models_loaded": ["qwen3.5-9b-q5_k_m"], "vram_used_gb": 6.0, "vram_available_gb": 37.6}
 ```
 
 Un `ok` **sans modèle chargé** est normal : le modèle charge à la demande. Ne pas
 utiliser `/health` pour décider si l'instance doit recevoir du trafic — c'est le
-rôle de `/ready`. Le format de `/health` est inchangé et ne fait aucun contrôle
-structurel : il ne peut donc jamais contredire `/ready`.
+rôle de `/ready`. Le corps public est volontairement minimal et ne fait aucun
+contrôle structurel : il ne peut donc jamais contredire `/ready`.
 
 ### /ready (readiness structurelle)
 

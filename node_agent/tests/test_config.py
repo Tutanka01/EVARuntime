@@ -60,6 +60,18 @@ def test_runtime_security_requires_tls_pair():
         configured.validate_runtime_security()
 
 
+def test_runtime_security_rejects_empty_allowed_model_dirs():
+    """
+    CLU-101 : une liste vide désactivait silencieusement le contrôle de chemin
+    du ModelRegistry (`if self._allowed_dirs`). Le node-agent doit refuser de
+    démarrer sans répertoire autorisé.
+    """
+    configured = make_settings(allowed_model_dirs=[])
+
+    with pytest.raises(RuntimeError, match="ALLOWED_MODEL_DIRS"):
+        configured.validate_runtime_security()
+
+
 def test_rejects_control_and_data_plane_port_overlap():
     with pytest.raises(ValidationError, match="chevaucher"):
         make_settings(agent_port=8083, base_llama_port=8081, max_loaded_models=5)

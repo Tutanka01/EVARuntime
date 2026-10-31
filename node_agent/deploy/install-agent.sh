@@ -271,6 +271,10 @@ else
     fi
     append_env_if_missing LLAMA_SERVER_HOST "$LLAMA_SERVER_HOST"
     append_env_if_missing LLAMA_SERVER_HEALTH_HOST 127.0.0.1
+    # CLU-101 : validate_runtime_security() refuse désormais une liste vide.
+    # Les configurations antérieures à ce correctif ne portent pas la clé :
+    # sans cette migration, le préflight bloque toute mise à jour du nœud.
+    append_env_if_missing ALLOWED_MODEL_DIRS /models
     append_env_if_missing IDLE_CHECK_INTERVAL_SECONDS 10
     append_env_if_missing GPU_PROBE_TIMEOUT_SECONDS 5.0
     append_env_if_missing GPU_PROBE_INTERVAL_SECONDS 60.0

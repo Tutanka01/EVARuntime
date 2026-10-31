@@ -120,6 +120,11 @@ CAPACITY_QUEUE_TIMEOUT_SECONDS=120
 CAPACITY_QUEUE_MAX_WAITERS=100
 CAPACITY_QUEUE_RETRY_AFTER_SECONDS=10
 
+# ── Borne de génération par requête ──────────────────────────────────────────
+# max_tokens / max_completion_tokens / n_predict. 0 = aucune borne.
+# Un dépassement ou une valeur négative/non entière est refusé en 400.
+MAX_NEW_TOKENS_PER_REQUEST=0
+
 # ── DURCISSEMENT 1/3 — allowlist des répertoires de modèles (SEC-002) ────────
 # Seuls les .gguf situés sous ces répertoires peuvent être déclarés dans
 # models.yaml. C'est la barrière contre un chemin arbitraire injecté par l'API

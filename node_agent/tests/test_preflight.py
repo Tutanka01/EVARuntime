@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import preflight
 from config import AgentSettings
 from preflight import (
     load_settings_file,
@@ -45,6 +46,70 @@ def test_preflight_accepts_complete_runtime(tmp_path):
 
     assert validate_runtime_files(configured) == []
     assert asyncio.run(validate_runtime_version(configured)) == []
+
+
+def test_check_local_health_epingle_le_certificat_et_ignore_les_proxies(
+    monkeypatch, tmp_path
+):
+    """
+    La sonde porte AGENT_SECRET : elle doit vérifier le certificat épinglé et
+    ne jamais passer par HTTPS_PROXY (httpx route aussi 127.0.0.1/::1).
+    """
+    cert = tmp_path / "agent.crt"
+    key = tmp_path / "agent.key"
+    cert.write_text("certificat", encoding="utf-8")
+    key.write_text("cle", encoding="utf-8")
+    key.chmod(0o640)
+    configured = AgentSettings(
+        _env_file=None,
+        agent_secret="a" * 32,
+        internal_api_key="b" * 32,
+        agent_tls_cert=cert,
+        agent_tls_key=key,
+        allowed_model_dirs="/models",
+    )
+
+    captured: dict = {}
+    seen: dict = {}
+
+    class FakeContext:
+        check_hostname = True
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"status": "ok", "loaded_model_ids": []}
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> bool:
+            return False
+
+        async def get(self, url: str, headers: dict | None = None):
+            captured["url"] = url
+            captured["headers"] = headers
+            return FakeResponse()
+
+    def fake_context(*, cafile: str):
+        seen["cafile"] = cafile
+        return FakeContext()
+
+    monkeypatch.setattr(preflight.ssl, "create_default_context", fake_context)
+    monkeypatch.setattr(preflight.httpx, "AsyncClient", FakeClient)
+
+    asyncio.run(preflight.check_local_health(configured, 1.0))
+
+    assert captured["trust_env"] is False
+    assert captured["verify"].check_hostname is False
+    assert seen["cafile"] == str(cert)
+    assert captured["headers"] == {"Authorization": f"Bearer {configured.agent_secret}"}
 
 
 def test_preflight_requires_positive_minimum_build(tmp_path):

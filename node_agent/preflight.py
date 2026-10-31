@@ -133,7 +133,13 @@ async def check_local_health(configured: AgentSettings, timeout: float) -> None:
     # le nom d'hôte de la boucle locale.
     context = ssl.create_default_context(cafile=str(configured.agent_tls_cert))
     context.check_hostname = False
-    async with httpx.AsyncClient(verify=context, timeout=timeout) as client:
+    # trust_env=False : la sonde porte AGENT_SECRET vers 127.0.0.1/::1. Un
+    # HTTPS_PROXY d'environnement la détournerait vers un proxy (httpx route
+    # aussi le loopback) et casserait la mise à jour, avec un risque de fuite
+    # si le proxy peut intercepter TLS.
+    async with httpx.AsyncClient(
+        verify=context, timeout=timeout, trust_env=False
+    ) as client:
         response = await client.get(
             url,
             headers={"Authorization": f"Bearer {configured.agent_secret}"},

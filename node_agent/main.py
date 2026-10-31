@@ -181,6 +181,17 @@ class _LoadOperation:
     completed_at: float | None = None
 
 
+def _build_llama_metrics_client() -> httpx.AsyncClient:
+    """
+    Client de collecte des métriques llama-server du nœud.
+
+    Les URL sont en HTTP loopback/privé et portent `INTERNAL_API_KEY` : un
+    `HTTP_PROXY`/`ALL_PROXY` de l'environnement ne doit jamais les voir. Même
+    règle que le collecteur de la gateway (`gateway/metrics.py`).
+    """
+    return httpx.AsyncClient(timeout=3.0, trust_env=False)
+
+
 class _AgentState:
     """
     Singleton local : pool de ServerManager + pool de ports + budget VRAM.
@@ -950,7 +961,7 @@ class _AgentState:
         result: dict = {}
         if not ready:
             return result
-        async with httpx.AsyncClient(timeout=3.0) as client:
+        async with _build_llama_metrics_client() as client:
             for model_id, mgr in ready:
                 try:
                     resp = await client.get(

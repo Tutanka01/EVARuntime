@@ -1680,7 +1680,19 @@ Configuration VRAM
 curl http://127.0.0.1:8000/health
 ```
 
-Réponse attendue (aucun modèle chargé au démarrage) :
+Réponse attendue pour un appel anonyme :
+
+```json
+{"status": "ok"}
+```
+
+Le détail (modèles chargés, VRAM) exige `ADMIN_SECRET` — comme `/ready` — pour
+ne pas publier l'inventaire des modèles sur une route publique :
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_SECRET" \
+  http://127.0.0.1:8000/health
+```
 
 ```json
 {
@@ -2515,6 +2527,13 @@ L'installateur exige un build minimal positif et sonde le binaire canonique
 doit être déclaré explicitement avec `--llama-server-bin` ; un build illisible
 ou inférieur au plancher fait échouer le préflight.
 
+`ALLOWED_MODEL_DIRS` doit lister au moins un répertoire absolu : sans lui, le
+node-agent chargeait n'importe quel chemin GGUF lisible par le service. Le
+déploiement livré écrit `/models` (installation neuve) et l'installateur ajoute
+la clé aux configurations existantes ; si vous maintenez l'EnvironmentFile à la
+main, ajoutez `ALLOWED_MODEL_DIRS=/models` avant `update-agent.sh`, sinon le
+préflight refuse la mise à jour.
+
 Le node-agent mesure aussi la VRAM par UUID en respectant
 `CUDA_VISIBLE_DEVICES`. Cette sonde est best-effort et ne complique pas une
 installation CPU-only : `GPU_PROBE_TIMEOUT_SECONDS` (défaut `5`) borne chaque
@@ -2596,9 +2615,11 @@ curl -s -H "Authorization: Bearer $ADMIN_SECRET" \
 
 Avant la première mise à jour d'un agent installé avec l'ancien défaut
 `LLAMA_SERVER_MIN_BUILD=0`, attestez le runtime puis relevez explicitement son
-plancher dans `/etc/llm-gateway-agent/env`. Le préflight de la nouvelle release
-refuse une valeur nulle, un binaire illisible ou un build trop ancien **avant**
-de toucher au service :
+plancher dans `/etc/llm-gateway-agent/env`. Vérifiez aussi que
+`ALLOWED_MODEL_DIRS` contient au moins un répertoire absolu (le déploiement
+livré écrit `/models`). Le préflight de la nouvelle release refuse une valeur
+nulle, un binaire illisible, un build trop ancien ou une allowlist vide
+**avant** de toucher au service :
 
 ```bash
 /opt/llama.cpp/current/llama-server --version
@@ -3297,6 +3318,12 @@ le runtime de la gateway locale.
 | `HTTPX_MAX_CONNECTIONS` | `200` | Connexions totales max du client partagé (`0` = illimité, déconseillé). |
 | `HTTPX_MAX_KEEPALIVE` | `100` | Connexions keep-alive conservées au repos (`0` = illimité). |
 | `HTTPX_KEEPALIVE_EXPIRY` | `30.0` | Durée de vie (s) d'une connexion keep-alive inactive. |
+
+### Bornes de génération
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `MAX_NEW_TOKENS_PER_REQUEST` | `0` | Nombre maximal de tokens demandables via `max_tokens`, `max_completion_tokens` ou `n_predict`. `0` = aucune borne (comportement historique). Un dépassement, une valeur négative, un booléen ou un type non entier est refusé en `400` — jamais écrêté en silence. |
 
 ### Robustesse du cycle de vie (shutdown, VRAM, orphelins)
 
