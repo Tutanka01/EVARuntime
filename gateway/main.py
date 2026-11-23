@@ -256,6 +256,9 @@ async def lifespan(app: FastAPI):
     await _validate_inference_runtime(enabled_models)
 
     await db.init_db()
+    # Connexions SQLite partagées du chemin chaud (auth, quota, usage) : une
+    # ouverture ici plutôt qu'à la première requête, fermées au shutdown.
+    await db.open_shared_db()
     log.info("Base de données initialisée : %s", settings.db_path)
 
     # ── Rétention RGPD (usage_log + sauvegardes pre-migration) ────────────────
@@ -315,6 +318,9 @@ async def lifespan(app: FastAPI):
     remaining = await drain_pending(settings.shutdown_background_flush_seconds)
     if remaining:
         log.info("Flush des tâches d'arrière-plan : %d encore en cours.", remaining)
+    # Après le flush : les dernières lignes d'usage passent par la connexion
+    # partagée d'écriture.
+    await db.close_shared_db()
     await aclose_http_client()
     log.info("=== LLM Gateway UPPA arrêt propre ===")
 

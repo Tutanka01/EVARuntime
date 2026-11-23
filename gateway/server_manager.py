@@ -91,6 +91,17 @@ DRAIN_CHUNK_BYTES = 65_536
 DRAIN_MAX_LINE_BYTES = 8_192
 # Attente du reap après SIGKILL, avant de fermer les pipes de force.
 REAP_WAIT_SECONDS = 10.0
+# Sonde /health pendant un chargement : intervalle progressif. Un intervalle
+# fixe de 2 s ajoutait jusqu'à 2 s à CHAQUE démarrage à froid (le serveur prêt
+# attendait la sonde suivante). On commence court — un petit modèle déjà en
+# cache de pages est prêt en quelques centaines de ms — puis on espace jusqu'au
+# plafond pour ne pas marteler un chargement de plusieurs dizaines de secondes.
+HEALTH_POLL_INITIAL_SECONDS = 0.1
+HEALTH_POLL_MAX_SECONDS = 1.0
+HEALTH_POLL_BACKOFF = 1.5
+# Attente entre deux sondes. Indirection pour les tests, qui vérifient les
+# intervalles DEMANDÉS plutôt que du temps écoulé (instable sur une CI chargée).
+_health_poll_sleep = asyncio.sleep
 
 
 # Marqueurs de saturation GPU/CUDA recherchés dans le stderr de llama-server.
@@ -167,6 +178,11 @@ class ServerManager:
 
         # Buffer des dernières lignes stderr — alimenté par _drain_logs, lu au crash.
         self._stderr_tail: deque[str] = deque(maxlen=30)
+        # Tâches de drainage des pipes : asyncio ne garde qu'une référence
+        # faible vers une tâche ; sans celle-ci, une tâche de drainage pouvait
+        # être ramassée par le GC en cours de route, et plus personne ne vidait
+        # le pipe (llama-server gèle dès qu'il est plein). Retirées à la fin.
+        self._drain_tasks: set[asyncio.Task] = set()
 
     # ── Propriétés publiques ──────────────────────────────────────────────────
 
@@ -435,8 +451,10 @@ class ServerManager:
         )
 
         # Drainer les DEUX pipes : un pipe plein (64 KB) bloque llama-server.
-        asyncio.create_task(self._drain_stream(self._process.stderr))
-        asyncio.create_task(self._drain_stream(self._process.stdout))
+        for pipe in (self._process.stderr, self._process.stdout):
+            task = asyncio.create_task(self._drain_stream(pipe))
+            self._drain_tasks.add(task)
+            task.add_done_callback(self._drain_tasks.discard)
 
     def _append_tail(self, raw: bytes, llama_log: logging.Logger) -> None:
         """
@@ -512,7 +530,9 @@ class ServerManager:
 
     async def _wait_for_health(self) -> None:
         """
-        Poll /health toutes les 2s jusqu'à {"status": "ok"}.
+        Poll /health jusqu'à {"status": "ok"}, à intervalle progressif
+        (HEALTH_POLL_INITIAL_SECONDS × HEALTH_POLL_BACKOFF, plafonné à
+        HEALTH_POLL_MAX_SECONDS).
         Lève TimeoutError si le serveur ne répond pas dans le délai configuré.
         Lève RuntimeError si le processus meurt avant d'être prêt.
 
@@ -533,6 +553,7 @@ class ServerManager:
         # un proxy campus, la sonde partait vers le proxy, qui ne peut pas
         # joindre le loopback de la gateway : tout chargement finissait en
         # timeout alors que le serveur était prêt.
+        interval = HEALTH_POLL_INITIAL_SECONDS
         async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
             while time.monotonic() < deadline:
                 if self._process and self._process.returncode is not None:
@@ -567,7 +588,11 @@ class ServerManager:
                 except (httpx.ConnectError, httpx.TimeoutException, httpx.ReadError):
                     pass
 
-                await asyncio.sleep(2)
+                # Jamais au-delà de l'échéance : le timeout de santé reste exact.
+                await _health_poll_sleep(
+                    max(0.0, min(interval, deadline - time.monotonic()))
+                )
+                interval = min(interval * HEALTH_POLL_BACKOFF, HEALTH_POLL_MAX_SECONDS)
 
         log.error(
             "llama-server '%s' injoignable sur %s après %ds (timeout de santé).",

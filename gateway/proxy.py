@@ -36,6 +36,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import json.decoder
+import json.scanner
 import logging
 import time
 from contextlib import AbstractAsyncContextManager
@@ -45,7 +47,7 @@ from typing import AsyncGenerator, Callable
 import anyio  # backend asyncio de starlette/httpcore — dépendance déjà verrouillée, pas un ajout
 import httpx
 from fastapi import Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import database as db
 from background import fire_and_forget
@@ -154,6 +156,28 @@ async def _report_backend_failure(manager: ServerManager) -> None:
             "Impossible de signaler l'échec du backend '%s'.",
             manager.model.id,
         )
+
+
+# Erreurs qui prouvent que le backend est injoignable : connexion refusée ou
+# trop lente à s'établir, socket coupée en lecture/écriture, protocole HTTP
+# rompu. Volontairement ABSENTS : `ReadTimeout` (génération plus longue que le
+# timeout de lecture : le backend travaille) et `PoolTimeout` (pool de
+# connexions de la GATEWAY épuisé : le backend n'y est pour rien). En mode
+# cluster, un signalement invalide le placement — évictions et rechargement à
+# froid : un faux positif coûte plus cher qu'un heartbeat d'attente.
+_BACKEND_UNREACHABLE_ERRORS: tuple[type[httpx.HTTPError], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+
+
+async def _report_if_unreachable(manager: ServerManager, exc: BaseException) -> None:
+    """Signale l'échec au gestionnaire seulement s'il prouve un backend injoignable."""
+    if isinstance(exc, _BACKEND_UNREACHABLE_ERRORS):
+        await _report_backend_failure(manager)
 
 
 # ── Stream upstream ouvert en pré-flight ─────────────────────────────────────
@@ -358,7 +382,7 @@ async def proxy_request(
     *,
     required_capability: str | None = None,
     allow_streaming: bool = True,
-) -> StreamingResponse | JSONResponse:
+) -> Response:
     """
     Point d'entrée générique.
     - Lit le body et résout le modèle cible
@@ -514,9 +538,9 @@ async def proxy_request(
             opened = await _open_upstream_stream(
                 manager, path, body_with_usage, request_id
             )
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             _release_stream_guard()
-            await _report_backend_failure(manager)
+            await _report_if_unreachable(manager, exc)
             _schedule_usage_log(
                 user=user,
                 model_id=manager.model.id,
@@ -531,7 +555,7 @@ async def proxy_request(
             )
         except httpx.RequestError as exc:
             _release_stream_guard()
-            await _report_backend_failure(manager)
+            await _report_if_unreachable(manager, exc)
             log.error("Erreur de connexion à llama-server '%s' : %s", manager.model.id, exc)
             _schedule_usage_log(
                 user=user,
@@ -645,12 +669,62 @@ async def proxy_request(
     else:
         manager.pin()
         try:
-            return await _non_stream_proxy(path, body, user, request_id, start_time, manager)
+            return await _non_stream_proxy(
+                path, body, user, request_id, start_time, manager,
+                request=request,
+            )
         finally:
             manager.unpin()
 
 
 # ── Proxy non-streaming ───────────────────────────────────────────────────────
+
+# Statut journalisé quand le client raccroche avant la réponse (convention
+# nginx « client closed request »), comme le chemin streaming.
+_CLIENT_CLOSED_STATUS = 499
+
+
+async def _wait_for_disconnect(request: Request) -> bool:
+    """
+    Attend la déconnexion du client. True si elle est constatée.
+
+    Le corps a déjà été lu par `proxy_request` : le prochain message ASGI ne
+    peut être que `http.disconnect`, émis par uvicorn à la fermeture de la
+    socket (ou, sous TestClient/ASGITransport, après la réponse — la tâche
+    est annulée avant). Le `receive` vu ici traverse le
+    `@app.middleware("http")` de main.py (`BaseHTTPMiddleware`), qui relaie
+    ce message une fois le corps consommé.
+
+    Tout autre résultat (message inattendu, pas de canal `receive`, erreur)
+    rend False : on ne sait rien, et la requête upstream suit son cours
+    normal — jamais d'annulation sur un doute.
+    """
+    try:
+        message = await request.receive()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return False
+    return message.get("type") == "http.disconnect"
+
+
+async def _cancel_and_wait(task: asyncio.Task) -> None:
+    """
+    Annule `task` et attend sa fin, sans avaler une annulation de l'appelant.
+
+    Annuler la requête httpx ferme sa connexion : c'est ce qui libère le slot
+    llama.cpp (le serveur arrête la génération sur socket fermée).
+    """
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception as exc:
+        log.debug("Requête upstream annulée : %s", exc)
+
 
 async def _non_stream_proxy(
     path: str,
@@ -659,27 +733,86 @@ async def _non_stream_proxy(
     request_id: str,
     start_time: float,
     manager: ServerManager,
-) -> JSONResponse:
+    *,
+    request: Request | None = None,
+) -> Response:
+    """
+    Relaie une requête non streamante.
+
+    request : la requête entrante, pour surveiller la déconnexion du client.
+    uvicorn n'annule PAS un handler non streamant quand le client raccroche :
+    sans cette surveillance, la génération continuait jusqu'à son terme (sans
+    borne si MAX_NEW_TOKENS_PER_REQUEST = 0), slot GPU occupé et modèle
+    pinné pour une réponse que personne ne lira. On fait donc courir l'appel
+    upstream contre la déconnexion ; si elle gagne, l'appel est annulé (la
+    connexion fermée libère le slot llama.cpp) et une ligne d'usage 499 est
+    écrite. Le pin reste relâché par le finally de `proxy_request`.
+    """
+    # Client partagé : on emprunte une connexion keep-alive du pool. Ne
+    # jamais fermer ce client ici — il vit toute la durée du processus.
+    client = get_http_client()
+    upstream = asyncio.ensure_future(client.post(
+        manager.llama_url(path),
+        json=body,
+        headers=_upstream_headers(manager, request_id),
+    ))
+    watcher: asyncio.Task | None = None
+    if request is not None and getattr(request, "receive", None) is not None:
+        watcher = asyncio.ensure_future(_wait_for_disconnect(request))
     try:
-        # Client partagé : on emprunte une connexion keep-alive du pool. Ne
-        # jamais fermer ce client ici — il vit toute la durée du processus.
-        client = get_http_client()
-        response = await client.post(
-            manager.llama_url(path),
-            json=body,
-            headers=_upstream_headers(manager, request_id),
-        )
-    except httpx.TimeoutException:
-        await _report_backend_failure(manager)
+        if watcher is not None:
+            await asyncio.wait({upstream, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if (
+                not upstream.done()
+                and not watcher.cancelled()
+                and watcher.result() is True
+            ):
+                await _cancel_and_wait(upstream)
+                log.info(
+                    "Client déconnecté avant la réponse de '%s' : requête "
+                    "upstream annulée (rid=%s).",
+                    manager.model.id, request_id,
+                )
+                fire_and_forget(db.log_usage(
+                    user_id=user["user_id"],
+                    key_id=user["key_id"],
+                    model=manager.model.id,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    duration_ms=int((time.monotonic() - start_time) * 1000),
+                    status_code=_CLIENT_CLOSED_STATUS,
+                    request_id=request_id,
+                ), name="log_usage")
+                # Personne ne lira cette réponse ; elle ne sert qu'au journal
+                # d'accès du middleware.
+                return _openai_error(
+                    _CLIENT_CLOSED_STATUS,
+                    "Requête abandonnée : client déconnecté.",
+                    "invalid_request_error",
+                )
+        response = await upstream
+    except httpx.TimeoutException as exc:
+        await _report_if_unreachable(manager, exc)
         return _openai_error(504, "Timeout : le modèle n'a pas répondu à temps.", "server_error")
     except httpx.RequestError as exc:
-        await _report_backend_failure(manager)
+        await _report_if_unreachable(manager, exc)
         log.error("Erreur de connexion à llama-server '%s' : %s", manager.model.id, exc)
         return _openai_error(502, "Impossible de joindre le backend d'inférence.", "server_error")
+    finally:
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+        if not upstream.done():
+            # Annulation du handler lui-même (arrêt du serveur…) : on ne
+            # laisse pas la génération tourner sans propriétaire.
+            upstream.cancel()
 
     duration_ms = int((time.monotonic() - start_time) * 1000)
+    large = len(response.content) >= _COOPERATIVE_JSON_MIN_BYTES
     try:
-        data = response.json()
+        if large:
+            data = await _loads_cooperative(response.content)
+        else:
+            data = response.json()
     except ValueError:
         log.error(
             "Réponse non-JSON de llama-server '%s' (HTTP %d)",
@@ -709,7 +842,236 @@ async def _non_stream_proxy(
         request_id=request_id,
     ), name="log_usage")
 
+    if large:
+        # Mêmes octets que `JSONResponse(content=data)` (verrouillé par
+        # test_large_non_stream_body_is_byte_identical_to_jsonresponse).
+        return Response(
+            content=await _dumps_cooperative(data),
+            status_code=response.status_code,
+            media_type="application/json",
+        )
     return JSONResponse(content=data, status_code=response.status_code)
+
+
+# ── JSON volumineux : parse et sérialisation par tranches ─────────────────────
+#
+# Une réponse d'embeddings de 5,5 Mo coûtait ~84 ms de `json.loads` +
+# `json.dumps` d'un seul tenant sur la boucle d'événements : pendant ce temps,
+# plus aucun stream SSE n'avançait. `asyncio.to_thread` ne règle RIEN ici
+# (mesuré : même blocage de 84 ms) — les codecs C du module json gardent le
+# GIL du début à la fin de l'appel. On découpe donc le travail en appels C
+# bornés, et la main est rendue à la boucle toutes les
+# `_COOPERATIVE_SLICE_SECONDS` :
+#
+#   - le premier niveau du document (un objet) est parcouru à la main ;
+#   - un tableau de premier niveau est décodé par FENÊTRES d'environ
+#     `_ARRAY_WINDOW_CHARS` caractères : on coupe la fenêtre sur une virgule et
+#     on décode « [ » + tranche + « ] » d'un seul appel C. La coupe n'est
+#     acceptée que si ce décodage consomme exactement la tranche — une virgule
+#     prise dans une chaîne ou un élément imbriqué laisse une chaîne ou un
+#     crochet ouvert et échoue ; on essaie alors la virgule précédente.
+#     Décoder élément par élément coûtait 7 à 15 fois le codec C sur un
+#     tableau de scalaires (`/v1/tokenize`) : un appel Python par token ;
+#   - un tableau dont le premier élément est gros (embeddings : ~20 Ko par
+#     vecteur) est décodé élément par élément : le surcoût par élément y est
+#     négligeable, et une fenêtre ne contiendrait que des virgules internes ;
+#   - à l'encodage, un tableau de premier niveau est encodé par tranches de
+#     taille comparable : l'encodage compact est compositionnel
+#     (`encode(l) == "[" + ",".join(encode(tranche)[1:-1]) + "]"`).
+#
+# Résultat identique à `json.loads` et aux octets de `JSONResponse`.
+#
+# Limite connue, assumée : seul le PREMIER niveau est découpé. Un gros tableau
+# imbriqué plus bas — `{"data":[{"embedding":[[…], …]}]}` d'un modèle
+# d'embeddings sans pooling, 5,4 Mo — reste décodé d'un bloc (~57 ms).
+
+# Taille de corps à partir de laquelle on passe au traitement par tranches.
+# En dessous, le coût d'un bloc reste de l'ordre de la milliseconde.
+_COOPERATIVE_JSON_MIN_BYTES = 256 * 1024
+# Travail CPU maximal enchaîné avant de rendre la main à la boucle.
+_COOPERATIVE_SLICE_SECONDS = 0.002
+# Taille visée d'un appel C, au décodage comme à l'encodage (~0,2 ms).
+_ARRAY_WINDOW_CHARS = 64 * 1024
+# Coupes essayées dans une fenêtre avant de passer à l'élément par élément.
+_ARRAY_CUT_ATTEMPTS = 4
+# Au-delà de cette taille de premier élément, un tableau est décodé élément
+# par élément (le surcoût Python par élément devient négligeable).
+_ARRAY_WINDOWED_MAX_ELEMENT_CHARS = 2048
+
+_json_scan_once = json.scanner.make_scanner(json.JSONDecoder())
+_json_skip_ws = json.decoder.WHITESPACE.match
+# Mêmes options que `JSONResponse.render`.
+_json_encode = json.JSONEncoder(
+    ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":"),
+).encode
+
+
+class _CpuSlice:
+    """Rend la main à la boucle quand la tranche de CPU courante est épuisée."""
+
+    def __init__(self) -> None:
+        self._started = time.perf_counter()
+
+    async def checkpoint(self) -> None:
+        if time.perf_counter() - self._started >= _COOPERATIVE_SLICE_SECONDS:
+            await asyncio.sleep(0)
+            self._started = time.perf_counter()
+
+
+def _skip_ws(text: str, index: int) -> int:
+    return _json_skip_ws(text, index).end()
+
+
+def _scan_value(text: str, index: int) -> tuple[object, int]:
+    try:
+        return _json_scan_once(text, index)
+    except StopIteration as exc:
+        raise json.JSONDecodeError("Expecting value", text, exc.value) from None
+
+
+def _scan_array_window(text: str, index: int) -> tuple[list, int, bool] | None:
+    """
+    Décode d'un appel C les éléments du tableau à partir de `index` (début
+    d'un élément), dans la limite d'une fenêtre.
+
+    Retourne (éléments, index suivant, fermé) : `fermé` si le crochet du
+    tableau a été atteint (index suivant = après « ] »), sinon l'index suit
+    la virgule de coupe. None si aucune coupe valide n'a été trouvée.
+    """
+    limit = index + _ARRAY_WINDOW_CHARS
+    cut = text.rfind(",", index, limit)
+    for _ in range(_ARRAY_CUT_ATTEMPTS):
+        if cut <= index:
+            break
+        chunk = "[" + text[index:cut] + "]"
+        try:
+            values, end = _json_scan_once(chunk, 0)
+        except (StopIteration, ValueError):
+            cut = text.rfind(",", index, cut)
+            continue
+        if end == len(chunk):
+            return values, cut + 1, False
+        # Le tableau s'est refermé AVANT la coupe, sur un « ] » du texte : le
+        # décodage de cette portion est celui du texte original.
+        return values, index + end - 1, True
+    if limit >= len(text) or "]" in text[index:limit]:
+        # Pas de coupe utilisable : le tableau se termine peut-être dans la
+        # fenêtre (dernier élément, ou virgules toutes après la fermeture).
+        try:
+            values, end = _json_scan_once("[" + text[index:limit], 0)
+        except (StopIteration, ValueError):
+            return None
+        return values, index + end - 1, True
+    return None
+
+
+async def _loads_array(text: str, index: int, cpu: _CpuSlice) -> tuple[list, int]:
+    """Décode le tableau qui commence à `index`, par fenêtres ou par élément."""
+    values: list = []
+    index = _skip_ws(text, index + 1)
+    if text.startswith("]", index):
+        return values, index + 1
+    # Premier élément décodé seul : sa taille choisit la stratégie.
+    value, after = _scan_value(text, index)
+    values.append(value)
+    windowed = after - index < _ARRAY_WINDOWED_MAX_ELEMENT_CHARS
+    index = after
+    while True:
+        await cpu.checkpoint()
+        index = _skip_ws(text, index)
+        if text.startswith("]", index):
+            return values, index + 1
+        if not text.startswith(",", index):
+            raise json.JSONDecodeError("Expecting ',' delimiter", text, index)
+        index = _skip_ws(text, index + 1)
+        if windowed:
+            window = _scan_array_window(text, index)
+            if window is not None:
+                batch, index, closed = window
+                values.extend(batch)
+                if closed:
+                    return values, index
+                # `index` suit déjà la virgule de coupe : l'élément suivant
+                # commence là, sans séparateur à relire.
+                await cpu.checkpoint()
+                index = _skip_ws(text, index)
+                value, index = _scan_value(text, index)
+                values.append(value)
+                continue
+            # Aucune coupe valide (éléments imbriqués) : élément par élément
+            # pour la suite de ce tableau.
+            windowed = False
+        value, index = _scan_value(text, index)
+        values.append(value)
+
+
+async def _loads_cooperative(raw: bytes) -> object:
+    """Équivalent de `json.loads(raw)` qui rend la main entre les tranches."""
+    text = raw.decode(json.detect_encoding(raw), "surrogatepass")
+    index = _skip_ws(text, 0)
+    if not text.startswith("{", index):
+        return json.loads(text)
+    cpu = _CpuSlice()
+    result: dict = {}
+    index = _skip_ws(text, index + 1)
+    if text.startswith("}", index):
+        index += 1
+    else:
+        while True:
+            if not text.startswith('"', index):
+                raise json.JSONDecodeError(
+                    "Expecting property name enclosed in double quotes", text, index
+                )
+            key, index = _scan_value(text, index)
+            index = _skip_ws(text, index)
+            if not text.startswith(":", index):
+                raise json.JSONDecodeError("Expecting ':' delimiter", text, index)
+            index = _skip_ws(text, index + 1)
+            if text.startswith("[", index):
+                value, index = await _loads_array(text, index, cpu)
+            else:
+                value, index = _scan_value(text, index)
+                await cpu.checkpoint()
+            # Clé dupliquée : dernière valeur, première position — comme json.loads.
+            result[key] = value
+            index = _skip_ws(text, index)
+            if text.startswith("}", index):
+                index += 1
+                break
+            if not text.startswith(",", index):
+                raise json.JSONDecodeError("Expecting ',' delimiter", text, index)
+            index = _skip_ws(text, index + 1)
+    if _skip_ws(text, index) != len(text):
+        raise json.JSONDecodeError("Extra data", text, index)
+    return result
+
+
+async def _dumps_array(value: list, cpu: _CpuSlice) -> str:
+    """Encode un tableau par tranches de ~`_ARRAY_WINDOW_CHARS` caractères."""
+    if not value:
+        return "[]"
+    first = _json_encode(value[0])
+    step = max(1, _ARRAY_WINDOW_CHARS // (len(first) + 1))
+    parts = [first]
+    for start in range(1, len(value), step):
+        await cpu.checkpoint()
+        parts.append(_json_encode(value[start:start + step])[1:-1])
+    return "[" + ",".join(parts) + "]"
+
+
+async def _dumps_cooperative(data: object) -> bytes:
+    """Mêmes octets que `JSONResponse(content=data).body`, par tranches."""
+    if not isinstance(data, dict) or not all(isinstance(k, str) for k in data):
+        return _json_encode(data).encode("utf-8")
+    cpu = _CpuSlice()
+    members: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, list):
+            members.append(f"{_json_encode(key)}:{await _dumps_array(value, cpu)}")
+        else:
+            members.append(f"{_json_encode(key)}:{_json_encode(value)}")
+        await cpu.checkpoint()
+    return ("{" + ",".join(members) + "}").encode("utf-8")
 
 
 # ── Proxy streaming SSE ───────────────────────────────────────────────────────
@@ -777,38 +1139,62 @@ async def _stream_proxy(
         )
         ttft_recorded = True
 
+    def _rewrite_line(line: str) -> str:
+        nonlocal prompt_tokens, completion_tokens
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            return line
+        try:
+            chunk = json.loads(line[6:])
+        except json.JSONDecodeError:
+            return line
+        if not isinstance(chunk, dict):
+            return line
+        if "model" in chunk:
+            chunk["model"] = manager.model.id
+        if usage := chunk.get("usage"):
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+        _record_ttft(chunk)
+        return "data: " + json.dumps(chunk, ensure_ascii=False)
+
+    # Un événement SSE = ses lignes non vides, terminées par une ligne vide.
+    # On relaie chaque événement upstream en UN seul chunk (un seul envoi
+    # ASGI) : lignes jointes par « \n », terminateur « \n\n ». Relayer ligne à
+    # ligne coûtait deux envois par token (la ligne, puis un « \n » isolé),
+    # envoyait trois sauts de ligne au client, et aurait coupé en deux un
+    # événement multi-lignes (`event:` + `data:`).
+    event_lines: list[str] = []
+
+    def _frame() -> bytes:
+        framed = ("\n".join(event_lines) + "\n\n").encode()
+        event_lines.clear()
+        return framed
+
     try:
         response = opened.response
         async for line in response.aiter_lines():
-            if not line:
-                yield b"\n"
-                continue
+            if line:
+                event_lines.append(_rewrite_line(line))
+            elif event_lines:
+                yield _frame()
+        if event_lines:
+            # Dernier événement sans ligne vide finale : relayé tel quel.
+            yield _frame()
 
-            if line.startswith("data: ") and line != "data: [DONE]":
-                try:
-                    chunk = json.loads(line[6:])
-                    if "model" in chunk:
-                        chunk["model"] = manager.model.id
-                    if usage := chunk.get("usage"):
-                        prompt_tokens = usage.get("prompt_tokens", 0)
-                        completion_tokens = usage.get("completion_tokens", 0)
-                    _record_ttft(chunk)
-                    line = "data: " + json.dumps(chunk, ensure_ascii=False)
-                except json.JSONDecodeError:
-                    pass
-
-            yield (line + "\n\n").encode()
-
-    except httpx.TimeoutException:
-        await _report_backend_failure(manager)
+    except httpx.TimeoutException as exc:
+        await _report_if_unreachable(manager, exc)
         err = _sse_error("Timeout d'inférence dépassé.")
         status_code = 504
+        if event_lines:
+            yield _frame()
         yield err.encode()
     except httpx.RequestError as exc:
-        await _report_backend_failure(manager)
+        await _report_if_unreachable(manager, exc)
         log.error("Erreur stream llama-server '%s' : %s", manager.model.id, exc)
         err = _sse_error("Erreur de connexion au backend d'inférence.")
         status_code = 502
+        if event_lines:
+            yield _frame()
         yield err.encode()
     except (GeneratorExit, asyncio.CancelledError):
         # Déconnexion client (aclose/annulation) : aucun yield ni await de

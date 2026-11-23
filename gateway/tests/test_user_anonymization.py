@@ -830,10 +830,12 @@ async def test_anonymization_works_after_migration_from_legacy(temp_db) -> None:
 async def test_migration_is_declared_at_version_two(temp_db) -> None:
     """La migration COR-002 est la version 2 du gateway principal."""
     versions = {m.version: m for m in db.MIGRATIONS}
-    assert db.SCHEMA_VERSION == 2
+    assert db.SCHEMA_VERSION >= 2
     assert "anonymized_at" in versions[2].description
-    # Ajoutée en fin de tuple : la baseline livrée n'est pas réécrite.
-    assert db.MIGRATIONS[-1].version == 2
+    # Ajoutée après la baseline, qui n'est pas réécrite ; les migrations
+    # suivantes (3 : index du quota) viennent après elle.
+    assert [m.version for m in db.MIGRATIONS][:2] == [1, 2]
+    assert versions[2].apply is db._ensure_anonymized_at
 
 
 @pytest.mark.anyio

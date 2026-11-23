@@ -485,6 +485,9 @@ async def test_stream_upstream_error_yields_sse_error_and_unpins(
     Le transport lève une RequestError (ex. ReadTimeout) en plein stream —
     après les premiers chunks : un chunk d'erreur SSE propre est émis
     (+ [DONE]), unpin est appelé, et la ligne d'usage porte le statut 504.
+
+    Un ReadTimeout ne prouve PAS un backend injoignable (génération plus
+    longue que le timeout de lecture) : le placement n'est pas invalidé.
     """
     captured: list[httpx.Request] = []
 
@@ -511,7 +514,7 @@ async def test_stream_upstream_error_yields_sse_error_and_unpins(
     assert "data: [DONE]" in text, "le stream d'erreur doit se terminer par [DONE]"
     assert manager.pin_calls == 1
     assert manager.unpin_calls == 1, "unpin doit être appelé malgré l'exception upstream"
-    assert manager.backend_failure_calls == 1
+    assert manager.backend_failure_calls == 0
     assert len(usage_recorder.rows) == 1
     assert usage_recorder.rows[0]["status_code"] == 504
 
@@ -833,11 +836,11 @@ async def test_stream_client_disconnect_under_cancelled_anyio_scope(
     await y échouait, sautait manager.unpin() (fuite de _active_requests —
     modèle plus jamais idle-évictable) et la ligne 499.
 
-    Fidélité à la production : on consomme d'abord le chunk data ET son
-    séparateur de ligne vide déjà bufferisé par aiter_lines — sinon le
-    générateur se re-parque sur son propre yield sans jamais retomber dans
-    l'attente upstream, et l'annulation n'est jamais livrée. Une fois le
-    buffer vide, le générateur est suspendu DANS release.wait() : c'est là
+    Fidélité à la production : on consomme d'abord le premier événement
+    (relayé en UN chunk, terminateur compris) — sinon le générateur se
+    re-parque sur son propre yield sans jamais retomber dans l'attente
+    upstream, et l'annulation n'est jamais livrée. Une fois le buffer vide,
+    le générateur est suspendu DANS release.wait() : c'est là
     que la re-livraison anyio doit le rattraper, pendant que le finally
     nettoie (fermeture du contexte suspendue un cycle de boucle, comme une
     vraie fermeture de socket).
@@ -858,9 +861,7 @@ async def test_stream_client_disconnect_under_cancelled_anyio_scope(
     )
 
     first = await gen.__anext__()
-    assert b"data:" in first
-    separator = await gen.__anext__()  # ligne vide bufferisée du chunk 1
-    assert separator == b"\n"
+    assert first.startswith(b"data:") and first.endswith(b"\n\n")
     # À partir d'ici, le prochain __anext__ suspend dans release.wait().
 
     with anyio.CancelScope() as scope:
@@ -911,3 +912,206 @@ async def test_preflight_connect_timeout_returns_504(
     assert manager.pin_calls == manager.unpin_calls == 1
     assert len(usage_recorder.rows) == 1
     assert usage_recorder.rows[0]["status_code"] == 504
+
+
+# ── 8. Cadrage SSE : un événement upstream = un chunk ─────────────────────────
+
+async def _relay(body: bytes, manager: FakeManager | None = None) -> list[bytes]:
+    """Relaie `body` (flux SSE brut du backend) et retourne les chunks émis."""
+    manager = manager or FakeManager()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    opened = await _open_upstream(httpx.MockTransport(handler), manager)
+    return [
+        chunk
+        async for chunk in proxy._stream_proxy(
+            user=USER, request_id="req-frame", start_time=0.0,
+            manager=manager, opened=opened,
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_each_upstream_event_is_relayed_as_one_chunk(restore_http_client):
+    """
+    Un token = un envoi ASGI. Avant : la ligne `data:` puis un « \\n » isolé
+    (deux envois), et trois sauts de ligne au client au lieu de deux.
+    """
+    events = [
+        'data: {"model":"upstream","choices":[{"delta":{"content":"%d"}}]}' % i
+        for i in range(5)
+    ]
+    chunks = await _relay(_sse_stream(*events, "data: [DONE]"))
+
+    assert len(chunks) == 6
+    for chunk in chunks:
+        assert chunk.endswith(b"\n\n") and not chunk.endswith(b"\n\n\n"), chunk
+        assert chunk.count(b"\n\n") == 1, chunk
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert [e["model"] for e in _json_events(b"".join(chunks))] == ["test-model"] * 5
+
+
+@pytest.mark.anyio
+async def test_multiline_event_is_kept_whole(restore_http_client):
+    """`event:` + `data:` forment UN événement : ni coupé en deux, ni réordonné."""
+    body = (
+        b'event: delta\ndata: {"model":"upstream","choices":[]}\n\n'
+        b": commentaire keep-alive\n\n"
+        b"data: [DONE]\n\n"
+    )
+    chunks = await _relay(body)
+
+    assert chunks == [
+        b'event: delta\ndata: {"model": "test-model", "choices": []}\n\n',
+        b": commentaire keep-alive\n\n",
+        b"data: [DONE]\n\n",
+    ]
+
+
+@pytest.mark.anyio
+async def test_trailing_event_without_blank_line_is_flushed(restore_http_client):
+    """Fin de flux sans ligne vide finale : le dernier événement n'est pas perdu."""
+    chunks = await _relay(b'data: {"choices":[]}\n\ndata: [DONE]')
+    assert chunks == [b'data: {"choices": []}\n\n', b"data: [DONE]\n\n"]
+
+
+@pytest.mark.anyio
+async def test_crlf_and_extra_blank_lines_are_normalised(restore_http_client):
+    """CRLF et lignes vides surnuméraires : aucun chunk vide relayé."""
+    chunks = await _relay(b'\r\n\r\ndata: {"choices":[]}\r\n\r\n\r\ndata: [DONE]\r\n\r\n')
+    assert chunks == [b'data: {"choices": []}\n\n', b"data: [DONE]\n\n"]
+
+
+@pytest.mark.anyio
+async def test_usage_and_ttft_still_captured_with_event_framing(
+    restore_http_client, usage_recorder,
+):
+    body = _sse_stream(
+        'data: {"choices":[{"delta":{"content":"a"}}]}',
+        'data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":9}}',
+        "data: [DONE]",
+    )
+    await _relay(body)
+    await usage_recorder.flush()
+
+    assert usage_recorder.rows[0]["prompt_tokens"] == 4
+    assert usage_recorder.rows[0]["completion_tokens"] == 9
+    assert telemetry.TTFT_SECONDS.snapshot().series, "TTFT enregistré"
+
+
+# ── 9. Invalidation du placement : seulement sur backend injoignable ─────────
+
+class ErrorAfterFirstChunk(httpx.AsyncByteStream):
+    def __init__(self, captured: list[httpx.Request], exc_type: type[httpx.RequestError]) -> None:
+        self._captured = captured
+        self._exc_type = exc_type
+
+    async def __aiter__(self):
+        yield _sse_stream('data: {"choices":[{"delta":{"content":"a"}}]}')
+        raise self._exc_type("panne simulée", request=self._captured[0])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("exc_type", "status", "reported"),
+    [
+        (httpx.ReadTimeout, 504, 0),
+        (httpx.ReadError, 502, 1),
+        (httpx.RemoteProtocolError, 502, 1),
+    ],
+)
+async def test_mid_stream_failure_reports_only_unreachable_backend(
+    restore_http_client, usage_recorder, exc_type, status, reported,
+):
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(200, stream=ErrorAfterFirstChunk(captured, exc_type))
+
+    manager = FakeManager()
+    chunks = await _relay_with(handler, manager)
+    await usage_recorder.flush()
+
+    text = b"".join(chunks).decode()
+    assert text.startswith("data: ") and '"error"' in text and "data: [DONE]" in text
+    assert manager.backend_failure_calls == reported
+    assert usage_recorder.rows[0]["status_code"] == status
+
+
+async def _relay_with(handler, manager: FakeManager) -> list[bytes]:
+    opened = await _open_upstream(httpx.MockTransport(handler), manager)
+    return [
+        chunk
+        async for chunk in proxy._stream_proxy(
+            user=USER, request_id="req-fail", start_time=0.0,
+            manager=manager, opened=opened,
+        )
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("exc_type", "status", "reported"),
+    [
+        (httpx.ConnectError, 502, 1),
+        (httpx.ConnectTimeout, 504, 1),
+        (httpx.ReadTimeout, 504, 0),
+        (httpx.PoolTimeout, 504, 0),
+        (httpx.ReadError, 502, 1),
+        (httpx.WriteError, 502, 1),
+        (httpx.RemoteProtocolError, 502, 1),
+    ],
+)
+async def test_preflight_failure_reports_only_unreachable_backend(
+    restore_http_client, usage_recorder, exc_type, status, reported,
+):
+    """
+    Pré-flight du stream : statut client inchangé (504 timeout, 502 sinon),
+    mais un ReadTimeout (génération longue) ou un PoolTimeout (pool de la
+    GATEWAY saturé) n'invalident plus le placement cluster.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc_type("panne simulée", request=request)
+
+    _inject_client(httpx.MockTransport(handler))
+    manager = FakeManager()
+    response = await proxy.proxy_request(
+        _FakeRequest(_stream_request_body()),
+        "/v1/chat/completions",
+        USER,
+        _EnsureModelManager(manager),
+    )
+    await usage_recorder.flush()
+
+    assert response.status_code == status
+    assert manager.backend_failure_calls == reported
+    assert manager.pin_calls == manager.unpin_calls == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("exc_type", "status", "reported"),
+    [
+        (httpx.ConnectError, 502, 1),
+        (httpx.ConnectTimeout, 504, 1),
+        (httpx.ReadTimeout, 504, 0),
+        (httpx.PoolTimeout, 504, 0),
+        (httpx.RemoteProtocolError, 502, 1),
+    ],
+)
+async def test_non_stream_failure_reports_only_unreachable_backend(
+    restore_http_client, exc_type, status, reported,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc_type("panne simulée", request=request)
+
+    _inject_client(httpx.MockTransport(handler))
+    manager = FakeManager()
+    response = await proxy._non_stream_proxy(
+        "/v1/chat/completions", {}, USER, "req-ns", 0.0, manager
+    )
+    assert response.status_code == status
+    assert manager.backend_failure_calls == reported

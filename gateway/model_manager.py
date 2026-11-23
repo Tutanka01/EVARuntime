@@ -184,6 +184,9 @@ class LocalModelManager:
         self._capacity_cond = asyncio.Condition()
         self._capacity_waiters: deque[object] = deque()
         self._model_locks: dict[str, asyncio.Lock] = {}
+        # Réveil planifié par `_notify_capacity_changed` (référence forte).
+        self._notify_task: asyncio.Task | None = None
+        self._notify_pending = False
 
         # Modèles en quarantaine : un déchargement admin est en cours de drain.
         # Aucune NOUVELLE requête n'est admise sur ces modèles, sinon le drain
@@ -651,14 +654,39 @@ class LocalModelManager:
         self._notify_capacity_changed()
 
     def _notify_capacity_changed(self) -> None:
+        """
+        Planifie un réveil des waiters de `_capacity_cond`.
+
+        Appelé depuis des callbacks synchrones (déchargement, fin de
+        chargement) : le réveil exige le lock de la condition, donc une tâche.
+        La tâche est gardée par une référence forte (asyncio ne garde qu'une
+        référence faible : une tâche ramassée par le GC avant d'avoir tourné
+        laissait les waiters dormir jusqu'à leur timeout).
+
+        Coalescence : si un réveil de la même boucle est déjà planifié et n'a
+        pas encore appelé `notify_all`, il s'exécutera APRÈS ce changement
+        d'état et réveillera donc aussi les waiters concernés — une seconde
+        tâche serait redondante. `_notify_pending` repasse à False sous le lock,
+        juste avant `notify_all`.
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._notify_capacity_waiters())
+        task = self._notify_task
+        if (
+            self._notify_pending
+            and task is not None
+            and not task.done()
+            and task.get_loop() is loop
+        ):
+            return
+        self._notify_pending = True
+        self._notify_task = loop.create_task(self._notify_capacity_waiters())
 
     async def _notify_capacity_waiters(self) -> None:
         async with self._capacity_cond:
+            self._notify_pending = False
             self._capacity_cond.notify_all()
 
     # ── Actions admin ─────────────────────────────────────────────────────────

@@ -27,3 +27,16 @@ os.environ.setdefault("AGENT_SECRET", "test-agent-secret-at-least-32-chars-long"
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("LOG_DIR", str(PROJECT_ROOT / "tests" / "_logs"))
 os.environ.setdefault("MODELS_CONFIG_PATH", str(PROJECT_ROOT / "models.yaml"))
+
+
+@pytest.fixture(autouse=True)
+def _reset_last_used_debounce():
+    """
+    La table anti-rebond de `last_used` (auth.py) est un état de processus,
+    alors que chaque base de test recommence ses `key_id` à 1 : sans remise à
+    zéro, un test hériterait des écritures « récentes » d'un autre.
+    """
+    yield
+    auth = sys.modules.get("auth")
+    if auth is not None:
+        auth._last_used_written.clear()

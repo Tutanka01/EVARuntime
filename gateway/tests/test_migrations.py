@@ -143,9 +143,12 @@ async def test_new_db_reaches_target_version_with_full_schema(temp_db) -> None:
         rows = await (await conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'"
         )).fetchall()
-    assert {"idx_usage_user_time", "idx_usage_timestamp", "idx_keys_hash", "idx_keys_user"} <= {
-        r["name"] for r in rows
-    }
+    names = {r["name"] for r in rows}
+    assert {
+        "idx_usage_user_time_tokens", "idx_usage_timestamp", "idx_keys_hash", "idx_keys_user",
+    } <= names
+    # Préfixe strict de l'index couvrant : supprimé par la migration 3.
+    assert "idx_usage_user_time" not in names
 
 
 @pytest.mark.anyio
@@ -449,3 +452,128 @@ async def test_rebuild_table_migration_changes_foreign_key(temp_db, monkeypatch)
         await conn.commit()
         row = await (await conn.execute("SELECT COUNT(*) AS n FROM usage_log")).fetchone()
         assert row["n"] == 0
+
+
+# ── Migration 3 : index couvrant du quota ─────────────────────────────────────
+
+_QUOTA_SQL = (
+    "SELECT COALESCE(SUM(total_tokens), 0) FROM usage_log "
+    "WHERE user_id = ? AND timestamp >= datetime('now', '-30 days')"
+)
+
+
+def _schema_objects(path: Path) -> list[tuple]:
+    """Objets du schéma (hors tables internes), pour comparer deux bases."""
+    conn = sqlite3.connect(path)
+    try:
+        return sorted(
+            conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+
+def _usage_indexes(path: Path) -> set[str]:
+    conn = sqlite3.connect(path)
+    try:
+        return {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND tbl_name = 'usage_log' AND name LIKE 'idx_%'"
+            )
+        }
+    finally:
+        conn.close()
+
+
+async def _init_at_version(monkeypatch, version: int) -> None:
+    """Amène la base à `version` exactement, comme un déploiement antérieur."""
+    full = db.MIGRATIONS
+    monkeypatch.setattr(db, "MIGRATIONS", tuple(m for m in full if m.version <= version))
+    try:
+        await db.init_db()
+    finally:
+        monkeypatch.setattr(db, "MIGRATIONS", full)
+
+
+def test_migration_3_is_declared_last_and_is_pure_sql() -> None:
+    migration = db.MIGRATIONS[2]
+    assert migration.version == 3
+    assert migration.apply is None
+    # Une instruction par entrée (jamais de script) : `execute()` un par un.
+    assert all(";" not in statement for statement in migration.statements)
+
+
+@pytest.mark.anyio
+async def test_migration_3_replaces_quota_index_on_existing_db(temp_db, monkeypatch) -> None:
+    """Base en version 2 avec données : index couvrant créé, ancien supprimé, sauvegarde prise."""
+    await _init_at_version(monkeypatch, 2)
+    assert _user_version(temp_db) == 2
+    assert "idx_usage_user_time" in _usage_indexes(temp_db)
+    user = await db.create_user(username="quota")
+    await db.log_usage(user["id"], None, "m", 10, 5, 12, 200, "req-1")
+    await db.close_shared_db()
+
+    await db.init_db()
+
+    assert _user_version(temp_db) == 3
+    indexes = _usage_indexes(temp_db)
+    assert "idx_usage_user_time_tokens" in indexes
+    assert "idx_usage_user_time" not in indexes
+    backups = _backups(temp_db)
+    assert len(backups) == 1 and ".pre-migration.v2." in backups[0].name
+    assert await db.tokens_used_last_30_days(user["id"]) == 15
+    await db.close_shared_db()
+
+
+@pytest.mark.anyio
+async def test_migration_3_is_idempotent(temp_db, monkeypatch) -> None:
+    await _init_at_version(monkeypatch, 2)
+    await db.init_db()
+    await db.init_db()
+    assert _user_version(temp_db) == 3
+    assert len(_backups(temp_db)) == 1
+
+
+@pytest.mark.anyio
+async def test_fresh_and_migrated_databases_have_identical_schema(
+    tmp_path, monkeypatch,
+) -> None:
+    """Base neuve, base migrée depuis v2 et base legacy aboutissent au même schéma."""
+    fresh = tmp_path / "fresh.db"
+    from_v2 = tmp_path / "from_v2.db"
+    legacy = tmp_path / "legacy.db"
+
+    monkeypatch.setattr(settings, "db_path", fresh)
+    await db.init_db()
+
+    monkeypatch.setattr(settings, "db_path", from_v2)
+    await _init_at_version(monkeypatch, 2)
+    await db.init_db()
+
+    _make_legacy_db(legacy)
+    monkeypatch.setattr(settings, "db_path", legacy)
+    await db.init_db()
+
+    assert _schema_objects(fresh) == _schema_objects(from_v2)
+    # La base legacy garde le texte SQL de ses propres CREATE (espacement,
+    # colonne ajoutée par ALTER) : on compare ses objets, pas leur texte.
+    assert [o[:3] for o in _schema_objects(legacy)] == [o[:3] for o in _schema_objects(fresh)]
+
+
+@pytest.mark.anyio
+async def test_quota_query_is_answered_from_the_covering_index(temp_db) -> None:
+    """Le SUM du quota ne lit plus la table : plan « USING COVERING INDEX »."""
+    await db.init_db()
+    conn = sqlite3.connect(temp_db)
+    try:
+        plan = " ".join(
+            row[-1] for row in conn.execute(f"EXPLAIN QUERY PLAN {_QUOTA_SQL}", (1,))
+        )
+    finally:
+        conn.close()
+    assert "COVERING INDEX idx_usage_user_time_tokens" in plan, plan

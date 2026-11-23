@@ -16,6 +16,7 @@ import logging
 import os
 import secrets
 import stat
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -84,15 +85,14 @@ CREATE INDEX IF NOT EXISTS idx_keys_hash         ON api_keys(key_hash);
 CREATE INDEX IF NOT EXISTS idx_keys_user         ON api_keys(user_id);
 """
 
+# PRAGMA persistant (écrit dans le fichier) : posé une fois par la connexion de
+# migration. Les réglages par connexion vivent dans `_SESSION_PRAGMAS`.
 _PRAGMAS = """
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-PRAGMA cache_size   = -65536;
-PRAGMA foreign_keys = ON;
-PRAGMA temp_store   = MEMORY;
 """
 
-# PRAGMAs de robustesse appliqués à CHAQUE connexion (pas seulement à l'init) :
+# PRAGMAs appliqués à CHAQUE connexion (pas seulement à l'init) — ce sont des
+# réglages de session, que SQLite ne persiste pas dans le fichier :
 # - busy_timeout : attend au lieu d'échouer immédiatement en « database is locked ».
 # - wal_autocheckpoint / journal_size_limit : bornent la croissance du WAL.
 # - secure_delete : SQLite zérote le contenu des cellules supprimées ou réécrites
@@ -101,13 +101,21 @@ PRAGMA temp_store   = MEMORY;
 #   (`strings`), donc dans toute copie produite APRÈS l'anonymisation — ce qui
 #   vidait DEC-001 de son sens. Il couvre aussi la purge de rétention, qui
 #   supprime des lignes de `usage_log`.
-# Ce sont des réglages de session, légers, compatibles WAL (aucun changement de mode).
+# - synchronous / cache_size / temp_store : réglages de performance. Ils
+#   n'étaient posés que sur la connexion de migration ; toutes les connexions
+#   de trafic tournaient donc en synchronous=FULL (un fsync par COMMIT) avec un
+#   cache de 2 Mo. NORMAL est sûr en WAL : une coupure de courant peut perdre
+#   les dernières transactions validées, jamais corrompre la base.
+# Tous sont légers et compatibles WAL (aucun changement de mode).
 _SESSION_PRAGMAS = """
 PRAGMA foreign_keys        = ON;
 PRAGMA busy_timeout        = 5000;
 PRAGMA wal_autocheckpoint  = 1000;
 PRAGMA journal_size_limit  = 67108864;
 PRAGMA secure_delete       = ON;
+PRAGMA synchronous         = NORMAL;
+PRAGMA cache_size          = -65536;
+PRAGMA temp_store          = MEMORY;
 """
 
 
@@ -123,11 +131,270 @@ async def _apply_session_pragmas(db: aiosqlite.Connection) -> None:
 
 @asynccontextmanager
 async def get_db() -> AsyncGenerator[aiosqlite.Connection, None]:
-    """Context manager : connexion aiosqlite avec Row factory."""
+    """
+    Context manager : connexion DÉDIÉE aiosqlite avec Row factory.
+
+    Réservée au travail multi-instructions ou transactionnel (administration,
+    anonymisation, rapports, rétention, VACUUM). Le chemin chaud des requêtes
+    passe par les connexions partagées ci-dessous.
+    """
     async with aiosqlite.connect(settings.db_path) as db:
         db.row_factory = aiosqlite.Row
         await _apply_session_pragmas(db)
         yield db
+
+
+# ── Connexions partagées du chemin chaud ─────────────────────────────────────
+#
+# `lookup_key` et `tokens_used_last_30_days` (lectures), `touch_key_last_used`
+# et `log_usage` (écritures) ouvraient chacun une connexion neuve : un thread
+# aiosqlite et huit PRAGMAs par appel, trois à quatre fois par requête. Ils
+# passent désormais par des connexions longues, une par rôle. aiosqlite
+# exécute tout sur UN thread par connexion : deux rôles qui partageraient une
+# connexion se mettraient en file l'un derrière l'autre. D'où trois rôles :
+#   - « read »  : `lookup_key`, l'authentification de CHAQUE requête. Une
+#     lecture indexée de l'ordre de 0,1 ms ; en WAL, un lecteur n'attend
+#     jamais un écrivain ;
+#   - « quota » : `tokens_used_last_30_days`, une somme sur 30 jours (14 ms
+#     pour 800 000 lignes, même couverte par l'index). Sur la connexion
+#     « read », vingt authentifications concurrentes attendaient chacune la
+#     fin de ce parcours ;
+#   - « write » : écritures d'une instruction, toutes planifiées en
+#     fire-and-forget par le chemin de requête. Une écriture qui attend le
+#     verrou (busy_timeout, purge de rétention, CLI) ne retarde ainsi ni
+#     l'authentification ni le quota.
+#
+# Invariants :
+#   - autocommit (isolation_level=None) : des coroutines concurrentes
+#     entrelacent leurs instructions sur la même connexion, elles ne doivent
+#     jamais partager une transaction implicite ;
+#   - chaque lecture est exécutée ET consommée en un seul aller-retour
+#     (`execute_fetchall`) : aucune instruction ne reste active, donc aucune
+#     transaction de lecture ne reste ouverte, et une révocation écrite par la
+#     CLI (autre processus) est visible dès la requête suivante ;
+#   - tout travail multi-instructions (anonymisation, migrations, rapports,
+#     VACUUM) garde une connexion dédiée (`get_db()`) ;
+#   - la connexion est indexée par (chemin de base, boucle d'événements) : les
+#     tests changent `settings.db_path` et enchaînent des `asyncio.run`, et une
+#     connexion n'est jamais réutilisée depuis une autre boucle.
+#
+# Cycle de vie : ouverte par le lifespan (`open_shared_db`), fermée au
+# shutdown APRÈS le flush des tâches d'arrière-plan (`close_shared_db`) ; sans
+# lifespan (tests, CLI, scripts), ouverte paresseusement au premier appel.
+# Après `close_shared_db`, une tâche retardataire de la même boucle (ligne
+# d'usage qui a survécu au flush) passe par une connexion dédiée, ouverte et
+# fermée pour elle : rien n'est rouvert sans être refermé, et rien n'est perdu.
+
+_SHARED_ROLES = ("read", "quota", "write")
+# Attente maximale, à la fermeture, des opérations en cours sur une connexion
+# partagée — au-delà du busy_timeout (5 s), une écriture aurait déjà échoué.
+_SHARED_CLOSE_TIMEOUT_SECONDS = 6.0
+
+
+@dataclass
+class _SharedConnection:
+    path: str
+    loop: asyncio.AbstractEventLoop
+    opening: asyncio.Task
+    # Opérations en cours (connexion obtenue, instruction pas encore rendue).
+    users: int = 0
+    # Posé par `close_shared_db` : signalé quand `users` retombe à zéro.
+    idle: asyncio.Event | None = None
+
+
+_shared: dict[str, _SharedConnection] = {}
+# Boucle dont les connexions partagées ont été fermées par `close_shared_db`.
+_closed_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _daemonize(conn: aiosqlite.Connection) -> None:
+    """
+    Marque le thread de la connexion comme démon, AVANT son démarrage.
+
+    Filet de sécurité pour les appelants sans lifespan (CLI, tests, scripts
+    `asyncio.run`) qui ne ferment jamais la connexion partagée : un thread
+    non-démon bloquerait la sortie de l'interpréteur, qui attend ces threads
+    AVANT d'exécuter les handlers atexit. Sortir connexion ouverte est sûr :
+    chaque écriture est déjà validée (autocommit) et SQLite rejoue le WAL à la
+    prochaine ouverture.
+
+    Depuis aiosqlite 0.22 (plancher de requirements.txt), le thread vit dans
+    `Connection._thread` ; jusqu'à 0.21, la connexion ÉTAIT le thread et
+    `Connection.stop()` n'existait pas. `test_shared_connection_thread_is_daemon`
+    détecte une évolution de cette API interne.
+    """
+    thread = getattr(conn, "_thread", conn)
+    if isinstance(thread, threading.Thread) and not thread.is_alive():
+        thread.daemon = True
+
+
+def _stop_in_background(conn: aiosqlite.Connection) -> None:
+    """
+    Arrête une connexion sans l'attendre, depuis un thread auxiliaire SANS
+    boucle : aiosqlite n'attache alors aucune future de résultat à l'arrêt.
+    Appelé depuis la boucle courante, `stop()` en attachait une ; si la boucle
+    se fermait avant que le thread SQLite ne traite l'arrêt (fin d'un
+    `asyncio.run`), ce thread mourait sur « Event loop is closed ».
+
+    Ne lève jamais : appelé sur des chemins d'erreur dont l'exception
+    d'origine doit rester celle qui remonte.
+    """
+    try:
+        threading.Thread(
+            target=conn.stop, name="sqlite-shared-stop", daemon=True
+        ).start()
+    except Exception as exc:
+        logger.debug("Arrêt d'une connexion SQLite partagée impossible : %s", exc)
+
+
+async def _open_shared(path: str) -> aiosqlite.Connection:
+    conn = aiosqlite.connect(path, isolation_level=None)
+    _daemonize(conn)
+    await conn
+    try:
+        conn.row_factory = aiosqlite.Row
+        await _apply_session_pragmas(conn)
+    except BaseException:
+        # L'erreur SQLite d'origine remonte, quoi que fasse l'arrêt.
+        _stop_in_background(conn)
+        raise
+    return conn
+
+
+def _discard_shared(entry: _SharedConnection) -> None:
+    """
+    Abandonne une connexion partagée devenue obsolète (autre chemin, autre
+    boucle), sans l'attendre : sa boucle d'origine peut être fermée.
+    `stop()` met en file la fermeture derrière les opérations déjà soumises,
+    puis le thread se termine.
+    """
+    task = entry.opening
+    try:
+        if not task.done():
+            task.cancel()
+        elif not task.cancelled() and task.exception() is None:
+            _stop_in_background(task.result())
+    except Exception as exc:  # boucle d'origine fermée : rien d'autre à faire
+        logger.debug("Connexion SQLite partagée abandonnée : %s", exc)
+
+
+def _shared_entry(role: str) -> _SharedConnection:
+    """Entrée du rôle pour (chemin, boucle) courants, créée au besoin."""
+    loop = asyncio.get_running_loop()
+    path = str(settings.db_path)
+    entry = _shared.get(role)
+    if entry is None or entry.path != path or entry.loop is not loop:
+        if entry is not None:
+            _discard_shared(entry)
+        entry = _SharedConnection(
+            path=path,
+            loop=loop,
+            opening=loop.create_task(_open_shared(path), name=f"sqlite-{role}"),
+        )
+        _shared[role] = entry
+    return entry
+
+
+async def _await_shared(role: str, entry: _SharedConnection) -> aiosqlite.Connection:
+    task = entry.opening
+    if task.done() and not task.cancelled() and task.exception() is None:
+        return task.result()
+    try:
+        # shield : l'annulation d'UN appelant n'annule pas l'ouverture que
+        # d'autres requêtes attendent peut-être.
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if task.cancelled() and _shared.get(role) is entry:
+            del _shared[role]
+        raise
+    except Exception:
+        # Ouverture en échec : on n'épingle pas l'erreur, le prochain appel
+        # retente (base momentanément illisible, répertoire recréé…).
+        if _shared.get(role) is entry:
+            del _shared[role]
+        raise
+
+
+async def _shared_db(role: str) -> aiosqlite.Connection:
+    """Connexion partagée du rôle `role`, ouverte au besoin (voir ci-dessus)."""
+    return await _await_shared(role, _shared_entry(role))
+
+
+@asynccontextmanager
+async def _hot_db(role: str) -> AsyncGenerator[aiosqlite.Connection, None]:
+    """
+    Connexion du chemin chaud pour UNE instruction.
+
+    Compte l'opération en cours, pour que `close_shared_db` l'attende au lieu
+    de fermer la connexion sous elle (« Connection closed »). Après la
+    fermeture, une tâche retardataire de la même boucle reçoit une connexion
+    dédiée en autocommit, fermée en sortie.
+    """
+    if _closed_loop is asyncio.get_running_loop():
+        async with aiosqlite.connect(settings.db_path, isolation_level=None) as conn:
+            conn.row_factory = aiosqlite.Row
+            await _apply_session_pragmas(conn)
+            yield conn
+        return
+    entry = _shared_entry(role)
+    entry.users += 1
+    try:
+        yield await _await_shared(role, entry)
+    finally:
+        entry.users -= 1
+        if entry.users == 0 and entry.idle is not None:
+            entry.idle.set()
+
+
+async def open_shared_db() -> None:
+    """Ouvre les connexions partagées (lifespan, après `init_db`)."""
+    global _closed_loop
+    _closed_loop = None
+    for role in _SHARED_ROLES:
+        await _shared_db(role)
+
+
+async def close_shared_db(timeout: float = _SHARED_CLOSE_TIMEOUT_SECONDS) -> None:
+    """
+    Ferme les connexions partagées. Appelé par le lifespan APRÈS
+    `drain_pending` : les dernières lignes d'usage passent par la connexion
+    d'écriture. Idempotent.
+
+    Ordre déterministe : les nouveaux appels de cette boucle basculent d'abord
+    sur des connexions dédiées, puis chaque connexion partagée n'est fermée
+    qu'une fois ses opérations en cours terminées (borné par `timeout` ; au-delà,
+    un avertissement chiffre les opérations qui vont échouer — elles sont
+    alors journalisées par `background.fire_and_forget`).
+    """
+    global _closed_loop
+    loop = asyncio.get_running_loop()
+    _closed_loop = loop
+    entries = list(_shared.items())
+    _shared.clear()
+    for role, entry in entries:
+        task = entry.opening
+        if entry.loop is not loop:
+            _discard_shared(entry)
+            continue
+        if entry.users:
+            entry.idle = asyncio.Event()
+            try:
+                await asyncio.wait_for(entry.idle.wait(), timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Fermeture de la connexion SQLite partagée '%s' : %d "
+                    "opération(s) encore en cours après %.0f s, interrompues.",
+                    role, entry.users, timeout,
+                )
+        if not task.done():
+            _discard_shared(entry)
+            continue
+        if task.cancelled() or task.exception() is not None:
+            continue  # ouverture annulée ou en échec : rien à fermer
+        try:
+            await task.result().close()
+        except Exception as exc:
+            logger.warning("Fermeture d'une connexion SQLite partagée : %s", exc)
 
 
 # ── Migrations versionnées (OPS-006) ──────────────────────────────────────────
@@ -280,6 +547,21 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=2,
         description="Colonne users.anonymized_at (politique d'anonymisation DEC-001)",
         apply=_ensure_anonymized_at,
+    ),
+    Migration(
+        version=3,
+        description="Index couvrant usage_log(user_id, timestamp, total_tokens) pour le quota",
+        # Le contrôle de quota (`tokens_used_last_30_days`, à CHAQUE requête
+        # d'un compte limité) somme 30 jours de `total_tokens` : avec l'ancien
+        # index (user_id, timestamp), chaque ligne de la fenêtre coûtait un
+        # accès à la table. L'index couvrant répond depuis l'index seul.
+        # `idx_usage_user_time` en est un préfixe strict, donc redondant :
+        # le garder doublerait le coût d'écriture de chaque `log_usage`.
+        statements=(
+            "CREATE INDEX IF NOT EXISTS idx_usage_user_time_tokens "
+            "ON usage_log(user_id, timestamp, total_tokens)",
+            "DROP INDEX IF EXISTS idx_usage_user_time",
+        ),
     ),
 )
 
@@ -644,8 +926,8 @@ async def lookup_key(raw_key: str) -> dict | None:
     Retourne None si invalide, révoquée ou expirée.
     """
     key_hash = hash_key(raw_key)
-    async with get_db() as db:
-        row = await (await db.execute(
+    async with _hot_db("read") as db:
+        rows = await db.execute_fetchall(
             """
             SELECT
                 u.id             AS user_id,
@@ -666,12 +948,11 @@ async def lookup_key(raw_key: str) -> dict | None:
               AND u.is_active = 1
             """,
             (key_hash,),
-        )).fetchone()
-
-    if not row:
+        )
+    if not rows:
         return None
 
-    row = dict(row)
+    row = dict(rows[0])
     if row["expires_at"]:
         # Parsing réel plutôt que comparaison lexicale : les formats ISO 8601
         # ("2026-01-01", "2026-01-01 12:00:00", avec/sans timezone) ne se
@@ -826,12 +1107,15 @@ async def anonymize_user(user_id: int) -> dict | None:
 
 
 async def touch_key_last_used(key_id: int) -> None:
-    async with get_db() as db:
+    """
+    Horodate la dernière utilisation d'une clé (connexion partagée, autocommit).
+    Appelée au plus une fois par clé et par minute : voir `auth.py`.
+    """
+    async with _hot_db("write") as db:
         await db.execute(
             "UPDATE api_keys SET last_used = datetime('now') WHERE id = ?",
             (key_id,),
         )
-        await db.commit()
 
 
 # ── Helpers usage ─────────────────────────────────────────────────────────────
@@ -840,10 +1124,12 @@ async def tokens_used_last_30_days(user_id: int) -> int:
     """
     Total de tokens consommés sur les 30 derniers jours (fenêtre glissante).
     Utilisé pour appliquer monthly_token_limit — même fenêtre que le dashboard
-    (tokens_30d dans get_user_period_stats). Requête couverte par idx_usage_user_time.
+    (tokens_30d dans get_user_period_stats). Requête couverte par l'index
+    `idx_usage_user_time_tokens` (migration 3) : la somme est lue dans l'index,
+    sans accès à la table.
     """
-    async with get_db() as db:
-        row = await (await db.execute(
+    async with _hot_db("quota") as db:
+        rows = await db.execute_fetchall(
             """
             SELECT COALESCE(SUM(total_tokens), 0) AS total
             FROM usage_log
@@ -851,8 +1137,8 @@ async def tokens_used_last_30_days(user_id: int) -> int:
               AND timestamp >= datetime('now', '-30 days')
             """,
             (user_id,),
-        )).fetchone()
-        return int(row["total"] or 0)
+        )
+    return int(rows[0]["total"] or 0)
 
 
 async def log_usage(
@@ -865,7 +1151,8 @@ async def log_usage(
     status_code: int,
     request_id: str,
 ) -> None:
-    async with get_db() as db:
+    """Une ligne d'usage, sur la connexion partagée d'écriture (autocommit)."""
+    async with _hot_db("write") as db:
         await db.execute(
             """
             INSERT INTO usage_log
@@ -880,7 +1167,6 @@ async def log_usage(
                 duration_ms, status_code, request_id,
             ),
         )
-        await db.commit()
 
 
 async def _delete_usage_rows(db: aiosqlite.Connection, days: int) -> int:
@@ -1087,6 +1373,11 @@ async def get_overview_stats() -> dict:
                     THEN user_id END)
                     AS active_users_7d
             FROM usage_log
+            -- Fenêtre la plus large utilisée ci-dessus (7 jours) : aujourd'hui,
+            -- hier et les 24 h y sont inclus. Prédicat sargable sur
+            -- idx_usage_timestamp — sans lui, chaque rafraîchissement du
+            -- dashboard (30 s par onglet) parcourait toute la table.
+            WHERE timestamp >= datetime('now', '-7 days')
             """
         )).fetchone()
 

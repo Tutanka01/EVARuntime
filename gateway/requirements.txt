@@ -9,7 +9,7 @@ uvicorn[standard]>=0.32.0       # inclut uvloop + httptools (nécessaires en pro
 httpx>=0.27.0
 
 # ── Base de données ───────────────────────────────────────────────────────────
-aiosqlite>=0.20.0
+aiosqlite>=0.22.0       # Connection.stop() et Connection._thread (database._daemonize)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 pydantic-settings>=2.0.0        # chargement .env / variables d'environnement
