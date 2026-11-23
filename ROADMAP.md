@@ -75,7 +75,7 @@ et la qualité des releases.
 
 | Composant | Résultat |
 |---|---:|
-| Tests gateway | 3030 réussis, 3 ignorés pour dépendances d’environnement (Python 3.14 local, et Python 3.11 avec les dépendances verrouillées de la CI) |
+| Tests gateway | 3039 réussis, 3 ignorés pour dépendances d’environnement (Python 3.14 local, et Python 3.11 avec les dépendances verrouillées de la CI) |
 | Tests node agent | 127 réussis |
 | Ruff gateway et node agent | OK |
 | GPU physique / nginx réel / runtime amont épinglé | Non démontré dans cet audit |
@@ -256,6 +256,13 @@ Corrigé :
   avant le renommage d'un GGUF téléchargé et un seul hachage par exécution ;
   purge des sauvegardes du registre ordonnée par date ; validation de chemin
   qui échoue fermée quand la résolution lève.
+- **Admission VRAM mesurée.** Défaut trouvé en production le jour du
+  déploiement, introduit avec l'admission par UUID : la VRAM libre mesurée
+  n'était rafraîchie que toutes les 60 s. Après l'éviction d'un modèle, la
+  mesure annonçait encore un GPU plein, la gateway évinçait d'autres modèles
+  sans nécessité puis faisait attendre la requête tout le timeout de la queue
+  (120 s) avant un `503`. La gateway re-sonde désormais dès que seule la
+  mesure bloque, et à intervalle court tant que le GPU reste occupé.
 - **Déploiement et GPU.** `smoke_test.sh` et `llm-gateway-backup.sh` n'existent
   plus que dans `deploy/` ; `doctor`, l'inventaire bootstrap et l'attestation
   de calibration utilisent le résolveur `CUDA_VISIBLE_DEVICES` de la sonde

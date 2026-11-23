@@ -1452,6 +1452,15 @@ minimum entre le budget configuré restant et la mémoire physique libre. Si la
 sonde est indisponible, le comportement historique fondé sur la configuration
 reste actif afin de ne pas rendre un environnement CPU-only inutilisable.
 
+La mesure périodique compte encore la mémoire d'un modèle évincé ou déchargé
+depuis la dernière sonde. Elle ne décide donc jamais seule : quand le budget
+configuré admettrait le modèle mais pas la mesure en mémoire, EVA re-sonde
+`nvidia-smi` avant d'évincer ou de mettre la requête en attente. Si le GPU est
+réellement occupé (processus tiers, pilote qui tarde à rendre la mémoire d'un
+processus tué), la requête en tête de queue re-sonde chaque seconde jusqu'à
+l'admission ou au timeout de la queue. Aucune sonde n'est lancée sur le chemin
+nominal, où mesure et budget s'accordent.
+
 Le bloc admin `vram_budget.gpu_measurement` publie l'inventaire par UUID et un
 état `measured` ou `unavailable` avec une raison stable. Une sonde absente,
 échouée, expirée ou partielle n'est jamais convertie en zéro et remplace tout

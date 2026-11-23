@@ -102,6 +102,13 @@ async def _probe_gpu_measurement() -> GpuVramMeasurement:
     return measurement
 
 
+# Intervalle de re-sonde nvidia-smi tant que la VRAM MESURÉE est le seul
+# obstacle à une admission (voir `_ensure_capacity`). Le pilote peut mettre un
+# instant à rendre la mémoire d'un processus tué : on re-mesure au lieu
+# d'attendre le timeout de la queue.
+GPU_REPROBE_INTERVAL_SECONDS = 1.0
+
+
 def _port_is_occupied(port: int, host: str = "127.0.0.1", connect_timeout: float = 0.2) -> bool:
     """
     Détection best-effort d'un port TCP déjà occupé (stdlib, pas de psutil).
@@ -428,6 +435,7 @@ class LocalModelManager:
         queue_started_at: float | None = None
         queue_outcome = "success"
         extra_eviction_done = not force_extra_eviction
+        logged_reasons: list[str] | None = None
         deadline = time.monotonic() + settings.capacity_queue_timeout_seconds
         try:
             while True:
@@ -447,12 +455,16 @@ class LocalModelManager:
                         elif not self._has_temporary_capacity_blocker(model):
                             extra_eviction_done = True
 
-                    while not self._has_capacity_for(model):
+                    while not await self._has_fresh_capacity_for(model):
                         reasons = self._capacity_reasons(model)
-                        log.warning(
-                            "Capacité insuffisante pour '%s' — %s — tentative d'éviction LRU…",
-                            model.id, " | ".join(reasons),
-                        )
+                        # Une seule ligne par motif : la re-sonde périodique
+                        # repasse ici chaque seconde tant que le GPU est occupé.
+                        if reasons != logged_reasons:
+                            logged_reasons = reasons
+                            log.warning(
+                                "Capacité insuffisante pour '%s' — %s — tentative d'éviction LRU…",
+                                model.id, " | ".join(reasons),
+                            )
                         evicted = await self._evict_lru_idle(exclude=model.id)
                         if not evicted:
                             break
@@ -497,9 +509,17 @@ class LocalModelManager:
                         f"Réessayez dans quelques secondes."
                     )
 
+                # Tête de queue bloquée par la seule mesure GPU : rien ne la
+                # réveillera quand le pilote aura rendu la mémoire, donc on
+                # re-sonde à intervalle court au lieu d'attendre le timeout.
+                wait_seconds = remaining
+                if is_turn and self._measured_cap_blocks(model):
+                    wait_seconds = min(remaining, GPU_REPROBE_INTERVAL_SECONDS)
                 try:
-                    await asyncio.wait_for(self._capacity_cond.wait(), timeout=remaining)
+                    await asyncio.wait_for(self._capacity_cond.wait(), timeout=wait_seconds)
                 except asyncio.TimeoutError as exc:
+                    if wait_seconds < remaining:
+                        continue
                     queue_outcome = "timeout"
                     raise CapacityQueueTimeout(
                         f"Impossible de charger '{model.id}' : capacité VRAM indisponible "
@@ -530,6 +550,39 @@ class LocalModelManager:
 
     def _has_capacity_for(self, model: ModelDefinition) -> bool:
         return self._available_vram_gb() >= model.vram_gb and bool(self._port_pool)
+
+    def _measured_cap_blocks(self, model: ModelDefinition) -> bool:
+        """
+        Vrai si la VRAM mesurée est le SEUL obstacle : le budget déclaré et le
+        pool de ports admettraient le modèle, mais pas la dernière mesure GPU.
+
+        Cette mesure date de la dernière sonde périodique (60 s par défaut) :
+        elle compte encore la mémoire d'un modèle évincé ou déchargé depuis.
+        Agir dessus sans la rafraîchir faisait évincer des modèles en trop puis
+        attendre tout le timeout de la queue devant un GPU pourtant libre.
+        """
+        if not self._port_pool:
+            return False
+        measurement = self._last_gpu_measurement
+        if measurement.visible_used_mb is None or measurement.visible_total_mb is None:
+            return False
+        configured = settings.effective_vram_budget_gb() - self._used_vram_gb()
+        return configured >= model.vram_gb > self._available_vram_gb()
+
+    async def _has_fresh_capacity_for(self, model: ModelDefinition) -> bool:
+        """
+        `_has_capacity_for`, en re-sondant le GPU quand seule la mesure bloque.
+
+        Aucune sonde sur le chemin nominal : elle n'a lieu que si la mesure en
+        mémoire contredit le budget déclaré. Doit être appelé sous
+        `_capacity_cond`, comme l'éviction qu'il précède.
+        """
+        if self._has_capacity_for(model):
+            return True
+        if not self._measured_cap_blocks(model):
+            return False
+        await self._refresh_gpu_measurement()
+        return self._has_capacity_for(model)
 
     def _capacity_reasons(self, model: ModelDefinition) -> list[str]:
         reasons: list[str] = []
@@ -935,6 +988,12 @@ class LocalModelManager:
         except asyncio.CancelledError:
             raise
 
+    async def _refresh_gpu_measurement(self) -> GpuVramMeasurement:
+        """Sonde le GPU et remplace la mesure dont dépend l'admission."""
+        measurement = await _probe_gpu_measurement()
+        self._last_gpu_measurement = measurement
+        return measurement
+
     async def _reconcile_vram_once(self) -> None:
         """
         Compare la VRAM réelle visible (nvidia-smi, par UUID) à la somme des
@@ -942,8 +1001,7 @@ class LocalModelManager:
         significative. Une sonde indisponible reste visible dans le statut et
         n'est jamais transformée en zéro ou en ancienne mesure.
         """
-        measurement = await _probe_gpu_measurement()
-        self._last_gpu_measurement = measurement
+        measurement = await self._refresh_gpu_measurement()
         used_mb = measurement.visible_used_mb
         if measurement.status != "measured" or used_mb is None:
             self._last_gpu_used_mb = None

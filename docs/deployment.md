@@ -2301,6 +2301,8 @@ du tableau.
 | Changement | À vérifier sur votre installation |
 |---|---|
 | Migration 3 du schéma SQLite : l'index du quota devient couvrant | Appliquée au premier démarrage, avec une sauvegarde `*.pre-migration.v2.*.bak`. La construction de l'index allonge ce démarrage sur une grosse table `usage_log`. Un retour à l'ancienne version exige de restaurer la base (voir [Rollback automatique](#rollback-automatique)). |
+| Le registre est validé strictement : capability inconnue refusée, `vision` exige `mmproj_path` et `mmproj_sha256` | Une seule entrée invalide de `models.yaml`, même désactivée, bloque `doctor` avant la bascule (le service en place n'est pas arrêté). Corriger une capability mal orthographiée (`embedding` au lieu de `embeddings`), retirer `vision` d'un modèle sans projecteur, ou déclarer le projecteur et le résultat de `sha256sum` sur son fichier. Le nouveau `doctor` se relance sans refaire la mise à jour : `<venv-release-…>/bin/python <checkout>/gateway/cli.py doctor --env-file /etc/llm-gateway/env`. |
+| L'admission est plafonnée par la VRAM libre mesurée par `nvidia-smi` | Un processus tiers sur le GPU, ou un `vram_gb` sous-estimé, provoque désormais des évictions ou une attente en queue. Le journal l'indique (« Capacité insuffisante … VRAM insuffisante »). `VRAM_RECONCILE_INTERVAL_SECONDS=0` revient au seul budget configuré. |
 | Les connexions SQLite du trafic passent en `synchronous=NORMAL` | Une coupure de courant peut perdre les dernières lignes d'usage validées, sans corruption de la base. |
 | Un événement SSE est relayé en un seul bloc terminé par une ligne vide | Un client qui comptait les lignes vides, ou qui attendait trois sauts de ligne entre deux événements, doit s'appuyer sur le format SSE standard. |
 | Une requête non streamée dont le client se déconnecte est annulée | La génération s'arrête, le journal d'accès et `usage_log` portent le statut `499`. Un script qui coupait la connexion en comptant sur la fin de la génération n'obtient plus de ligne d'usage facturée. |
@@ -3441,7 +3443,7 @@ le runtime de la gateway locale.
 | `SHUTDOWN_DRAIN_TIMEOUT_SECONDS` | `25.0` | Attente max des requêtes actives (modèles pinnés) au SIGTERM avant déchargement forcé (`0` = pas d'attente). |
 | `SHUTDOWN_DRAIN_POLL_SECONDS` | `0.2` | Intervalle de poll pendant le drain. |
 | `SHUTDOWN_BACKGROUND_FLUSH_SECONDS` | `5.0` | Deadline (s) du flush des usages fire-and-forget au SIGTERM, après le déchargement des modèles et avant la fermeture du client HTTP (`0` = pas d'attente). |
-| `VRAM_RECONCILE_INTERVAL_SECONDS` | `60.0` | Intervalle entre deux sondes `nvidia-smi` de réconciliation VRAM (`0` = désactivé). |
+| `VRAM_RECONCILE_INTERVAL_SECONDS` | `60.0` | Intervalle entre deux sondes `nvidia-smi` de réconciliation VRAM (`0` = désactivé : l'admission ne s'appuie alors que sur le budget configuré). |
 | `VRAM_RECONCILE_PROBE_TIMEOUT_SECONDS` | `5.0` | Timeout de la sonde `nvidia-smi`. |
 | `VRAM_RECONCILE_DRIFT_THRESHOLD` | `0.15` | Seuil de dérive relative déclenchant un warning (0.15 = +15 %). |
 | `KILL_ORPHAN_LLAMA_ON_STARTUP` | `false` | Tenter de tuer les `llama-server` orphelins occupant un port du pool au démarrage (best-effort, nécessite `psutil`). Par défaut : LOG seulement. |
