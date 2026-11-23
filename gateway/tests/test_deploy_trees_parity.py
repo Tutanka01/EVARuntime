@@ -1,6 +1,6 @@
 """Garde de parité entre `gateway/deploy/` (Linux) et `gateway/deploy-macos/` (macOS).
 
-Pourquoi ce test existe (issue #29) : les deux arbres dupliquent huit scripts
+Pourquoi ce test existe (issue #29) : les deux arbres dupliquaient huit scripts
 d'installation/exploitation dont une partie du contenu est commune. Rien ne
 garantissait que les parties communes restent alignées, et la dérive a déjà eu
 lieu (dc7f257 corrigeait uniquement la copie macOS d'un script ; le smoke test
@@ -10,24 +10,31 @@ exécuté par `deploy-macos/update.sh` était la copie **Linux**).
 Linux fait foi ; la copie macOS doit être répliquée à l'identique, modulo les
 substitutions de chemins normalisées ci-dessous.
 
-Le mécanisme : un manifeste déclare, pour chaque fichier commun, l'une des
-trois politiques :
+**Source unique** (`SOURCES_UNIQUES`) : un script qui ne différait d'une
+plateforme à l'autre que par ses chemins par défaut n'est plus copié. Il vit
+dans `deploy/` seul, choisit ses défauts à l'exécution (`uname -s`), et les deux
+installeurs le livrent depuis `deploy/`. Le garde interdit qu'une copie
+réapparaisse dans `deploy-macos/` et vérifie que les deux arbres l'exécutent et
+le livrent (avec les libs qu'il source) depuis `deploy/`.
 
-- **miroir** (`MIROIRS`) : les deux copies doivent être identiques après
-  normalisation des chemins plateformes. Toute autre divergence échoue ;
+Pour les fichiers qui restent présents dans les deux arbres, un manifeste
+déclare l'une des deux politiques :
+
 - **fonctions partagées** (`FONCTIONS_PARTAGEES`) : le fichier diverge par
   nature (système de service, outils GNU/BSD), mais les fonctions listées
   doivent rester identiques après normalisation ;
 - **divergence déclarée** (`DIVERGENCES_PAR_NATURE`) : divergence par nature,
   avec une justification écrite. Aucun fichier commun ne peut être ajouté aux
   deux arbres sans être déclaré ici : le manifeste doit couvrir exactement
-  l'intersection des deux arborescences.
+  l'intersection des deux arborescences. Un fichier qui deviendrait identique
+  au chemin près doit passer en source unique plutôt que d'être recopié.
 
 En cas d'échec, deux issues possibles : porter le changement sur l'autre copie
 (règle par défaut), ou — si la divergence est devenue légitime — la déclarer
-dans le manifeste avec sa justification. Ce test porte un contrôle positif
-(test_le_garde_detecte_une_mutation_sur_une_copie) : il prouve que le
-comparateur voit réellement les divergences, et qu'il ne rend pas un verdict
+dans le manifeste avec sa justification. Ce test porte des contrôles positifs
+(test_le_garde_detecte_une_mutation_sur_une_copie,
+test_le_garde_detecte_une_copie_reintroduite) : ils prouvent que le garde voit
+réellement les divergences et les copies, et qu'il ne rend pas un verdict
 d'absence par inertie.
 
 Les paires sémantiques de noms différents — `nginx.conf` (Linux) vs
@@ -107,38 +114,16 @@ NORMALISATIONS: tuple[Normalisation, ...] = (
         pattern_macos=r"deploy-macos",
         justification="nom de l'arbre source : chaque copie désigne son propre arbre",
     ),
-    Normalisation(
-        canonique="<PKG_SQLITE>",
-        pattern_linux=r"apt install sqlite3",
-        pattern_macos=r"brew install sqlite",
-        justification="hint d'installation du paquet sqlite3 (apt vs brew)",
-    ),
 )
-
-# Règles supplémentaires propres à un fichier : le layout macOS place la base
-# sous `<racine>/data/`, là où Linux la met directement sous /var/lib/llm-gateway.
-NORMALISATIONS_PAR_FICHIER: dict[str, tuple[Normalisation, ...]] = {
-    "llm-gateway-backup.sh": (
-        Normalisation(
-            canonique="<STATE_DIR>/",
-            pattern_linux=None,
-            pattern_macos=r"<STATE_DIR>/data/",
-            justification="sous-répertoire data/ du layout macOS (table Architecture)",
-        ),
-    ),
-}
-
-# Doc d'en-tête plateforme (lancement launchd vs systemd) admise comme prologue
-# hors de la comparaison : la comparaison du code commence au marqueur.
-PROLOGUES: dict[str, str] = {
-    "llm-gateway-backup.sh": "set -euo pipefail",
-}
 
 
 # ── Manifeste de parité ───────────────────────────────────────────────────────
 
-#: Fichiers qui doivent être identiques après normalisation.
-MIROIRS: frozenset[str] = frozenset(
+#: Scripts à source unique : présents dans deploy/ SEULEMENT, défauts de
+#: plateforme choisis à l'exécution (`uname -s`), livrés par les deux
+#: installeurs depuis deploy/. Anciennement « miroirs » (copies identiques au
+#: chemin près) : la copie n'apportait qu'une possibilité de dérive.
+SOURCES_UNIQUES: frozenset[str] = frozenset(
     {
         "smoke_test.sh",
         "llm-gateway-backup.sh",
@@ -160,16 +145,18 @@ FONCTIONS_PARTAGEES: dict[str, tuple[str, ...]] = {
     "gpu-preflight-lib.sh": ("deploy_gpu_waiver_declared",),
 }
 
-#: Justifications des divergences par nature. Tout fichier commun non miroir
-#: doit y figurer, avec une justification substantive.
+#: Justifications des divergences par nature. Tout fichier commun doit y
+#: figurer, avec une justification substantive.
 DIVERGENCES_PAR_NATURE: dict[str, str] = {
     "code-layout-lib.sh": (
         "Les listes _DEPLOY_OPERATIONAL_FILES diffèrent par nature : l'installation "
-        "Linux copie aussi les libs (sourcees depuis /opt), tandis que macOS ne "
-        "copie que les scripts exécutables (les libs restent sourcées depuis le "
-        "repo). Les fonctions exclusives (snapshot/restore Linux vs permissions/"
-        "static macOS) reflètent le modèle systemd vs utilisateur courant. Les "
-        "trois fonctions communes de copie restent gardées par FONCTIONS_PARTAGEES."
+        "Linux livre aussi nginx-lib.sh et l'exemple de variantes runtime, tandis "
+        "que macOS ne livre que les scripts à source unique et la lib qu'ils "
+        "sourcent (les libs macOS restent sourcées depuis le repo). Les deux listes "
+        "couvrent SOURCES_UNIQUES et leurs libs : invariant testé. Les fonctions "
+        "exclusives (snapshot/restore Linux vs permissions/static macOS) reflètent "
+        "le modèle systemd vs utilisateur courant. Les trois fonctions communes "
+        "de copie restent gardées par FONCTIONS_PARTAGEES."
     ),
     "deploy-mode-lib.sh": (
         "Divergence par nature : deploy_validate_mode refuse le cluster sur macOS, "
@@ -202,15 +189,15 @@ DIVERGENCES_PAR_NATURE: dict[str, str] = {
         "La copie Linux est transactionnelle (snapshot de code, venv staged avec "
         "pip check, attente /ready, rollback, gate smoke test 0/4/5/6, doctor) ; "
         "la copie macOS est un pipeline simple (backup venv/env, sync, pip in-place, "
-        "bootout/bootstrap). Les invariants transverses (smoke test de son propre "
-        "arbre, signal SEC-002) sont testés ; toute correction apportée à l'une "
+        "bootout/bootstrap). Les invariants transverses (smoke test à source unique "
+        "deploy/, signal SEC-002) sont testés ; toute correction apportée à l'une "
         "doit être évaluée pour l'autre."
     ),
 }
 
 #: Paires de fichiers appariés par RÔLE et non par nom : clé = nom canonique
 #: (côté Linux), tuple = (nom Linux, nom macOS). Ces noms ne figurent PAS dans
-#: `fichiers_communs()` (intersection par nom) : le mécanisme miroir ne les voit
+#: `fichiers_communs()` (intersection par nom) : le mécanisme par nom ne les voit
 #: donc jamais, et c'est précisément ce trou qui a laissé `nginx.conf.macOS`
 #: dériver en silence (access_log commenté + coquille « eva_rigged » → usernames
 #: en clair dans le journal ; /admin/ au timeout par défaut 60 s → 504 à chaque
@@ -226,48 +213,13 @@ PAIRES_SEMANTIQUES: dict[str, tuple[str, str]] = {
 
 
 def normalise(nom_fichier: str, texte: str) -> str:
-    """Applique les règles communes puis les règles propres au fichier."""
-    regles = NORMALISATIONS + NORMALISATIONS_PAR_FICHIER.get(nom_fichier, ())
-    for regle in regles:
+    """Applique les règles de chemins plateformes (communes à tous les fichiers)."""
+    for regle in NORMALISATIONS:
         if regle.pattern_linux:
             texte = re.sub(regle.pattern_linux, regle.canonique, texte)
         if regle.pattern_macos:
             texte = re.sub(regle.pattern_macos, regle.canonique, texte)
     return texte
-
-
-def corps_comparable(nom_fichier: str, texte: str) -> str:
-    """Retire le prologue documentaire plateforme, s'il en est déclaré un."""
-    marqueur = PROLOGUES.get(nom_fichier)
-    if marqueur is None:
-        return texte
-    try:
-        return texte[texte.index(marqueur):]
-    except ValueError:
-        raise AssertionError(
-            f"{nom_fichier}: marqueur de prologue '{marqueur}' introuvable — le "
-            f"fichier a été reformaté, mets à jour PROLOGUES dans ce test."
-        ) from None
-
-
-def diff_miroir(
-    nom_fichier: str, racine_linux: Path = ARBRE_LINUX, racine_macos: Path = ARBRE_MACOS
-) -> str:
-    """Diff unifié des deux copies après normalisation. Chaîne vide = parité."""
-    linux = corps_comparable(
-        nom_fichier, normalise(nom_fichier, (racine_linux / nom_fichier).read_text(encoding="utf-8"))
-    )
-    macos = corps_comparable(
-        nom_fichier, normalise(nom_fichier, (racine_macos / nom_fichier).read_text(encoding="utf-8"))
-    )
-    return "".join(
-        difflib.unified_diff(
-            linux.splitlines(keepends=True),
-            macos.splitlines(keepends=True),
-            fromfile=f"deploy/{nom_fichier} (référence, normalisée)",
-            tofile=f"deploy-macos/{nom_fichier} (normalisée)",
-        )
-    )
 
 
 def extraire_fonction(texte: str, nom: str) -> str:
@@ -324,7 +276,20 @@ def fichiers_communs() -> set[str]:
 
 
 def manifeste_complet() -> set[str]:
-    return set(MIROIRS) | set(FONCTIONS_PARTAGEES) | set(DIVERGENCES_PAR_NATURE)
+    return set(FONCTIONS_PARTAGEES) | set(DIVERGENCES_PAR_NATURE)
+
+
+def copies_reintroduites(racine_macos: Path = ARBRE_MACOS) -> list[str]:
+    """Scripts à source unique dont une copie est réapparue dans deploy-macos/."""
+    return sorted(nom for nom in SOURCES_UNIQUES if (racine_macos / nom).exists())
+
+
+def fichiers_operationnels(arbre: Path) -> list[str]:
+    """Contenu de `_DEPLOY_OPERATIONAL_FILES` dans le code-layout-lib.sh d'un arbre."""
+    texte = (arbre / "code-layout-lib.sh").read_text(encoding="utf-8")
+    match = re.search(r"^_DEPLOY_OPERATIONAL_FILES=\(\n(.*?)^\)$", texte, re.M | re.S)
+    assert match, f"{arbre.name}/code-layout-lib.sh : _DEPLOY_OPERATIONAL_FILES introuvable"
+    return match.group(1).split()
 
 
 # ── Le garde ──────────────────────────────────────────────────────────────────
@@ -343,8 +308,9 @@ def test_tout_fichier_commun_est_declare_dans_le_manifeste_et_inversement() -> N
     fantomes = sorted(declares - communs)
     assert not non_declares, (
         f"Fichiers présents dans deploy/ ET deploy-macos/ mais absents du manifeste "
-        f"de test_deploy_trees_parity.py : {non_declares}. Déclare-les : miroir si "
-        f"identifiables, fonctions partagées ou divergence justifiée sinon."
+        f"de test_deploy_trees_parity.py : {non_declares}. Identiques au chemin "
+        f"près : passe-les en source unique (SOURCES_UNIQUES) ; sinon déclare des "
+        f"fonctions partagées ou une divergence justifiée."
     )
     assert not fantomes, (
         f"Fichiers déclarés dans le manifeste mais qui ne sont plus communs aux deux "
@@ -352,15 +318,69 @@ def test_tout_fichier_commun_est_declare_dans_le_manifeste_et_inversement() -> N
     )
 
 
-@pytest.mark.parametrize("nom_fichier", sorted(MIROIRS))
-def test_les_fichiers_miroirs_sont_identiques_apres_normalisation(nom_fichier: str) -> None:
-    """Un fichier miroir doit être identique des deux côtés, chemins normalisés."""
-    diff = diff_miroir(nom_fichier)
-    assert diff == "", (
-        f"Les copies de {nom_fichier} ont divergé (issue #29). {ARBRE_LINUX.name}/ "
-        f"fait foi : porte le changement sur l'autre copie, ou si la divergence est "
-        f"devenue légitime, documente-la dans le manifeste.\n{diff}"
+def test_les_sources_uniques_n_existent_que_dans_deploy() -> None:
+    """Un script à source unique vit dans deploy/ et n'a aucune copie macOS.
+
+    Une copie réintroduite redeviendrait un miroir non gardé : la dérive que
+    l'issue #29 a constatée. Contrôle positif :
+    test_le_garde_detecte_une_copie_reintroduite.
+    """
+    for nom in sorted(SOURCES_UNIQUES):
+        assert (ARBRE_LINUX / nom).is_file(), f"deploy/{nom} absent : source unique perdue"
+    copies = copies_reintroduites()
+    assert not copies, (
+        f"Copies réintroduites dans deploy-macos/ : {copies}. Ces scripts ont une "
+        f"source unique dans deploy/ (défauts plateformes choisis par `uname -s`) : "
+        f"supprime la copie et porte la différence dans la source unique."
     )
+
+
+@pytest.mark.parametrize("nom_fichier", sorted(SOURCES_UNIQUES))
+def test_les_sources_uniques_choisissent_la_plateforme_a_l_execution(nom_fichier: str) -> None:
+    """Les défauts plateformes passent par un `case "$(uname -s …)"` avec branche Darwin.
+
+    Le comportement réel (défaut macOS effectivement retenu) est exercé par
+    tests/test_smoke_test_script.py ; ici on garde la forme, pour les deux scripts.
+    """
+    texte = (ARBRE_LINUX / nom_fichier).read_text(encoding="utf-8")
+    assert re.search(r'^case "\$\(uname -s', texte, re.M), (
+        f"deploy/{nom_fichier} ne choisit plus ses défauts par `uname -s`"
+    )
+    assert re.search(r"^\s+Darwin\)", texte, re.M), (
+        f"deploy/{nom_fichier} n'a plus de branche Darwin : le défaut macOS est perdu"
+    )
+
+
+def test_les_deux_installeurs_livrent_les_sources_uniques_et_leurs_libs() -> None:
+    """Chaque arbre installe les sources uniques DEPUIS deploy/, avec les libs sourcées.
+
+    Une recette installée doit pouvoir être relancée hors du checkout pendant un
+    incident : toute lib qu'elle source depuis son propre répertoire doit être
+    livrée à côté d'elle, sur les deux plateformes (macOS ne livrait pas
+    deploy-mode-lib.sh : la recette installée échouait au `source`).
+    """
+    libs_requises: set[str] = set()
+    for nom in SOURCES_UNIQUES:
+        texte = (ARBRE_LINUX / nom).read_text(encoding="utf-8")
+        libs_requises |= set(re.findall(r'^source "\$SCRIPT_DIR/([^"/]+)"', texte, re.M))
+    attendus = SOURCES_UNIQUES | libs_requises
+    assert "deploy-mode-lib.sh" in attendus, (
+        "Contrôle positif : smoke_test.sh source deploy-mode-lib.sh — l'extraction "
+        "des libs sourcées ne voit plus rien."
+    )
+    for arbre in (ARBRE_LINUX, ARBRE_MACOS):
+        manquants = sorted(attendus - set(fichiers_operationnels(arbre)))
+        assert not manquants, (
+            f"{arbre.name}/code-layout-lib.sh ne livre pas {manquants} : la recette "
+            f"installée ne serait pas autonome."
+        )
+        corps = extraire_fonction(
+            (arbre / "code-layout-lib.sh").read_text(encoding="utf-8"),
+            "deploy_sync_gateway_operational_files",
+        )
+        assert 'cp "$source_root/deploy/$file"' in corps, (
+            f"{arbre.name}/code-layout-lib.sh doit copier depuis deploy/ (source unique)."
+        )
 
 
 @pytest.mark.parametrize(
@@ -392,14 +412,15 @@ def test_les_divergences_declarees_sont_justifiees(nom_fichier: str) -> None:
 # ── Invariants transverses (fichiers divergents par nature) ──────────────────
 
 
-def test_chaque_update_execute_le_smoke_test_de_son_arbre() -> None:
-    """La gate smoke test d'un update.sh exécute la copie de SON arbre.
+def test_chaque_update_execute_le_smoke_test_a_source_unique() -> None:
+    """La gate smoke test des deux update.sh exécute `deploy/smoke_test.sh`.
 
-    Défaut réel trouvé par le garde : deploy-macos/update.sh exécutait
-    $SCRIPT_DIR/deploy/smoke_test.sh — la copie Linux — donc validait un autre
-    artefact que celui déployé.
+    Historique : deploy-macos/update.sh exécutait la copie Linux alors qu'il
+    installait la copie macOS — il validait un autre artefact que celui
+    déployé. Avec une source unique, le fichier exécuté est par construction
+    celui que deploy_sync_gateway_operational_files installe, des deux côtés.
     """
-    attendu = {(ARBRE_LINUX, "update.sh"): "deploy", (ARBRE_MACOS, "update.sh"): "deploy-macos"}
+    attendu = {(ARBRE_LINUX, "update.sh"): "deploy", (ARBRE_MACOS, "update.sh"): "deploy"}
     for (arbre, nom_fichier), arbre_attendu in attendu.items():
         texte = (arbre / nom_fichier).read_text(encoding="utf-8")
         match = re.search(r'^SMOKE_TEST_SCRIPT="\$SCRIPT_DIR/(\S+)/smoke_test\.sh"$', texte, re.M)
@@ -830,7 +851,7 @@ def test_les_paires_semantiques_pointent_sur_des_fichiers_non_communs() -> None:
     """Le manifeste des paires doit rester disjoint de l'intersection par nom.
 
     Une paire dont les deux noms existent des deux côtés relève du mécanisme
-    miroir/divergence, pas de `PAIRES_SEMANTIQUES` ; un nom inexistant ferait
+    fonctions partagées/divergence, pas de `PAIRES_SEMANTIQUES` ; un nom inexistant ferait
     passer le garde pour une comparaison vide.
     """
     communs = fichiers_communs()
@@ -840,7 +861,7 @@ def test_les_paires_semantiques_pointent_sur_des_fichiers_non_communs() -> None:
         assert nom_linux not in communs and nom_macos not in communs, (
             f"{canonique}: les deux noms existent des deux arbres — sort "
             f"{nom_linux}/{nom_macos} de PAIRES_SEMANTIQUES et déclare-les dans le "
-            "manifeste par nom (miroir ou divergence justifiée)."
+            "manifeste par nom (source unique, fonctions partagées ou divergence justifiée)."
         )
 
 
@@ -930,36 +951,16 @@ def test_le_garde_semantique_refuse_les_mutations_connues() -> None:
 def test_le_garde_detecte_une_mutation_sur_une_copie(tmp_path: Path) -> None:
     """Un test d'absence sans contrôle positif peut devenir inerte (AGENTS.md).
 
-    On copie les deux arbres dans un tmp_path, on vérifie d'abord que la copie
-    conforme ne déclenche rien (pas de faux positif), puis on injecte une
-    mutation unilatérale dans la copie macOS : le garde doit la voir et la
-    citer. Même protocole sur une fonction partagée.
+    On recopie une lib commune dans un tmp_path, on vérifie d'abord que la
+    copie conforme ne déclenche rien (pas de faux positif), puis on injecte une
+    mutation unilatérale dans le corps d'une fonction partagée côté macOS : le
+    garde doit la voir et la citer.
     """
     faux_linux = tmp_path / "deploy"
     faux_macos = tmp_path / "deploy-macos"
     faux_linux.mkdir()
     faux_macos.mkdir()
 
-    (faux_linux / "smoke_test.sh").write_text(
-        (ARBRE_LINUX / "smoke_test.sh").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    (faux_macos / "smoke_test.sh").write_text(
-        (ARBRE_MACOS / "smoke_test.sh").read_text(encoding="utf-8"), encoding="utf-8"
-    )
-    assert diff_miroir("smoke_test.sh", faux_linux, faux_macos) == "", (
-        "Faux positif : une copie conforme est rapportée divergente."
-    )
-
-    marque_mutation = "MUTATION_INJECTEE_PAR_LE_TEST_DE_PARITE=1"
-    (faux_macos / "smoke_test.sh").write_text(
-        (ARBRE_MACOS / "smoke_test.sh").read_text(encoding="utf-8") + f"\n{marque_mutation}\n"
-    )
-    diff = diff_miroir("smoke_test.sh", faux_linux, faux_macos)
-    assert diff != "" and marque_mutation in diff, (
-        "Le garde ne détecte pas une mutation unilatérale : il est inerte."
-    )
-
-    # Même protocole sur une fonction partagée.
     texte_linux = (ARBRE_LINUX / "code-layout-lib.sh").read_text(encoding="utf-8")
     texte_macos = (ARBRE_MACOS / "code-layout-lib.sh").read_text(encoding="utf-8")
     assert diff_fonction("code-layout-lib.sh", "_deploy_code_safe_roots").strip() == ""
@@ -976,4 +977,21 @@ def test_le_garde_detecte_une_mutation_sur_une_copie(tmp_path: Path) -> None:
     )
     assert "MUTATION_INJECTEE_PAR_LE_TEST_DE_PARITE" in diff_fonction_mutee, (
         "Le comparateur de fonctions partagées ne voit pas une mutation du corps."
+    )
+
+
+def test_le_garde_detecte_une_copie_reintroduite(tmp_path: Path) -> None:
+    """Contrôle positif du garde de source unique (règle AGENTS.md).
+
+    Un arbre macOS sans copie ne déclenche rien ; une copie de smoke_test.sh
+    déposée dans deploy-macos/ doit être vue et citée.
+    """
+    faux_macos = tmp_path / "deploy-macos"
+    faux_macos.mkdir()
+    assert copies_reintroduites(faux_macos) == [], "Faux positif sur un arbre sans copie."
+    (faux_macos / "smoke_test.sh").write_text(
+        (ARBRE_LINUX / "smoke_test.sh").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    assert copies_reintroduites(faux_macos) == ["smoke_test.sh"], (
+        "Le garde ne voit pas une copie réintroduite : il est inerte."
     )

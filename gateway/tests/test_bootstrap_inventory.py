@@ -27,6 +27,7 @@ import json
 
 import pytest
 
+import gpu_inventory
 from bootstrap import inventory, schema
 
 
@@ -287,10 +288,34 @@ def test_invalid_token_truncates_the_selection_as_cuda_does():
 
 
 def test_resolve_visible_devices_distinguishes_unset_from_empty():
-    gpus = inventory.parse_nvidia_smi_csv(NVIDIA_CSV_TWO_L40S)
-    assert len(inventory.resolve_visible_devices(gpus, None).devices) == 2
-    assert inventory.resolve_visible_devices(gpus, "").devices == ()
-    assert inventory.resolve_visible_devices(gpus, "  ").devices == ()
+    """L'inventaire n'a plus de résolveur propre : c'est celui du runtime."""
+    gpus = gpu_inventory.parse_nvidia_smi_csv(NVIDIA_CSV_TWO_L40S)
+    assert len(gpu_inventory.resolve_visible_devices(gpus, None).devices) == 2
+    assert gpu_inventory.resolve_visible_devices(gpus, "").devices == ()
+    assert gpu_inventory.resolve_visible_devices(gpus, "  ").devices == ()
+    assert not hasattr(inventory, "resolve_visible_devices"), "résolveur dupliqué réintroduit"
+
+
+def test_an_empty_element_invalidates_the_whole_list_as_the_runtime_does():
+    """`0,,1` : le runtime refuse la liste (empty_token) ; l'inventaire aussi.
+
+    Avant l'unification, l'inventaire ignorait l'élément vide et comptait les
+    deux GPU — un budget que la sonde d'admission n'aurait jamais mesuré.
+    """
+    profile = inventory.collect_hardware(raw=raw_host(env={"CUDA_VISIBLE_DEVICES": "0,,1"}))
+    assert profile.status == "fail"
+    assert "cuda_visible_devices_invalid" in codes(profile)
+    assert "élément vide" in finding(profile, "cuda_visible_devices_invalid").message
+    assert profile.visible_vram_total_bytes == 0
+
+
+def test_minus_one_hides_every_gpu_like_an_empty_value():
+    """`-1` : CUDA n'expose rien — même verdict que la valeur vide, pas « inconnu »."""
+    profile = inventory.collect_hardware(raw=raw_host(env={"CUDA_VISIBLE_DEVICES": "-1"}))
+    assert profile.status == "fail"
+    assert "cuda_visible_devices_empty" in codes(profile)
+    assert "cuda_visible_devices_invalid" not in codes(profile)
+    assert profile.visible_vram_total_bytes == 0
 
 
 # ── Aucun repli silencieux (§6) ───────────────────────────────────────────────
@@ -435,7 +460,8 @@ def test_no_vram_finding_when_nothing_is_exposed():
 # ── Analyseurs ────────────────────────────────────────────────────────────────
 
 def test_nvidia_csv_parsing_is_defensive():
-    parsed = inventory.parse_nvidia_smi_csv(
+    """Analyse du runtime, puis projection §5 : rien d'inventé, rien de deviné."""
+    samples = gpu_inventory.parse_nvidia_smi_csv(
         "\n"
         "pas, du, tout, du, csv\n"
         "0, GPU-ok, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
@@ -444,6 +470,8 @@ def test_nvidia_csv_parsing_is_defensive():
         "3, GPU-zero, NVIDIA L40S, 0, 550.54.15, 8.9\n"
         "x, GPU-idx, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
     )
+    parsed = [g for g in map(inventory.gpu_device_from_sample, samples) if g is not None]
+    assert not hasattr(inventory, "parse_nvidia_smi_csv"), "analyseur dupliqué réintroduit"
     assert [g.uuid for g in parsed] == ["GPU-ok", "GPU-idx"]
     assert parsed[0].vram_total_bytes == L40S_BYTES
     assert parsed[1].index is None

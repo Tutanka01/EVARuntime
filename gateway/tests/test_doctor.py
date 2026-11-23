@@ -780,17 +780,30 @@ def test_real_nvidia_smi_probe_returns_none_without_the_tool(monkeypatch):
 
 
 def test_nvidia_smi_csv_parsing_is_defensive():
-    parsed = doctor.parse_nvidia_smi_csv(
-        "0, GPU-aaa, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
-        "ligne, incomplete\n"
-        "x, GPU-bbb, NVIDIA A100, pas-un-nombre, 550.54.15, 8.0\n"
-        "1, GPU-ccc, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
-        "2, GPU-ddd, NVIDIA GB10, [N/A], 580.159.03, 12.1\n"
-    )
-    assert [g.index for g in parsed] == [0, 1, 2]
+    """doctor projette l'analyse du runtime (`gpu_inventory`), il n'en a plus.
+
+    Changement assumé : une ligne à UUID valide mais à index/mémoire illisibles
+    reste un GPU (mémoire non rapportée), comme pour la sonde d'admission.
+    """
+    import gpu_inventory
+
+    assert not hasattr(doctor, "parse_nvidia_smi_csv"), "analyseur dupliqué réintroduit"
+    assert not hasattr(doctor, "visible_devices"), "résolveur dupliqué réintroduit"
+    parsed = [
+        doctor.gpu_info_from_sample(sample)
+        for sample in gpu_inventory.parse_nvidia_smi_csv(
+            "0, GPU-aaa, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
+            "ligne, incomplete\n"
+            "x, GPU-bbb, NVIDIA A100, pas-un-nombre, 550.54.15, 8.0\n"
+            "1, GPU-ccc, NVIDIA L40S, 46068, 550.54.15, 8.9\n"
+            "2, GPU-ddd, NVIDIA GB10, [N/A], 580.159.03, 12.1\n"
+        )
+    ]
+    assert [g.index for g in parsed] == [0, None, 1, 2]
     assert parsed[0].name == "NVIDIA L40S"
     assert parsed[0].memory_total_mib == 46068.0
-    assert parsed[2].memory_total_mib is None
+    assert parsed[1].memory_total_mib is None
+    assert parsed[3].memory_total_mib is None
 
 
 def test_unreported_vram_is_skipped_without_hiding_the_gpu(tmp_path, monkeypatch):

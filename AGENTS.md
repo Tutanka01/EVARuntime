@@ -48,11 +48,15 @@ count.
   nginx, TLS, systemd). Human and JSON output, stable exit codes.
 - `gateway/deploy/`: systemd, nginx, installer, update script, and example node
   configuration.
-- `gateway/deploy/smoke_test.sh`: first-token recipe. Gates `update.sh` and is
-  runnable standalone during an incident.
-- `gateway/deploy-macos/`: launchd/Homebrew mirror of `deploy/`. `deploy/` is
-  the reference tree: parity is enforced by
-  `gateway/tests/test_deploy_trees_parity.py` (issue #29).
+- `gateway/deploy/smoke_test.sh`: first-token recipe. Gates `update.sh` (Linux
+  and macOS) and is runnable standalone during an incident. Single source for
+  both platforms, like `llm-gateway-backup.sh`: platform defaults are picked at
+  run time (`uname -s`).
+- `gateway/deploy-macos/`: launchd/Homebrew counterpart of `deploy/` for the
+  scripts that genuinely diverge (`install.sh`, `update.sh`, `*-lib.sh`); it
+  installs the single-source scripts from `deploy/`. `deploy/` is the reference
+  tree: parity is enforced by `gateway/tests/test_deploy_trees_parity.py`
+  (issue #29).
 - `gateway/static/dashboard.html`: admin dashboard served by the main gateway.
 - `gateway/tests/`: main gateway unit tests.
 - `node_agent/`: lightweight FastAPI agent that loads/unloads `llama-server` on a
@@ -232,11 +236,12 @@ reasonable, with syntax checks. Do not run installers against the host unless th
 user explicitly asks for it. Deployment logic can still be tested for real: drive
 the script against a fake local HTTP server, as `test_smoke_test_script.py` does.
 
-Deploy scripts exist twice (`gateway/deploy/` for Linux/systemd,
+Most deploy scripts exist twice (`gateway/deploy/` for Linux/systemd,
 `gateway/deploy-macos/` for launchd). `gateway/deploy/` is the reference: when a
 fix touches a common file, replicate it on the other side or declare the
 divergence with a justification in `test_deploy_trees_parity.py` — CI fails on
-undeclared drift.
+undeclared drift. `smoke_test.sh` and `llm-gateway-backup.sh` have a single
+source in `gateway/deploy/`; never re-add a copy under `deploy-macos/`.
 
 Two rules that caught real defects:
 

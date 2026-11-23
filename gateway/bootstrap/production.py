@@ -800,10 +800,13 @@ class LlamaServerCalibrationProbes:
                 "le matériel courant"
             )
 
+        # Analyse et résolution du runtime (`gpu_inventory`) : même requête,
+        # même analyseur, même résolveur que la sonde d'admission, doctor et
+        # l'inventaire bootstrap. Import local : section GPU autonome.
+        import gpu_inventory
+
         command = (
-            "nvidia-smi",
-            "--query-gpu=index,uuid,name,memory.total,driver_version,compute_cap",
-            "--format=csv,noheader,nounits",
+            "nvidia-smi", gpu_inventory.NVIDIA_SMI_QUERY, gpu_inventory.NVIDIA_SMI_FORMAT,
         )
         code, output, detail = await _subprocess_output(command, timeout=5.0)
         if code != 0:
@@ -811,32 +814,41 @@ class LlamaServerCalibrationProbes:
                 "inventaire GPU courant impossible : " + (detail or f"code {code}")
             )
         expected_uuids = set(self.visible_gpu_uuids)
-        current_uuids: set[str] = set()
-        descriptors: list[dict[str, Any]] = []
-        try:
-            for raw in output.splitlines():
-                if not raw.strip():
-                    continue
-                values = [part.strip() for part in raw.split(",")]
-                if len(values) != 6:
-                    raise ValueError(f"ligne inattendue : {raw!r}")
-                uuid = values[1]
-                if uuid not in expected_uuids:
-                    continue
-                if uuid in current_uuids:
-                    raise ValueError(f"UUID GPU dupliqué : {uuid}")
-                current_uuids.add(uuid)
-                descriptors.append({
-                    "name": values[2],
-                    "vram_total_mib": int(values[3]),
-                    "driver_version": values[4],
-                    "compute_cap": values[5],
-                })
-        except (ValueError, IndexError) as exc:
+        samples, malformed = gpu_inventory.parse_nvidia_smi_rows(output)
+        all_uuids = [sample.uuid for sample in samples]
+        if malformed:
             raise calibration.CalibrationError(
-                f"inventaire GPU courant illisible : {exc}"
-            ) from exc
-        if current_uuids != expected_uuids:
+                f"inventaire GPU courant illisible : {malformed} ligne(s) inattendue(s)"
+            )
+        if len(set(all_uuids)) != len(all_uuids):
+            raise calibration.CalibrationError(
+                "inventaire GPU courant illisible : UUID GPU dupliqué"
+            )
+        # Le périmètre évalué est exactement celui que `start()` exporte en
+        # CUDA_VISIBLE_DEVICES aux llama-server de calibration.
+        scope = gpu_inventory.assess_visible_scope(
+            samples, ",".join(self.visible_gpu_uuids)
+        )
+        if scope.reason == gpu_inventory.SCOPE_MIG_UNSUPPORTED:
+            raise calibration.CalibrationError(
+                "GPU du plan en mode MIG : la VRAM d'une instance MIG n'est pas "
+                "mesurable par la sonde du runtime (mig_unsupported)"
+            )
+        current_uuids = {sample.uuid for sample in scope.devices}
+        descriptors: list[dict[str, Any]] = []
+        for sample in scope.devices:
+            if sample.memory_total_mb is None:
+                raise calibration.CalibrationError(
+                    f"inventaire GPU courant illisible : memory.total non rapporté "
+                    f"pour {sample.uuid}"
+                )
+            descriptors.append({
+                "name": sample.name,
+                "vram_total_mib": int(sample.memory_total_mb),
+                "driver_version": sample.driver_version,
+                "compute_cap": sample.compute_capability,
+            })
+        if scope.reason != gpu_inventory.SCOPE_OK or current_uuids != expected_uuids:
             raise calibration.CalibrationError(
                 "UUID GPU visibles différents du plan : "
                 f"courants={sorted(current_uuids)}, attendus={sorted(expected_uuids)}"

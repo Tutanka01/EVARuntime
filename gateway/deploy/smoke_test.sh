@@ -14,9 +14,15 @@
 #   sudo bash gateway/deploy/smoke_test.sh
 #   sudo bash gateway/deploy/smoke_test.sh --base-url https://llm.example.fr \
 #        --model llama-3.1-8b-instruct --ttft-threshold-ms 5000
+#   bash gateway/deploy/smoke_test.sh            # macOS : utilisateur courant
 #
-# Usage automatisé : appelé par update.sh après le redémarrage. Un échec
-# fonctionnel y déclenche la restauration de la version précédente.
+# Source UNIQUE pour Linux et macOS (issue #29) : `deploy-macos/` n'en a pas de
+# copie. Seul le fichier d'environnement par défaut dépend de la plateforme,
+# choisi à l'exécution (`uname -s`) — voir ENV_FILE plus bas.
+#
+# Usage automatisé : appelé par update.sh (Linux et macOS) après le
+# redémarrage. Sous Linux, un échec fonctionnel y déclenche la restauration de
+# la version précédente.
 #
 # ── Ce que chaque URL de base couvre ─────────────────────────────────────────
 #
@@ -101,6 +107,22 @@ die_usage() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit "$EXIT_USAGE"; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Répertoire de configuration par défaut, selon la plateforme qui EXÉCUTE le
+# script (table « Architecture macOS vs Linux », docs/deployment.md).
+# LLM_GATEWAY_CONFIG_DIR, puis --env-file, restent prioritaires.
+# macOS : HOME peut manquer (job launchd). Il n'est lu que s'il est défini — sous
+# `set -u`, « $HOME » nu ferait échouer le script même quand une surcharge rend
+# le défaut inutile ; l'absence n'est signalée que si le défaut sert vraiment.
+case "$(uname -s 2>/dev/null || true)" in
+    Darwin) DEFAULT_CONFIG_DIR="${HOME:+$HOME/.config/evaruntime}" ;;
+    *)      DEFAULT_CONFIG_DIR="/etc/llm-gateway" ;;
+esac
+if [[ -n "$DEFAULT_CONFIG_DIR" ]]; then
+    DEFAULT_ENV_HELP="$DEFAULT_CONFIG_DIR/env"
+else
+    DEFAULT_ENV_HELP="\$HOME/.config/evaruntime/env — HOME non défini"
+fi
+
 usage() {
     cat <<EOF
 Usage: $0 [options]
@@ -113,7 +135,7 @@ Options :
   --admin-url URL          Plan de contrôle et /ready, en direct sur la gateway
                            (défaut : identique au défaut de --base-url)
   --env-file PATH          EnvironmentFile lu pour ADMIN_SECRET, le port et le
-                           modèle par défaut (défaut : /etc/llm-gateway/env)
+                           modèle par défaut (défaut : $DEFAULT_ENV_HELP)
   --admin-secret-file PATH Lit ADMIN_SECRET dans un fichier root-only plutôt que
                            dans l'EnvironmentFile
   --model ID               Modèle à exercer. Défaut dérivé de la configuration :
@@ -147,7 +169,8 @@ EOF
 
 BASE_URL=""
 ADMIN_URL=""
-ENV_FILE="${LLM_GATEWAY_CONFIG_DIR:-/etc/llm-gateway}/env"
+CONFIG_DIR="${LLM_GATEWAY_CONFIG_DIR:-$DEFAULT_CONFIG_DIR}"
+ENV_FILE="${CONFIG_DIR:+$CONFIG_DIR/env}"
 ADMIN_SECRET_FILE=""
 MODEL_ID="${SMOKE_TEST_MODEL:-}"
 PROMPT="Answer with a single word: OK"
@@ -211,6 +234,10 @@ if [[ -n "$ADMIN_SECRET_FILE" ]]; then
     [[ -f "$ADMIN_SECRET_FILE" ]] || die_usage "Fichier de secret introuvable : $ADMIN_SECRET_FILE"
     IFS= read -r ADMIN_SECRET < "$ADMIN_SECRET_FILE" || true
 else
+    [[ -n "$ENV_FILE" ]] || die_usage \
+        "HOME n'est pas défini : impossible de déduire le fichier d'environnement \
+macOS par défaut (\$HOME/.config/evaruntime/env). Passez --env-file, \
+LLM_GATEWAY_CONFIG_DIR ou --admin-secret-file."
     [[ -f "$ENV_FILE" ]] || die_usage \
         "EnvironmentFile introuvable : $ENV_FILE. Passez --env-file ou --admin-secret-file."
     ADMIN_SECRET="$(env_value ADMIN_SECRET)"

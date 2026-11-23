@@ -83,7 +83,6 @@ Exit codes — cf. `docs/admin.md`
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -98,6 +97,7 @@ from typing import Any, Iterable, Sequence
 
 from pydantic_settings import DotEnvSettingsSource
 
+import gpu_inventory
 import readiness
 from config import SECRET_MIN_LENGTH, Settings, secret_is_placeholder
 from config import settings as _ambient_settings
@@ -926,89 +926,74 @@ async def check_llama_server_version(config: Any) -> CheckResult:
 
 @dataclass(frozen=True)
 class GpuInfo:
-    """Un GPU tel que rapporté par nvidia-smi. L'UUID n'est jamais affiché."""
+    """Un GPU tel que rapporté par nvidia-smi. L'UUID n'est jamais affiché.
+
+    Projection de `gpu_inventory.GpuVramSample` : l'analyse de la sortie
+    nvidia-smi et la résolution de CUDA_VISIBLE_DEVICES sont celles du runtime
+    (`gpu_inventory`), pour que doctor rende le verdict qui gouverne
+    réellement l'admission — il n'en a plus de copie.
+    """
     index: int | None
     uuid: str
     name: str
     memory_total_mib: float | None
     driver_version: str
     compute_capability: str
+    mig_mode_current: str = ""
 
 
-# Requête exactement telle que spécifiée par le plan de consolidation §5.
-_NVIDIA_SMI_QUERY = (
-    "--query-gpu=index,uuid,name,memory.total,driver_version,compute_cap"
-)
+def gpu_info_from_sample(sample: gpu_inventory.GpuVramSample) -> GpuInfo:
+    """Projette une ligne de la sonde runtime vers la vue doctor."""
+    return GpuInfo(
+        index=sample.index,
+        uuid=sample.uuid,
+        name=sample.name,
+        # [N/A] (GB10/PGX, mémoire unifiée) reste None : le GPU est visible et
+        # la capacité est explicitement confiée à TOTAL_VRAM_GB.
+        memory_total_mib=sample.memory_total_mb,
+        driver_version=sample.driver_version,
+        compute_capability=sample.compute_capability,
+        mig_mode_current=sample.mig_mode_current,
+    )
 
 
-def parse_nvidia_smi_csv(text: str) -> list[GpuInfo]:
-    """Parse la sortie `--format=csv,noheader,nounits`. Ne lève jamais."""
-    gpus: list[GpuInfo] = []
-    for line in text.splitlines():
-        fields = [f.strip() for f in line.split(",")]
-        if len(fields) < 6 or not fields[2]:
-            continue
-        try:
-            index: int | None = int(fields[0])
-        except ValueError:
-            index = None
-        memory_raw = fields[3].strip().lower()
-        if memory_raw in {"[n/a]", "n/a"}:
-            # Les GB10/PGX exposent une mémoire unifiée, mais nvidia-smi peut
-            # répondre [N/A] pour memory.total. Le GPU reste visible dans doctor
-            # et la capacité est alors explicitement confiée à TOTAL_VRAM_GB.
-            memory: float | None = None
-        else:
-            try:
-                memory = float(fields[3])
-            except ValueError:
-                continue
-        gpus.append(GpuInfo(
-            index=index,
-            uuid=fields[1],
-            name=fields[2],
-            memory_total_mib=memory,
-            driver_version=fields[4],
-            compute_capability=fields[5],
-        ))
-    return gpus
+# Raisons d'échec de la sonde runtime, traduites pour l'opérateur. Toute autre
+# raison laisse un inventaire exploitable (les devices sont rendus).
+_PROBE_FAILURES: dict[str, str] = {
+    "nvidia_smi_unavailable": "nvidia-smi introuvable dans le PATH",
+    "nvidia_smi_timeout": "timeout de la sonde nvidia-smi",
+    "nvidia_smi_failed": "nvidia-smi a échoué",
+    "nvidia_smi_probe_error": "erreur de sonde nvidia-smi",
+    "nvidia_smi_output_too_large": "sortie nvidia-smi anormalement volumineuse",
+    "nvidia_smi_parse_error": "sortie nvidia-smi illisible",
+    "invalid_timeout": "timeout de sonde invalide",
+}
 
 
 async def probe_nvidia_smi(timeout: float = 5.0) -> tuple[list[GpuInfo] | None, str]:
     """
     Interroge nvidia-smi. Retourne (GPU, raison) — `None` si la sonde a échoué.
 
-    Aucun secret n'est passé en argument. Attrape TOUT : nvidia-smi absent est un
-    cas légitime (mode cluster, hôte de développement sans GPU).
+    Délègue à `gpu_inventory.probe_gpu_memory`, la sonde du runtime (même
+    requête, même environnement, mêmes bornes). On demande l'inventaire
+    PHYSIQUE (CUDA_VISIBLE_DEVICES retirée) : le périmètre configuré est évalué
+    ensuite par `check_vram_detected`, avec le résolveur du runtime.
+
+    Aucun secret n'est passé en argument. Ne lève jamais : nvidia-smi absent est
+    un cas légitime (mode cluster, hôte de développement sans GPU).
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "nvidia-smi",
-            _NVIDIA_SMI_QUERY,
-            "--format=csv,noheader,nounits",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except FileNotFoundError:
-        return None, "nvidia-smi introuvable dans le PATH"
-    except Exception as exc:
-        return None, f"nvidia-smi non exécutable ({type(exc).__name__})"
-
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        return None, "timeout de la sonde nvidia-smi"
-    except Exception as exc:
-        return None, f"erreur de sonde nvidia-smi ({type(exc).__name__})"
-
-    text = (stdout or b"").decode("utf-8", errors="replace")
-    if proc.returncode != 0:
-        return None, f"nvidia-smi a échoué (code {proc.returncode})"
-    return parse_nvidia_smi_csv(text), text.strip()[:200]
+    environment = {
+        key: value for key, value in os.environ.items() if key != "CUDA_VISIBLE_DEVICES"
+    }
+    measurement = await gpu_inventory.probe_gpu_memory(timeout, env=environment)
+    if measurement.devices:
+        return [gpu_info_from_sample(sample) for sample in measurement.devices], measurement.reason
+    if measurement.reason == "gpu_inventory_empty":
+        return [], measurement.reason
+    reason = _PROBE_FAILURES.get(measurement.reason, measurement.reason)
+    if measurement.detail:
+        reason = f"{reason} ({measurement.detail})"
+    return None, reason
 
 
 def check_gpu_inventory(
@@ -1119,35 +1104,6 @@ def check_gpu_inventory(
 
 # ── Contrôle : VRAM détectée vs configurée ────────────────────────────────────
 
-def visible_devices(config: Any, gpus: Sequence[GpuInfo]) -> tuple[list[GpuInfo], list[str]]:
-    """
-    Restreint l'inventaire aux devices réellement exposés au service.
-
-    `CUDA_VISIBLE_DEVICES` est propagé aux sous-processus llama-server par
-    `ServerManager` : c'est donc CETTE liste, et non l'ensemble des GPU de
-    l'hôte, qui détermine la VRAM disponible. Accepte les index (`0,1`) comme les
-    UUID (`GPU-…`). Retourne (devices visibles, jetons non résolus).
-    """
-    raw = str(getattr(config, "cuda_visible_devices", "") or "")
-    tokens = [t.strip() for t in raw.split(",") if t.strip()]
-    if not tokens:
-        return [], []
-
-    visible: list[GpuInfo] = []
-    unknown: list[str] = []
-    for token in tokens:
-        match = None
-        if token.isdigit():
-            match = next((g for g in gpus if g.index == int(token)), None)
-        else:
-            match = next((g for g in gpus if g.uuid == token), None)
-        if match is None:
-            unknown.append(token)
-        elif match not in visible:
-            visible.append(match)
-    return visible, unknown
-
-
 def check_vram_detected(
     config: Any,
     gpus: list[GpuInfo] | None,
@@ -1186,23 +1142,67 @@ def check_vram_detected(
         net_budget = float(config.effective_vram_budget_gb())
     except Exception:
         net_budget = configured
-    raw = str(getattr(config, "cuda_visible_devices", "") or "")
-    visible, unknown = visible_devices(config, gpus)
+    # `ServerManager` exporte la valeur configurée telle quelle aux llama-server,
+    # et la sonde d'admission la résout avec `gpu_inventory` : doctor applique
+    # le MÊME résolveur et le même ordre de verdicts (MIG, jeton non résolu,
+    # scope vide), pour ne jamais valider une valeur que le runtime refuse.
+    configured_scope = getattr(config, "cuda_visible_devices", None)
+    raw = None if configured_scope is None else str(configured_scope)
+    scope = gpu_inventory.assess_visible_scope(gpus, raw)
+    visible = list(scope.devices)
 
-    if not raw.strip():
+    if scope.reason == gpu_inventory.SCOPE_MIG_UNSUPPORTED:
+        # Une instance MIG ne peut pas dépasser la VRAM physique de l'hôte : ce
+        # plafond-là reste vérifiable, et un budget au-delà est impossible.
+        reported = [g.memory_total_mib for g in gpus]
+        if reported and all(m is not None for m in reported):
+            host_total = sum(m for m in reported if m is not None) / 1024.0
+            if net_budget > host_total:
+                return CheckResult(
+                    "vram_detected", "fail", "vram_budget_exceeds_hardware",
+                    f"CUDA_VISIBLE_DEVICES={raw} (MIG) : budget net "
+                    f"{net_budget:.1f} Go supérieur à la VRAM physique de TOUT "
+                    f"l'hôte ({host_total:.1f} Go). Aucune instance MIG ne peut "
+                    "l'offrir : abaissez TOTAL_VRAM_GB à la taille de l'instance.",
+                )
+        # Avertissement, pas `skip` : la valeur n'est pas vérifiable (une
+        # coquille dans un UUID MIG ne se distingue pas d'une instance réelle)
+        # et le budget n'est confronté à aucune mesure. Non bloquant, comme au
+        # runtime où l'admission retombe sur le budget configuré.
+        return CheckResult(
+            "vram_detected", "warn", "mig_unsupported",
+            f"CUDA_VISIBLE_DEVICES={raw} désigne une instance MIG, ou un GPU en "
+            "mode MIG : la sonde du runtime ne sait pas mesurer la VRAM d'une "
+            "instance MIG (vram_budget.status=unavailable), et l'UUID MIG n'est "
+            "pas vérifié (nvidia-smi --query-gpu ne liste que les GPU parents) — "
+            "contrôlez-le avec « nvidia-smi -L ». Le budget effectif reste celui "
+            f"de la configuration (TOTAL_VRAM_GB={configured:.1f} Go, budget net "
+            f"{net_budget:.1f} Go) ; vérifiez-le avec la taille de l'instance "
+            "(nvidia-smi mig -lgi).",
+            critical=False,
+        )
+    if scope.reason == gpu_inventory.SCOPE_EMPTY:
         return CheckResult(
             "vram_detected", "fail", "no_visible_gpu",
-            f"CUDA_VISIBLE_DEVICES est vide alors que {len(gpus)} GPU sont "
-            "présents : aucun device ne sera exposé aux llama-server et tout "
-            "chargement échouera. Renseignez CUDA_VISIBLE_DEVICES (ex. « 0 »).",
+            f"CUDA_VISIBLE_DEVICES={raw!r} n'expose aucun GPU alors que "
+            f"{len(gpus)} sont présents : aucun device ne sera exposé aux "
+            "llama-server et tout chargement échouera. Renseignez "
+            "CUDA_VISIBLE_DEVICES (ex. « 0 »).",
         )
-    if unknown:
+    if scope.reason == gpu_inventory.SCOPE_INVALID:
+        token = scope.unresolved[0]
+        designation = (
+            "contient un élément vide — la liste entière est refusée"
+            if token == gpu_inventory.EMPTY_TOKEN
+            else f"désigne un device inexistant ({token})"
+        )
         return CheckResult(
             "vram_detected", "fail", "cuda_visible_devices_invalid",
-            f"CUDA_VISIBLE_DEVICES={raw} désigne des devices inexistants "
-            f"({', '.join(unknown)}) ; GPU réellement présents : "
-            f"{', '.join(str(g.index) for g in gpus)}. CUDA n'exposera que les "
-            "devices situés AVANT le premier jeton invalide.",
+            f"CUDA_VISIBLE_DEVICES={raw} {designation} ; GPU réellement "
+            f"présents : {', '.join(str(g.index) for g in gpus)}. CUDA "
+            "n'exposera que les devices situés AVANT le premier jeton invalide, "
+            "et la sonde VRAM du runtime refuse ce périmètre "
+            "(cuda_visible_devices_invalid).",
         )
 
     if any(g.memory_total_mib is None for g in visible):

@@ -16,7 +16,8 @@
 #   Une version n'est conservée que si elle SERT réellement, pas seulement si elle
 #   répond. Trois contrôles se succèdent :
 #     1. `/ready` après le redémarrage (readiness structurelle stricte).
-#     2. `deploy-macos/smoke_test.sh` : recette du premier token de bout en bout.
+#     2. `deploy/smoke_test.sh` : recette du premier token de bout en bout (source
+#        unique Linux/macOS, issue #29).
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -195,10 +196,13 @@ fi
 
 section "Recette du premier token…"
 
-# Exécuter la copie de CET arbre : c'est celle qu'install.sh déploie et que cet
-# update maintient. Exercer la copie Linux validerait un autre artefact que
-# celui réellement déployé (parité deploy/deploy-macos, issue #29).
-SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy-macos/smoke_test.sh"
+# Source unique `deploy/smoke_test.sh` (issue #29), exécutée depuis le CHECKOUT
+# ($SCRIPT_DIR/deploy/). deploy_sync_gateway_operational_files vient d'en
+# copier le même fichier (octet pour octet) sous $INSTALL_DIR/deploy/ : c'est
+# cette copie installée qu'un opérateur relance en incident, sans le checkout.
+# Le défaut de configuration macOS est choisi par le script lui-même
+# (`uname -s`) ; --env-file le rend explicite ici.
+SMOKE_TEST_SCRIPT="$SCRIPT_DIR/deploy/smoke_test.sh"
 
 if [[ -f "$SMOKE_TEST_SCRIPT" ]]; then
     info "Exécution de la recette du premier token…"

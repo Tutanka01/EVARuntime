@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # llm-gateway-backup.sh — Sauvegarde périodique de la base SQLite de la gateway.
 #
-# Conçu pour être lancé par llm-gateway-backup.service (Type=oneshot), déclenché
+# Linux : lancé par llm-gateway-backup.service (Type=oneshot), déclenché
 # quotidiennement par llm-gateway-backup.timer. Peut aussi être lancé à la main :
 #   sudo -u llmservice bash /opt/llm-gateway/deploy/llm-gateway-backup.sh
+# macOS : pas de planification livrée ; à lancer à la main (utilisateur courant) :
+#   bash "$HOME/Library/Application Support/evaruntime/gateway/deploy/llm-gateway-backup.sh"
+#
+# Source UNIQUE pour les deux plateformes (issue #29) : `deploy-macos/` n'en a
+# pas de copie. Seuls les chemins par défaut dépendent de la plateforme,
+# choisis à l'exécution (`uname -s`).
 #
 # Propriétés :
 #   - Utilise `sqlite3 .backup` (sûr sur une base WAL active, contrairement à cp).
@@ -15,15 +21,35 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ── Configuration (surchargée par l'environnement) ────────────────────────────
-# DB_PATH et BACKUP_DIR peuvent être fournis par /etc/llm-gateway/env.
-DB_PATH="${DB_PATH:-/var/lib/llm-gateway/gateway.db}"
-BACKUP_DIR="${BACKUP_DIR:-/var/lib/llm-gateway/backups}"
+# DB_PATH et BACKUP_DIR peuvent être fournis par l'environnement (Linux :
+# EnvironmentFile /etc/llm-gateway/env du service). Défauts selon la plateforme
+# qui exécute le script (table « Architecture macOS vs Linux », docs/deployment.md).
+case "$(uname -s 2>/dev/null || true)" in
+    Darwin)
+        # HOME peut manquer (job launchd) : lu seulement s'il est défini, pour
+        # que DB_PATH/BACKUP_DIR fournis suffisent (voir le contrôle plus bas).
+        DEFAULT_STATE_DIR="${HOME:+$HOME/Library/Application Support/evaruntime}"
+        DEFAULT_DB_PATH="${DEFAULT_STATE_DIR:+$DEFAULT_STATE_DIR/data/gateway.db}"
+        SQLITE_INSTALL_HINT="brew install sqlite"
+        ;;
+    *)
+        DEFAULT_STATE_DIR="/var/lib/llm-gateway"
+        DEFAULT_DB_PATH="$DEFAULT_STATE_DIR/gateway.db"
+        SQLITE_INSTALL_HINT="apt install sqlite3"
+        ;;
+esac
+DB_PATH="${DB_PATH:-$DEFAULT_DB_PATH}"
+BACKUP_DIR="${BACKUP_DIR:-${DEFAULT_STATE_DIR:+$DEFAULT_STATE_DIR/backups}}"
 RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-14}"
 
 log()  { echo "[backup] $*"; }
 err()  { echo "[backup][ERROR] $*" >&2; exit 1; }
 
-command -v sqlite3 >/dev/null 2>&1 || err "sqlite3 introuvable (apt install sqlite3)."
+# Un défaut vide ne peut venir que d'un HOME absent sur macOS.
+[[ -n "$DB_PATH" ]] || err "HOME n'est pas défini : impossible de déduire DB_PATH par défaut. Fournissez DB_PATH."
+[[ -n "$BACKUP_DIR" ]] || err "HOME n'est pas défini : impossible de déduire BACKUP_DIR par défaut. Fournissez BACKUP_DIR."
+
+command -v sqlite3 >/dev/null 2>&1 || err "sqlite3 introuvable ($SQLITE_INSTALL_HINT)."
 [[ -f "$DB_PATH" ]] || err "Base introuvable : $DB_PATH"
 
 # `$DEST` est ensuite interpolé DANS une commande sqlite3 délimitée par des

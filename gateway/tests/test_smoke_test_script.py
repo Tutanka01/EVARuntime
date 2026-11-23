@@ -797,6 +797,169 @@ def test_script_syntaxiquement_valide():
         assert proc.returncode == 0, f"{script.name} : {proc.stderr}"
 
 
+# ── Source unique Linux/macOS : défaut de configuration choisi à l'exécution ──
+#
+# `deploy/smoke_test.sh` est la seule copie (issue #29) : `deploy-macos/` n'en a
+# plus. Le fichier d'environnement par défaut dépend de `uname -s`. On simule la
+# plateforme par un faux `uname` en tête de PATH, et HOME pointe vers tmp_path :
+# aucun chemin réel de l'hôte n'est lu.
+
+MACOS_LAYOUT_LIB = REPO_GATEWAY / "deploy-macos" / "code-layout-lib.sh"
+
+
+def _platform_env(tmp_path: Path, system: str, **extra: str) -> dict[str, str]:
+    fake_bin = tmp_path / f"fake-bin-{system}"
+    fake_bin.mkdir(exist_ok=True)
+    uname = fake_bin / "uname"
+    uname.write_text(f"#!/bin/sh\necho {system}\n", encoding="utf-8")
+    uname.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "LLM_GATEWAY_CONFIG_DIR"}
+    env.update(PATH=f"{fake_bin}{os.pathsep}{env.get('PATH', '')}", HOME=str(tmp_path / "home"))
+    env.update(extra)
+    return env
+
+
+def _write_env(path: Path, gateway) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"ADMIN_SECRET={ADMIN_SECRET}\nCLUSTER_MODE=local\n"
+        "GATEWAY_HOST=127.0.0.1\nGATEWAY_PORT=8000\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def _run_without_env_file(script: Path, gateway, env: dict[str, str]):
+    """Comme run_smoke, mais SANS --env-file : le défaut de plateforme s'applique."""
+    cmd = [
+        "bash", str(script),
+        "--base-url", gateway.url, "--admin-url", gateway.url, "--model", MODEL_ID,
+        "--connect-timeout", "5", "--ready-timeout", "5", "--admin-timeout", "10",
+        "--load-timeout", "10", "--stream-timeout", "15", "--usage-timeout", "3",
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env)
+
+
+@pytest.mark.parametrize(
+    ("system", "expected"),
+    [("Darwin", "{home}/.config/evaruntime/env"), ("Linux", "/etc/llm-gateway/env")],
+)
+def test_aide_annonce_le_defaut_de_la_plateforme(tmp_path, system, expected):
+    env = _platform_env(tmp_path, system)
+    proc = subprocess.run(
+        ["bash", str(SMOKE_SCRIPT), "--help"], capture_output=True, text=True, timeout=30, env=env
+    )
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert f"(défaut : {expected.format(home=env['HOME'])})" in proc.stdout
+
+
+def test_macos_lit_l_env_utilisateur_par_defaut(tmp_path, gateway):
+    """Sur Darwin, sans --env-file, la recette lit ~/.config/evaruntime/env."""
+    env = _platform_env(tmp_path, "Darwin")
+    _write_env(Path(env["HOME"]) / ".config" / "evaruntime" / "env", gateway)
+    proc = _run_without_env_file(SMOKE_SCRIPT, gateway, env)
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert_identity_cleaned(gateway)
+    assert_no_secret(combined(proc))
+
+
+def test_macos_n_utilise_jamais_le_chemin_linux(tmp_path, gateway):
+    """Contrôle croisé : sur Darwin, l'absence de l'env utilisateur est signalée
+    avec le chemin macOS — jamais /etc/llm-gateway — et aucun appel ne part."""
+    env = _platform_env(tmp_path, "Darwin")
+    proc = _run_without_env_file(SMOKE_SCRIPT, gateway, env)
+    assert proc.returncode == EXIT_USAGE
+    assert f"{env['HOME']}/.config/evaruntime/env" in combined(proc)
+    assert "/etc/llm-gateway" not in combined(proc)
+    assert not gateway.calls
+
+
+def test_llm_gateway_config_dir_prime_sur_le_defaut_macos(tmp_path, gateway):
+    config_dir = tmp_path / "explicit-config"
+    _write_env(config_dir / "env", gateway)
+    env = _platform_env(tmp_path, "Darwin", LLM_GATEWAY_CONFIG_DIR=str(config_dir))
+    proc = _run_without_env_file(SMOKE_SCRIPT, gateway, env)
+    assert proc.returncode == EXIT_OK, combined(proc)
+
+
+def _without_home(env: dict[str, str]) -> dict[str, str]:
+    """Job launchd : HOME peut être absent de l'environnement."""
+    return {k: v for k, v in env.items() if k != "HOME"}
+
+
+def test_macos_sans_home_l_aide_reste_disponible(tmp_path):
+    env = _without_home(_platform_env(tmp_path, "Darwin"))
+    proc = subprocess.run(
+        ["bash", str(SMOKE_SCRIPT), "--help"], capture_output=True, text=True, timeout=30, env=env
+    )
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert "unbound variable" not in combined(proc)
+    assert "HOME non défini" in proc.stdout
+
+
+def test_macos_sans_home_llm_gateway_config_dir_suffit(tmp_path, gateway):
+    config_dir = tmp_path / "explicit-config"
+    _write_env(config_dir / "env", gateway)
+    env = _without_home(_platform_env(tmp_path, "Darwin", LLM_GATEWAY_CONFIG_DIR=str(config_dir)))
+    proc = _run_without_env_file(SMOKE_SCRIPT, gateway, env)
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert_identity_cleaned(gateway)
+
+
+def test_macos_sans_home_env_file_suffit(tmp_path, gateway, env_file):
+    env = _without_home(_platform_env(tmp_path, "Darwin"))
+    cmd = [
+        "bash", str(SMOKE_SCRIPT), "--env-file", str(env_file),
+        "--base-url", gateway.url, "--admin-url", gateway.url, "--model", MODEL_ID,
+        "--connect-timeout", "5", "--ready-timeout", "5", "--admin-timeout", "10",
+        "--load-timeout", "10", "--stream-timeout", "15", "--usage-timeout", "3",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90, env=env)
+    assert proc.returncode == EXIT_OK, combined(proc)
+
+
+def test_macos_sans_home_ni_surcharge_echoue_clairement(tmp_path, gateway):
+    env = _without_home(_platform_env(tmp_path, "Darwin"))
+    proc = _run_without_env_file(SMOKE_SCRIPT, gateway, env)
+    assert proc.returncode == EXIT_USAGE
+    assert "HOME n'est pas défini" in combined(proc)
+    assert "unbound variable" not in combined(proc)
+    assert not gateway.calls
+
+
+def test_linux_sans_home_garde_le_defaut_systeme(tmp_path):
+    env = _without_home(_platform_env(tmp_path, "Linux"))
+    proc = subprocess.run(
+        ["bash", str(SMOKE_SCRIPT), "--help"], capture_output=True, text=True, timeout=30, env=env
+    )
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert "(défaut : /etc/llm-gateway/env)" in proc.stdout
+
+
+def test_recette_installee_par_le_layout_macos_tourne_hors_du_checkout(tmp_path, gateway):
+    """L'installeur macOS livre la source unique ET la lib qu'elle source.
+
+    Avant la source unique, deploy-macos/ ne livrait pas deploy-mode-lib.sh : la
+    recette installée échouait au `source`, donc ne pouvait pas être relancée
+    pendant un incident sans le checkout.
+    """
+    install_dir = tmp_path / "home" / "Library" / "Application Support" / "evaruntime" / "gateway"
+    sync = subprocess.run(
+        ["bash", "-c", 'source "$1"; deploy_sync_gateway_operational_files "$2" "$3"',
+         "bash", str(MACOS_LAYOUT_LIB), str(REPO_GATEWAY), str(install_dir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert sync.returncode == 0, sync.stderr
+    installed = install_dir / "deploy" / "smoke_test.sh"
+    assert installed.read_bytes() == SMOKE_SCRIPT.read_bytes(), "copie installée ≠ source unique"
+
+    env = _platform_env(tmp_path, "Darwin")
+    _write_env(Path(env["HOME"]) / ".config" / "evaruntime" / "env", gateway)
+    proc = _run_without_env_file(installed, gateway, env)
+    assert proc.returncode == EXIT_OK, combined(proc)
+    assert_identity_cleaned(gateway)
+
+
 # ── Branchement du gate dans update.sh ────────────────────────────────────────
 
 UPDATE_SCRIPT = REPO_GATEWAY / "deploy" / "update.sh"

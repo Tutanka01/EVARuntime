@@ -20,7 +20,9 @@ Ce n'est pas de la coquetterie de testabilité : c'est la seule façon d'avoir l
 même couverture sur un Mac sans GPU, dans une CI Linux sans pilote NVIDIA, et sur
 la L40S de production. La technique est celle de `doctor.py` (sondes séparées des
 contrôles, cf. `probe_nvidia_smi` / `check_gpu_inventory`), poussée un cran plus
-loin : ici la frontière impure est unique et nommée.
+loin : ici la frontière impure est unique et nommée. L'analyse de la sortie
+`nvidia-smi` et la résolution de `CUDA_VISIBLE_DEVICES` ne sont PAS locales :
+elles sont celles du runtime (`gpu_inventory`), partagées avec doctor.
 
 `capture_host()` est SYNCHRONE, contrairement à `doctor.probe_nvidia_smi()`. Le
 planificateur est une commande one-shot, jamais un chemin de requête ; et une
@@ -89,6 +91,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
+import gpu_inventory
+
 from . import schema
 
 SECTION_NAME = schema.SECTION_HARDWARE
@@ -135,9 +139,11 @@ _CUDA_13_MIN_DRIVER = 580
 # les autres — c'est-à-dire sur celles où la question se pose.
 DEFAULT_MODELS_DIR = Path("/models")
 
-# Requête à l'identique de `doctor._NVIDIA_SMI_QUERY`. Aucun secret ne transite par argv.
-NVIDIA_SMI_QUERY = "--query-gpu=index,uuid,name,memory.total,driver_version,compute_cap"
-NVIDIA_SMI_FORMAT = "--format=csv,noheader,nounits"
+# Requête du runtime (`gpu_inventory`), partagée avec doctor et la sonde
+# d'admission : un seul format de sortie, un seul analyseur. Aucun secret ne
+# transite par argv.
+NVIDIA_SMI_QUERY = gpu_inventory.NVIDIA_SMI_QUERY
+NVIDIA_SMI_FORMAT = gpu_inventory.NVIDIA_SMI_FORMAT
 
 NVIDIA_OK = "ok"
 NVIDIA_ABSENT = "absent"
@@ -405,93 +411,36 @@ def parse_meminfo(text: str) -> tuple[int | None, int | None]:
     return total, available
 
 
-def parse_nvidia_smi_csv(text: str) -> list[GpuDevice]:
+def gpu_device_from_sample(sample: gpu_inventory.GpuVramSample) -> GpuDevice | None:
     """
-    Parse la sortie `--format=csv,noheader,nounits`. Ne lève jamais.
+    Projette une ligne de la sonde runtime vers le profil §5, ou `None`.
 
-    `memory.total` est en MiB avec `nounits` ; le profil §5 exige des octets, la
-    conversion est faite ici pour qu'aucun consommateur n'ait à deviner l'unité.
-    Une ligne inexploitable est ignorée, pas devinée : un GPU dont la VRAM ne se
-    lit pas ne doit pas entrer dans le budget avec une valeur inventée.
+    L'analyse de la sortie `nvidia-smi` est celle du runtime
+    (`gpu_inventory.parse_nvidia_smi_csv`). `memory.total` est en MiB avec
+    `nounits` ; le profil §5 exige des octets, la conversion est faite ici pour
+    qu'aucun consommateur n'ait à deviner l'unité. Un GPU dont la VRAM ne se lit
+    pas n'entre pas dans le profil avec une valeur inventée.
     """
-    gpus: list[GpuDevice] = []
-    for line in text.splitlines():
-        fields = [f.strip() for f in line.split(",")]
-        if len(fields) < 6 or not fields[2]:
-            continue
-        try:
-            index: int | None = int(fields[0])
-        except ValueError:
-            index = None
-        try:
-            memory_mib = float(fields[3])
-        except ValueError:
-            continue
-        if memory_mib <= 0:
-            continue
-        gpus.append(GpuDevice(
-            index=index,
-            uuid=fields[1],
-            vendor=VENDOR_NVIDIA,
-            model=fields[2],
-            vram_total_bytes=int(memory_mib * 1024 * 1024),
-            driver_version=fields[4],
-            compute_capability=fields[5],
-        ))
-    return gpus
+    memory_mib = sample.memory_total_mb
+    if memory_mib is None or memory_mib <= 0 or not sample.name:
+        return None
+    return GpuDevice(
+        index=sample.index,
+        uuid=sample.uuid,
+        vendor=VENDOR_NVIDIA,
+        model=sample.name,
+        vram_total_bytes=int(memory_mib * 1024 * 1024),
+        driver_version=sample.driver_version,
+        compute_capability=sample.compute_capability,
+    )
 
 
 # ── CUDA_VISIBLE_DEVICES ──────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class VisibleSelection:
-    """Devices réellement exposés, et ce qui a empêché d'en exposer davantage."""
-    devices: tuple[GpuDevice, ...]
-    unresolved: tuple[str, ...]
-    declared: bool
-
-
-def resolve_visible_devices(
-    gpus: Sequence[GpuDevice],
-    raw: str | None,
-) -> VisibleSelection:
-    """
-    Restreint l'inventaire aux devices que `CUDA_VISIBLE_DEVICES` expose.
-
-    Trois formes, sémantiques distinctes — les confondre est la source d'erreur
-    classique, et `doctor.visible_devices()` les confond parce que sa source est
-    une chaîne de configuration incapable de porter la nuance :
-
-    - **variable absente** (`None`) : CUDA expose TOUS les GPU. C'est le défaut ;
-    - **variable présente et vide** (`""`) : CUDA n'expose AUCUN GPU. Sur un hôte
-      qui en possède, c'est une erreur de configuration, pas un hôte CPU ;
-    - **liste** : index (`0,1`) ou UUID (`GPU-…`), les deux acceptés.
-
-    La troncature est reproduite fidèlement : CUDA n'expose que les devices
-    situés AVANT le premier jeton invalide, et ignore tout ce qui suit. Un
-    inventaire qui résoudrait quand même les jetons suivants annoncerait de la
-    VRAM que le runtime ne verra jamais.
-    """
-    if raw is None:
-        return VisibleSelection(tuple(gpus), (), declared=False)
-
-    tokens = [t.strip() for t in raw.split(",")]
-    tokens = [t for t in tokens if t]
-    if not tokens:
-        return VisibleSelection((), (), declared=True)
-
-    visible: list[GpuDevice] = []
-    for token in tokens:
-        if token.isdigit():
-            match = next((g for g in gpus if g.index == int(token)), None)
-        else:
-            match = next((g for g in gpus if g.uuid == token), None)
-        if match is None:
-            # Troncature CUDA : tout ce qui suit un jeton invalide est perdu.
-            return VisibleSelection(tuple(visible), (token,), declared=True)
-        if match not in visible:
-            visible.append(match)
-    return VisibleSelection(tuple(visible), (), declared=True)
+#
+# Aucune résolution locale : `gpu_inventory.assess_visible_scope` est le
+# résolveur du runtime (variable absente = tout, vide ou `-1` = rien, liste
+# tronquée au premier jeton inconnu, élément vide refusé, MIG non mesurable).
+# L'inventaire rend donc, par construction, le verdict qui gouverne l'admission.
 
 
 # ── Sondes (impures, isolées) ─────────────────────────────────────────────────
@@ -511,6 +460,9 @@ def probe_nvidia_smi(timeout: float = 5.0) -> NvidiaSmiProbe:
             capture_output=True,
             timeout=timeout,
             check=False,
+            # Inventaire PHYSIQUE, comme la sonde runtime : le périmètre est
+            # appliqué ensuite par le résolveur partagé.
+            env=gpu_inventory.nvidia_smi_environment(os.environ),
         )
     except FileNotFoundError:
         return NvidiaSmiProbe(NVIDIA_ABSENT, detail="nvidia-smi introuvable dans le PATH")
@@ -773,7 +725,8 @@ def _probe_gpus(raw: RawHost) -> tuple[tuple[GpuDevice, ...], bool, list[schema.
         ))
         return (), True, findings
 
-    gpus = parse_nvidia_smi_csv(probe.stdout)
+    samples = gpu_inventory.parse_nvidia_smi_csv(probe.stdout)
+    gpus = [device for device in map(gpu_device_from_sample, samples) if device is not None]
     if not gpus:
         findings.append(schema.Finding(
             code="gpu_absent",
@@ -786,7 +739,9 @@ def _probe_gpus(raw: RawHost) -> tuple[tuple[GpuDevice, ...], bool, list[schema.
         ))
         return (), True, findings
 
-    marked, selection_findings = _apply_visibility(gpus, raw.env)
+    # Le périmètre est résolu sur l'inventaire COMPLET de la sonde, comme le fait
+    # le runtime : un GPU écarté du profil (VRAM illisible) reste désignable.
+    marked, selection_findings = _apply_visibility(gpus, raw.env, scope_devices=samples)
     findings.extend(selection_findings)
     return marked, True, findings
 
@@ -794,20 +749,32 @@ def _probe_gpus(raw: RawHost) -> tuple[tuple[GpuDevice, ...], bool, list[schema.
 def _apply_visibility(
     gpus: Sequence[GpuDevice],
     env: Mapping[str, str],
+    *,
+    scope_devices: Sequence[gpu_inventory.GpuIdentity] | None = None,
 ) -> tuple[tuple[GpuDevice, ...], list[schema.Finding]]:
-    """Marque chaque GPU selon `CUDA_VISIBLE_DEVICES` et rapporte les anomalies."""
+    """
+    Marque chaque GPU selon `CUDA_VISIBLE_DEVICES` et rapporte les anomalies.
+
+    Le verdict est celui du runtime (`gpu_inventory.assess_visible_scope`),
+    calculé sur `scope_devices` (l'inventaire brut de la sonde) ou, à défaut,
+    sur `gpus` (profil déclaré).
+    """
     findings: list[schema.Finding] = []
     if not gpus:
         # Sans GPU, la variable n'a rien à filtrer : en parler ajouterait du
         # bruit là où le constat utile (`gpu_absent`) est déjà émis.
         return (), findings
     raw_value = env.get("CUDA_VISIBLE_DEVICES")
-    selection = resolve_visible_devices(gpus, raw_value)
+    scope = gpu_inventory.assess_visible_scope(
+        scope_devices if scope_devices is not None else gpus, raw_value
+    )
+    selection = scope.selection
     visible_uuids = {g.uuid for g in selection.devices}
     marked = tuple(
         GpuDevice(**{**g.to_dict(), "visible": g.uuid in visible_uuids})
         for g in gpus
     )
+    exposed = sum(1 for g in marked if g.visible)
 
     if not selection.declared:
         findings.append(schema.Finding(
@@ -820,36 +787,53 @@ def _apply_visibility(
                 "ici sera surévalué."
             ),
         ))
-    elif selection.unresolved:
+    elif scope.reason == gpu_inventory.SCOPE_MIG_UNSUPPORTED:
+        findings.append(schema.Finding(
+            code="mig_unsupported",
+            level="warn",
+            message=(
+                f"CUDA_VISIBLE_DEVICES={raw_value!r} désigne une instance MIG, ou "
+                "un GPU en mode MIG : la sonde VRAM du runtime ne mesure pas les "
+                "instances MIG. Le budget planifié ici ne pourra pas être confronté "
+                "à une mesure ; dimensionnez TOTAL_VRAM_GB sur la taille de "
+                "l'instance."
+            ),
+        ))
+    elif scope.reason == gpu_inventory.SCOPE_INVALID:
+        token = selection.unresolved[0]
+        designation = (
+            "contient un élément vide — la liste entière est refusée"
+            if token == gpu_inventory.EMPTY_TOKEN
+            else f"désigne un device inexistant ({token}) ; CUDA n'expose que "
+            f"les devices situés AVANT lui, soit {exposed} sur {len(gpus)}"
+        )
         findings.append(schema.Finding(
             code="cuda_visible_devices_invalid",
             level="fail",
             message=(
-                f"CUDA_VISIBLE_DEVICES={raw_value!r} désigne un device "
-                f"inexistant ({selection.unresolved[0]}) ; CUDA n'expose que les "
-                f"devices situés AVANT lui, soit {len(selection.devices)} sur "
-                f"{len(gpus)}. Corrigez la variable : index présents = "
-                f"{', '.join(str(g.index) for g in gpus)}."
+                f"CUDA_VISIBLE_DEVICES={raw_value!r} {designation}. La sonde VRAM "
+                "du runtime refuse ce périmètre. Corrigez la variable : index "
+                f"présents = {', '.join(str(g.index) for g in gpus)}."
             ),
         ))
-    elif not selection.devices:
+    elif scope.reason == gpu_inventory.SCOPE_EMPTY:
         findings.append(schema.Finding(
             code="cuda_visible_devices_empty",
             level="fail",
             message=(
-                f"CUDA_VISIBLE_DEVICES est définie et vide alors que {len(gpus)} "
-                "GPU sont présents : aucun device ne sera exposé aux "
+                f"CUDA_VISIBLE_DEVICES={raw_value!r} n'expose aucun GPU alors que "
+                f"{len(gpus)} sont présents : aucun device ne sera exposé aux "
                 "llama-server et tout chargement échouera. Ce n'est pas un hôte "
                 "CPU, c'est une configuration incohérente — renseignez-la "
                 "(ex. « 0 ») ou supprimez-la."
             ),
         ))
-    elif len(selection.devices) < len(gpus):
+    elif exposed < len(gpus):
         findings.append(schema.Finding(
             code="cuda_visible_devices_partial",
             level="info",
             message=(
-                f"{len(selection.devices)}/{len(gpus)} GPU exposés par "
+                f"{exposed}/{len(gpus)} GPU exposés par "
                 f"CUDA_VISIBLE_DEVICES={raw_value!r} : le budget VRAM ne compte "
                 "que ceux-là."
             ),

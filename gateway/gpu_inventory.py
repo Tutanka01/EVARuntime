@@ -24,7 +24,7 @@ import math
 import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Literal, Mapping, Sequence
+from typing import Generic, Literal, Mapping, Protocol, Sequence, TypeVar
 
 
 # ``nounits`` rend les valeurs de mémoire stables et faciles à parser (MiB).
@@ -141,26 +141,52 @@ class GpuVramSample:
         }
 
 
+class GpuIdentity(Protocol):
+    """Ce dont la résolution du périmètre a besoin : un index et un UUID.
+
+    ``doctor`` et ``bootstrap.inventory`` projettent l'inventaire dans leurs
+    propres types ; ils passent ces objets tels quels au résolveur ci-dessous.
+    """
+
+    @property
+    def index(self) -> int | None: ...
+
+    @property
+    def uuid(self) -> str: ...
+
+
+_DeviceT = TypeVar("_DeviceT", bound=GpuIdentity)
+
+
 @dataclass(frozen=True)
-class VisibleGpuSelection:
+class VisibleGpuSelection(Generic[_DeviceT]):
     """Résolution déterministe de ``CUDA_VISIBLE_DEVICES``."""
 
-    devices: tuple[GpuVramSample, ...]
+    devices: tuple[_DeviceT, ...]
     unresolved: tuple[str, ...]
     declared: bool
 
 
+# Jeton rapporté dans ``unresolved`` pour une liste contenant un élément vide
+# (``0,,1``) : la liste entière est refusée, pas « réparée ».
+EMPTY_TOKEN = "empty_token"
+
+
 def resolve_visible_devices(
-    gpus: Sequence[GpuVramSample],
+    gpus: Sequence[_DeviceT],
     raw: str | None,
-) -> VisibleGpuSelection:
+) -> VisibleGpuSelection[_DeviceT]:
     """Résout une liste d'index ou d'UUID sans agréger hors périmètre.
 
     ``None`` signifie variable absente (tous les devices sont visibles), tandis
-    qu'une chaîne vide signifie variable explicitement définie mais sans GPU.
-    Comme CUDA, une liste est tronquée au premier token inconnu : le résultat
-    est toutefois marqué invalide par ``unresolved`` et ne peut pas être
-    considéré comme une mesure réussie.
+    qu'une chaîne vide — ou ``-1`` — signifie variable explicitement définie
+    mais sans GPU. Comme CUDA, une liste est tronquée au premier token inconnu :
+    le résultat est toutefois marqué invalide par ``unresolved`` et ne peut pas
+    être considéré comme une mesure réussie.
+
+    C'est l'UNIQUE résolveur du dépôt : ``doctor``, ``bootstrap.inventory`` et
+    l'attestation de calibration l'appellent, pour que leur verdict soit par
+    construction celui qui gouverne l'admission.
     """
     if raw is None:
         return VisibleGpuSelection(tuple(gpus), (), declared=False)
@@ -179,9 +205,9 @@ def resolve_visible_devices(
 
     tokens = [token.strip() for token in raw.split(",")]
     if any(not token for token in tokens):
-        return VisibleGpuSelection((), ("empty_token",), declared=True)
+        return VisibleGpuSelection((), (EMPTY_TOKEN,), declared=True)
 
-    selected: list[GpuVramSample] = []
+    selected: list[_DeviceT] = []
     for token in tokens:
         if token.isdigit():
             match = next((gpu for gpu in gpus if gpu.index == int(token)), None)
@@ -192,6 +218,86 @@ def resolve_visible_devices(
         if match not in selected:
             selected.append(match)
     return VisibleGpuSelection(tuple(selected), (), declared=True)
+
+
+# Verdicts de périmètre : mêmes codes que ``GpuVramMeasurement.reason``.
+SCOPE_OK = "ok"
+SCOPE_MIG_UNSUPPORTED = "mig_unsupported"
+SCOPE_INVALID = "cuda_visible_devices_invalid"
+SCOPE_EMPTY = "cuda_visible_devices_empty"
+
+
+def requests_mig(raw: str | None) -> bool:
+    """Le scope désigne-t-il explicitement une instance MIG (``MIG-…``) ?"""
+    return bool(raw) and any(
+        token.strip().upper().startswith(_MIG_UUID_PREFIX)
+        for token in (raw or "").split(",")
+    )
+
+
+@dataclass(frozen=True)
+class VisibleScope(Generic[_DeviceT]):
+    """Verdict du runtime sur un ``CUDA_VISIBLE_DEVICES`` donné."""
+
+    reason: str
+    selection: VisibleGpuSelection[_DeviceT]
+
+    @property
+    def devices(self) -> tuple[_DeviceT, ...]:
+        return self.selection.devices
+
+    @property
+    def unresolved(self) -> tuple[str, ...]:
+        return self.selection.unresolved
+
+    @property
+    def declared(self) -> bool:
+        return self.selection.declared
+
+
+def assess_visible_scope(
+    gpus: Sequence[_DeviceT],
+    raw: str | None,
+) -> VisibleScope[_DeviceT]:
+    """Verdict de périmètre, dans l'ordre exact appliqué par ``probe_gpu_memory``.
+
+    Ordre : un élément vide ou un jeton non-MIG non résolu rend la valeur
+    INVALIDE, même mêlée à un jeton MIG (``0,,MIG-x``, ``7,MIG-x``) ; sinon MIG
+    (jeton ``MIG-…`` ou device sélectionné en mode MIG) ; puis un scope déclaré
+    qui n'expose rien. Un jeton ``MIG-…`` n'est PAS vérifié : ``--query-gpu``
+    ne liste que les GPU parents et le runtime ne lance pas ``nvidia-smi -L`` —
+    une coquille dans un UUID MIG reste donc « MIG », pas « invalide ».
+    ``mig_mode_current`` est lu s'il existe : un type projeté qui ne le porte
+    pas n'est jamais MIG par ce seul critère.
+    """
+    if requests_mig(raw):
+        tokens = [token.strip() for token in (raw or "").split(",")]
+        if any(not token for token in tokens):
+            selection: VisibleGpuSelection[_DeviceT] = VisibleGpuSelection(
+                (), (EMPTY_TOKEN,), declared=True
+            )
+        else:
+            others = [t for t in tokens if not t.upper().startswith(_MIG_UUID_PREFIX)]
+            selection = (
+                resolve_visible_devices(gpus, ",".join(others))
+                if others else VisibleGpuSelection((), (), declared=True)
+            )
+        reason = SCOPE_INVALID if selection.unresolved else SCOPE_MIG_UNSUPPORTED
+        return VisibleScope(reason, selection)
+
+    selection = resolve_visible_devices(gpus, raw)
+    if selection.unresolved:
+        reason = SCOPE_INVALID
+    elif any(
+        str(getattr(device, "mig_mode_current", "") or "").strip().lower() == "enabled"
+        for device in selection.devices
+    ):
+        reason = SCOPE_MIG_UNSUPPORTED
+    elif selection.declared and not selection.devices:
+        reason = SCOPE_EMPTY
+    else:
+        reason = SCOPE_OK
+    return VisibleScope(reason, selection)
 
 
 @dataclass(frozen=True)
@@ -406,6 +512,20 @@ def parse_nvidia_smi_csv(text: str) -> list[GpuVramSample]:
     return samples
 
 
+def parse_nvidia_smi_rows(text: str) -> tuple[list[GpuVramSample], int]:
+    """Comme ``parse_nvidia_smi_csv``, avec le nombre de lignes irrécupérables.
+
+    Pour les appelants qui doivent refuser une sortie partiellement illisible
+    plutôt que de raisonner sur les seules lignes comprises.
+    """
+    return _parse_rows(text)
+
+
+def nvidia_smi_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Environnement d'un ``nvidia-smi`` d'inventaire (voir ``_subprocess_environment``)."""
+    return _subprocess_environment(source)
+
+
 def _subprocess_environment(source: Mapping[str, str]) -> dict[str, str]:
     """Demande l'inventaire physique, jamais l'inventaire déjà filtré."""
     environment = dict(source)
@@ -420,20 +540,21 @@ def _subprocess_environment(source: Mapping[str, str]) -> dict[str, str]:
 def _decorate_scope(
     samples: Sequence[GpuVramSample],
     raw: str | None,
-) -> tuple[tuple[GpuVramSample, ...], VisibleGpuSelection]:
-    selection = resolve_visible_devices(samples, raw)
+) -> tuple[tuple[GpuVramSample, ...], VisibleScope[GpuVramSample]]:
+    scope = assess_visible_scope(samples, raw)
+    selection = scope.selection
     visible_uuids = {device.uuid for device in selection.devices}
     decorated = tuple(
         replace(device, visible=device.uuid in visible_uuids) for device in samples
     )
     by_uuid = {device.uuid: device for device in decorated}
-    return decorated, VisibleGpuSelection(
+    return decorated, VisibleScope(scope.reason, VisibleGpuSelection(
         # L'ordre déclaré est un élément du contrat CUDA : ``1,0`` renumérote
         # les devices dans cet ordre et ne doit pas redevenir l'ordre physique.
         tuple(by_uuid[device.uuid] for device in selection.devices),
         selection.unresolved,
         selection.declared,
-    )
+    ))
 
 
 async def probe_gpu_memory(
@@ -534,13 +655,16 @@ async def probe_gpu_memory(
     # ``--query-gpu`` ne décrit pas correctement les instances MIG enfants.
     # Refuser aussi un scope MIG explicite, même si nvidia-smi ne renvoie que
     # l'UUID du GPU parent, plutôt que d'attribuer sa VRAM entière à l'instance.
-    if raw and any(
-        token.strip().upper().startswith(_MIG_UUID_PREFIX)
-        for token in raw.split(",")
+    # Une valeur mêlant MIG et jeton invalide (``7,MIG-x``) reste invalide :
+    # elle suit le verdict partagé plus bas.
+    if (
+        requests_mig(raw)
+        and assess_visible_scope(samples, raw).reason == SCOPE_MIG_UNSUPPORTED
     ):
         return GpuVramMeasurement.unavailable("mig_unsupported", raw, devices=samples)
 
-    decorated, selection = _decorate_scope(samples, raw)
+    decorated, scope = _decorate_scope(samples, raw)
+    selection = scope.selection
     if malformed:
         return GpuVramMeasurement.unavailable(
             "nvidia_smi_parse_error",
@@ -564,17 +688,16 @@ async def probe_gpu_memory(
             devices=decorated,
             visible_uuids=[device.uuid for device in selection.devices],
         )
-    if any(
-        device.mig_mode_current.strip().lower() == "enabled"
-        for device in selection.devices
-    ):
+    # Verdict de périmètre partagé (``assess_visible_scope``) : doctor,
+    # bootstrap.inventory et l'attestation de calibration rendent le même.
+    if scope.reason == SCOPE_MIG_UNSUPPORTED:
         return GpuVramMeasurement.unavailable(
             "mig_unsupported",
             raw,
             devices=decorated,
             visible_uuids=[device.uuid for device in selection.devices],
         )
-    if selection.unresolved:
+    if scope.reason == SCOPE_INVALID:
         return GpuVramMeasurement.unavailable(
             "cuda_visible_devices_invalid",
             raw,
@@ -582,7 +705,7 @@ async def probe_gpu_memory(
             visible_uuids=[device.uuid for device in selection.devices],
             detail=selection.unresolved[0],
         )
-    if raw is not None and not selection.devices:
+    if scope.reason == SCOPE_EMPTY:
         return GpuVramMeasurement.unavailable(
             "cuda_visible_devices_empty", raw, devices=decorated
         )
