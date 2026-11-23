@@ -71,12 +71,12 @@ et la qualité des releases.
 - mode cluster avec scheduler, health checks, réconciliation et failover ;
 - dépendances verrouillées, audit CVE et tests d’invariants nombreux.
 
-### Vérification locale du 3 septembre 2026
+### Vérification locale du 23 novembre 2026
 
 | Composant | Résultat |
 |---|---:|
-| Tests gateway | 2513 réussis, 3 ignorés pour dépendances d’environnement |
-| Tests node agent | 67 réussis |
+| Tests gateway | 3030 réussis, 3 ignorés pour dépendances d’environnement (Python 3.14 local, et Python 3.11 avec les dépendances verrouillées de la CI) |
+| Tests node agent | 127 réussis |
 | Ruff gateway et node agent | OK |
 | GPU physique / nginx réel / runtime amont épinglé | Non démontré dans cet audit |
 | Modèle distribué sur plusieurs nœuds | Non supporté actuellement |
@@ -214,6 +214,68 @@ présentes dans les modèles de données ou dans les tests :
 - négociation de version et de capabilities du protocole agent ;
 - agrégation des métriques par `(node, deployment, model)` sans écrasement ;
 - câblage réel de `pin_to_node` ou retrait de cette promesse documentaire.
+
+### Audit performance et qualité du 23 novembre 2026
+
+Un audit de lecture, mesuré sur une base de test puis corrigé dans la foulée,
+a porté sur le chemin chaud, le mode cluster, l'outillage bootstrap/admin et
+les arbres de déploiement. Chaque correctif a son test de régression, et
+chaque lot a été relu par un relecteur indépendant de celui qui l'a écrit.
+
+Corrigé :
+
+- **Cluster.** `CLU-001` était marqué corrigé à tort sur deux points :
+  `unload_uncertain` n'avait aucune sortie quand le nœud confirmait le modèle
+  encore prêt, et l'unload admin d'une copie sans placement ne déchargeait
+  rien tout en annonçant la VRAM libérée. Les deux le sont désormais. Sont
+  aussi corrigés : pins perdus lors d'un re-placement ou d'un heartbeat
+  périmé (un modèle en plein stream pouvait être évincé), VRAM et ports
+  comptés deux fois pendant et après un chargement, échec propre à un modèle
+  compté comme panne de nœud, réservations de chargement jamais purgées,
+  opération d'agent périmée annoncée prête sur un port réattribué, drapeau
+  `evicting` bloqué après annulation, budget de temps d'unload
+  (`CLUSTER_UNLOAD_TIMEOUT`). Le fake des tests implémente maintenant le
+  protocole d'opérations : la suite passe par le chemin de production, et les
+  chemins de chargement hérités sont supprimés.
+- **Chemin chaud.** Réglages SQLite de session appliqués à toutes les
+  connexions (`synchronous=NORMAL` ne l'était qu'à la migration), connexions
+  longues par rôle pour l'authentification, le quota et les écritures, index
+  couvrant pour le quota (migration 3), `last_used` écrit au plus une fois par
+  clé et par minute, statistiques du dashboard bornées à 7 jours, un événement
+  SSE relayé en une seule écriture, annulation de la requête amont quand le
+  client d'une requête non streamée se déconnecte (ligne d'usage 499), JSON
+  volumineux traité par tranches pour ne plus figer les autres flux, sonde de
+  santé progressive au chargement, `report_backend_failure` réservé aux
+  backends réellement injoignables.
+- **Bootstrap et admin.** `bootstrap-apply` valide le registre avec
+  `ALLOWED_MODEL_DIRS` du service (absolu, non vide) au lieu de
+  `--models-dir` seul ; client HTTP de la recette qui garde le statut d'une
+  réponse non JSON ; éditeur de `models.yaml` sans repli de ligne, qui remplace
+  les valeurs multi-lignes en entier et refuse toute retouche qui perdrait un
+  commentaire ; reprise automatique d'un rollback bootstrap refusé ; `fsync`
+  avant le renommage d'un GGUF téléchargé et un seul hachage par exécution ;
+  purge des sauvegardes du registre ordonnée par date ; validation de chemin
+  qui échoue fermée quand la résolution lève.
+- **Déploiement et GPU.** `smoke_test.sh` et `llm-gateway-backup.sh` n'existent
+  plus que dans `deploy/` ; `doctor`, l'inventaire bootstrap et l'attestation
+  de calibration utilisent le résolveur `CUDA_VISIBLE_DEVICES` de la sonde
+  d'exécution, donc rendent le même verdict.
+
+Reste ouvert, constaté pendant ce travail :
+
+| ID | Priorité | Constat | Conséquence | Acceptation minimale |
+|---|:---:|---|---|---|
+| `OPS-013` | P1 | Toute migration de schéma, même un simple index comme la migration 3, rend fatal le rollback automatique de code d'`update.sh` : l'ancien code refuse une base plus récente que lui | Une recette en échec après mise à jour laisse le service arrêté jusqu'à restauration manuelle de la sauvegarde `.pre-migration` | Rollback qui restaure aussi la base, ou migrations rétro-compatibles déclarées comme telles et tolérées par l'ancien code |
+| `PERF-009` | P2 | Le traitement JSON par tranches ne découpe que les tableaux de premier niveau | Une réponse d'embeddings sans pooling de 5,4 Mo fige encore la boucle 58 ms | Découpage des tableaux imbriqués, ou relais sans réencodage quand rien n'est à réécrire |
+| `PERF-010` | P2 | Les gains SQLite sont mesurés sur macOS, sans `fsync` réel | Le gain de `synchronous=NORMAL` sur Linux n'est pas chiffré | Mesure sur le matériel de staging (à joindre à `TST-004`) |
+| `CLU-006` | P2 | Une opération d'agent encore en attestation, donc sans manager, survit à un `unload-all` et peut charger son modèle ensuite | Modèle rechargé après un déchargement global ; l'inventaire le réadopte | `unload-all` annule aussi les opérations sans manager |
+| `GPU-003` | P3 | Un identifiant MIG n'est pas confronté à `nvidia-smi -L` ; `production.py::read_vram` garde sa propre analyse de `nvidia-smi` | Une faute de frappe dans un UUID MIG n'est qu'un avertissement de `doctor` | Vérification des UUID MIG, dernière analyse dupliquée supprimée |
+| `TST-008` | P2 | `ruff` ne vérifie que E et F ; ni typage ni couverture en CI ; la suite gateway attend plus qu'elle ne calcule | 77 `except` trop larges et 59 fonctions trop complexes ne sont pas surveillés | Règles `B`, `ASYNC` et `RUF006` activées par paliers ; décision sur un vérificateur de types et sur `pytest-xdist` (dépendances à verrouiller) |
+| `COR-031` | P3 | `_build_applier_config` (plus de 300 lignes, 28 paramètres) vit dans le module CLI ; `bootstrap_sync_model` porte trois machines d'état | Logique de câblage difficile à tester sans Typer | Câblage déplacé dans `bootstrap/production.py`, handler découpé |
+
+`OBS-002` reste ouvert et précisé : le chemin non streamé n'écrit toujours
+aucune ligne d'usage quand le backend répond 502 ou 504, contrairement au
+chemin streaming.
 
 ## 5. Vision produit
 
@@ -569,7 +631,8 @@ schémas admin stricts, projecteur vision obligatoire et attesté, invariants de
 configuration au démarrage) ; CLU-001, CLU-003 et CLU-005 le sont (lot 4 —
 protocole cluster identifié : digest/génération/opération obligatoires, polling
 d'opération, unload incertain exposé 503). Le jalon R0 est complet ; restent
-hors R0 : SEC-006, TST-004, TST-005 (R1).
+hors R0 : SEC-006, TST-004, TST-005 (R1). CLU-001 n'a réellement été complet
+que le 23 novembre 2026 : voir « Audit performance et qualité » en section 4.
 
 ### R1 — preuve terrain et cluster qualifié
 

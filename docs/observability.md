@@ -476,5 +476,12 @@ sqlite3 /var/lib/llm-gateway/gateway.db \
      FROM usage_log WHERE request_id = 'commande-4815';"
 ```
 
+Un `status_code` à `499` signifie que le client a raccroché avant la fin :
+en streaming comme en non-streaming, la génération upstream est alors
+interrompue (connexion vers `llama-server` fermée). Les tokens ne sont
+généralement pas comptés : llama.cpp ne publie l'usage qu'en fin de
+génération. En non-streaming, le journal d'accès de la gateway affiche aussi
+`499` ; en streaming, il a déjà écrit `200` au premier octet.
+
 Les métriques, elles, ne portent **jamais** l'identifiant de requête : ce
 serait un label à cardinalité non bornée, et Prometheus n'est pas un journal.

@@ -700,6 +700,12 @@ Client A        Client B        FastAPI         ModelManager
 subprocess (`asyncio.Lock`), tous les waiters repartent ensemble
 (`asyncio.Event`).
 
+La sonde `/health` du chargement est progressive : première sonde immédiate,
+puis 100 ms, intervalle ×1,5 plafonné à 1 s
+(`server_manager.HEALTH_POLL_*`). L'ancien intervalle fixe de 2 s ajoutait
+jusqu'à 2 s à chaque démarrage à froid. La détection de crash et les messages
+d'erreur assainis sont inchangés.
+
 ---
 
 ## Pool de ports dynamique
@@ -969,12 +975,45 @@ Le mode WAL permet des lectures concurrentes pendant les écritures (auth
 pendant le log d'usage).
 
 ```sql
--- Pragmas appliqués (database.py)
+-- Persistant, posé à l'initialisation (database.py, _PRAGMAS)
 PRAGMA journal_mode = WAL;       -- concurrent reads + single writer
-PRAGMA synchronous  = NORMAL;    -- performance sans risque de corruption
+-- Par connexion, posés à CHAQUE ouverture (_SESSION_PRAGMAS)
+PRAGMA synchronous  = NORMAL;    -- un fsync au checkpoint, pas à chaque COMMIT
 PRAGMA cache_size   = -65536;    -- 64MB cache mémoire
+PRAGMA temp_store   = MEMORY;
 PRAGMA foreign_keys = ON;        -- intégrité référentielle
+PRAGMA busy_timeout = 5000;      -- attend le verrou au lieu d'échouer
+PRAGMA secure_delete = ON;       -- effacement réel (anonymisation, rétention)
 ```
+
+`synchronous`, `cache_size` et `temp_store` sont des réglages de connexion :
+jusqu'à 2026-11 ils n'étaient posés que sur la connexion de migration, et tout
+le trafic tournait en `synchronous=FULL` avec un cache de 2 Mo. En WAL,
+`NORMAL` ne peut pas corrompre la base ; une coupure de courant peut perdre
+les dernières transactions validées (lignes d'usage récentes).
+
+**Connexions du chemin chaud.** Trois connexions aiosqlite longues, une par
+rôle : `read` (`lookup_key`), `quota` (`tokens_used_last_30_days`) et `write`
+(`touch_key_last_used`, `log_usage`). Elles sont ouvertes par le lifespan et
+fermées au shutdown **après** le flush des tâches d'arrière-plan. Elles sont en
+autocommit et chaque lecture est consommée en un seul aller-retour : aucune
+transaction ne reste ouverte, donc une révocation écrite par la CLI (autre
+processus) est vue dès la requête suivante — il n'y a pas de cache
+d'authentification. Les rôles sont séparés parce qu'aiosqlite exécute tout sur
+un thread par connexion. Une écriture qui attend le verrou (purge de
+rétention, CLI) ne retarde donc pas l'authentification. Une somme de quota
+(15 ms pour 800 000 lignes sur 30 jours) ne retarde pas non plus les
+authentifications concurrentes, qui passaient sinon de 0,1 ms à 15 ms. La fermeture attend
+les opérations en cours sur chaque connexion (bornée, avec un avertissement
+au-delà) ; une tâche qui survit au flush passe ensuite par une connexion
+dédiée, refermée aussitôt. Tout travail multi-instructions (anonymisation,
+migrations, rapports, `VACUUM`) garde une connexion dédiée (`get_db()`).
+Remplacer `gateway.db` exige d'arrêter le service, comme la procédure de
+restauration le prévoit déjà. Plancher : aiosqlite 0.22 (`Connection.stop()`).
+
+`api_keys.last_used` est écrit au plus une fois par clé et par minute
+(`auth.LAST_USED_DEBOUNCE_SECONDS`) : sa précision est d'environ une minute.
+L'historique exact des appels est dans `usage_log`.
 
 ### Schéma
 
@@ -992,13 +1031,22 @@ usage_log
   model, prompt_tokens, completion_tokens, total_tokens
   duration_ms, status_code, request_id
 
-Index : usage_log(user_id, timestamp), usage_log(timestamp),
+Index : usage_log(user_id, timestamp, total_tokens), usage_log(timestamp),
         api_keys(key_hash), api_keys(user_id)
 ```
 
 Le champ `model` dans `usage_log` stocke l'ID du modèle tel que résolu
 par le routing (ex : `"llama-3.3-70b-instruct"`), permettant les rapports
 d'usage par modèle.
+
+L'index `idx_usage_user_time_tokens` (migration 3) **couvre** le contrôle de
+quota mensuel, exécuté à chaque requête d'un compte limité : la somme des
+`total_tokens` sur 30 jours est lue dans l'index, sans accès à la table
+(21 ms → 3,6 ms pour 200 000 lignes sur la fenêtre). Il remplace
+`idx_usage_user_time`, son préfixe strict. L'aperçu du dashboard
+(`get_overview_stats`, rafraîchi toutes les 30 s par onglet) borne son
+parcours à sa fenêtre la plus large, 7 jours, par un prédicat sur
+`idx_usage_timestamp` au lieu de lire toute la table.
 
 ### Migrations versionnées
 
@@ -1231,6 +1279,25 @@ Client             nginx               FastAPI             llama-server
   │◄── data: [DONE] ─│                    │                      │
 ```
 
+**Cadrage.** Chaque événement SSE du backend (ses lignes non vides, jusqu'à la
+ligne vide) est relayé en **un seul** chunk et un seul envoi ASGI : lignes
+jointes par `\n`, terminateur `\n\n`. Le relais ligne à ligne émettait deux
+envois par token (la ligne, puis un `\n` isolé), soit trois sauts de ligne
+côté client, et aurait coupé un événement multi-lignes (`event:` + `data:`).
+Seules les lignes `data:` JSON sont réécrites (`model` public, capture de
+`usage`, TTFT) ; un dernier événement sans ligne vide finale est relayé tel
+quel.
+
+**Échecs du data-plane.** Un timeout renvoie `504`, une autre erreur de
+transport `502`, comme avant. Mais seul un échec qui **prouve** un backend
+injoignable — connexion refusée ou trop lente (`ConnectError`,
+`ConnectTimeout`), socket coupée (`ReadError`, `WriteError`), protocole rompu
+(`RemoteProtocolError`) — est signalé au gestionnaire
+(`report_backend_failure`) : en mode cluster, ce signal invalide le placement
+et déclenche évictions et rechargement à froid. Un `ReadTimeout` (génération
+plus longue que `read=600s`) ou un `PoolTimeout` (pool de la gateway saturé)
+ne le déclenchent plus.
+
 **Points critiques nginx :**
 ```nginx
 proxy_buffering        off;
@@ -1295,6 +1362,34 @@ Le pool keep-alive évite un handshake TCP par requête vers
 `client.post(...)` ; le mode streaming l'emprunte via `client.stream(...)` le
 temps du stream puis la rend au context-exit. Seule la connexion empruntée est
 libérée — le client partagé reste ouvert.
+
+**Déconnexion du client en non-streaming.** uvicorn n'annule pas un handler
+non streamant quand le client raccroche : la génération allait à son terme,
+slot GPU occupé et modèle pinné, pour une réponse que personne ne lirait
+(sans borne si `MAX_NEW_TOKENS_PER_REQUEST=0`). L'appel upstream court donc
+contre l'arrivée de `http.disconnect` sur le canal `receive` de la requête
+(le corps est déjà lu : c'est le seul message possible). Si la déconnexion
+gagne, la requête httpx est annulée — la connexion fermée libère le slot
+llama.cpp —, une ligne d'usage `499` est écrite comme en streaming, et le pin
+est relâché par le `finally` habituel. Vérifié sous un vrai uvicorn (h11 et
+httptools) avec le middleware HTTP de `main.py` (`BaseHTTPMiddleware`), en
+FastAPI 0.136/Starlette 1.2 comme aux versions verrouillées (0.141/1.3) ;
+le mécanisme dépend du relais de `http.disconnect` par ce middleware, couvert
+par `tests/test_non_stream_proxy.py`.
+
+**Grosses réponses JSON.** Au-delà de 256 Kio (embeddings), le parse, la
+réécriture de `model` et la sérialisation ne se font plus d'un seul tenant.
+Le premier niveau du document est parcouru à la main, et chaque tableau de
+premier niveau est traité en appels C bornés. Un tableau de petits éléments
+(`/v1/tokenize`) est découpé en fenêtres d'environ 64 Kio. Un tableau de gros
+éléments (vecteurs d'embeddings) est traité élément par élément. La main est
+rendue à la boucle toutes les 2 ms. Le coût CPU total reste proche de celui
+des codecs C, à 10–20 % près. `asyncio.to_thread` n'aurait rien changé : les
+codecs C du module `json` gardent le GIL pendant tout l'appel (mesuré : même
+gel de 84 ms pour 5,5 Mo). Les octets renvoyés sont identiques à ceux de
+`JSONResponse`. Limite connue : un gros tableau imbriqué plus bas que le
+premier niveau (embeddings sans pooling, `{"data":[{"embedding":[[…]]}]}`)
+reste traité d'un bloc.
 
 Dimensionnement (bornes `httpx.Limits`, réglables par variable d'environnement) :
 
@@ -1599,8 +1694,10 @@ rechargements redondants.
 
 L'`internal_api_key` du `llama-server` n'étant pas exposée par `status()`, une
 entrée réconciliée porte une clé vide (sentinelle « à rafraîchir »). À la première
-requête sur ce modèle, un `load_model()` **idempotent** (`already_loaded` côté
-agent, pas de rechargement réel) récupère la vraie clé et l'URL de confiance.
+requête sur ce modèle, un chargement **idempotent** (`start_load_model`,
+`already_loaded` côté agent, pas de rechargement réel) récupère la vraie clé et
+l'URL de confiance. L'entrée existante est mise à jour **en place** : les
+handles déjà distribués gardent leurs pins.
 L'URL `llama-server` est toujours reconstruite à partir de l'hôte du `base_url`
 du nœud (source de confiance `nodes.yaml`), jamais d'une valeur renvoyée par
 l'agent.
@@ -1622,7 +1719,64 @@ cluster) :
   `ClusterUnloadUncertainError` au lieu d'annoncer une VRAM libérée à tort ;
 - toute nouvelle tentative de chargement échoue immédiatement — pas de routage
   vers une URL potentiellement disparue, pas de copie du modèle sur un autre
-  nœud — jusqu'à ce qu'un heartbeat ou un re-sync confirme la disparition.
+  nœud — jusqu'à ce que l'incertitude soit levée.
+
+Le heartbeat la lève dans les deux sens. Si le nœud ne rapporte plus le
+modèle, la disparition est confirmée et l'entrée purgée. S'il le rapporte
+encore, le heartbeat déclenche un `GET /agent/status` : un modèle `ready` sous
+la **même** `generation_id` prouve que l'unload n'a pas eu lieu, le drapeau est
+retiré et le modèle redevient routable. Une autre génération ne lève pas le
+drapeau.
+
+`POST /admin/models/{id}/unload` décharge **toutes** les copies suivies du
+modèle sur les nœuds online (route primaire, doublon revenu d'un nœud offline,
+copie suspecte ou ancienne génération retirée du placement), et refuse en bloc
+(409) si l'une d'elles traite encore une requête. Les nœuds offline sont
+sautés et journalisés ; leur copie est réconciliée comme doublon évictable à
+leur retour. Avant, seul `_placement` était consulté : une copie suspecte ou
+d'ancienne génération restait en VRAM alors que la route annonçait « VRAM
+libérée ».
+
+### Inventaire, pins et comptabilité VRAM (audit cluster 2026-11)
+
+- **Pins préservés.** Un replacement sur le nœud qui détient déjà l'entrée
+  (réponse `already_loaded`, refresh d'une entrée suspecte ou réconciliée) met
+  à jour le `_LoadedInfo` existant au lieu d'en créer un neuf : un stream en
+  cours reste compté et son modèle n'est jamais évincé.
+- **Heartbeat périmé ignoré.** La révision d'inventaire est capturée avant
+  `health()` ; si un load, un unload ou une invalidation a eu lieu pendant le
+  round-trip, la réponse n'est appliquée ni à l'inventaire ni à
+  `last_health`. Une entrée qu'un inventaire ne rapporte plus mais qui a des
+  requêtes actives n'est jamais jetée : elle perd sa route primaire, devient
+  suspecte, puis est réadoptée en place ou purgée une fois les requêtes
+  terminées.
+- **Copie existante réutilisée.** Après un échec data-plane, le replacement
+  tente d'abord un chargement idempotent sur un nœud qui sert déjà la même
+  définition (aucune VRAM supplémentaire), avant le scheduler. Une alternative
+  saine capable d'accueillir le modèle reste prioritaire sur le nœud suspect.
+  Avant, sur un nœud unique, une seule erreur réseau provoquait un 503 (copie
+  pinnée) ou deux évictions et un rechargement à froid.
+- **Pas de double comptage.** L'agent compte un modèle LOADING dans sa VRAM,
+  ses ports et `loaded_model_ids`. Le scheduler ne retranche une réservation
+  `pending_loads` que si le dernier health ne la publie pas encore, et les
+  deltas locaux appliqués après un load ou un unload sont ignorés quand le
+  health courant reflète déjà le changement.
+- **Réservations orphelines purgées.** Une réservation laissée par un load
+  annulé est retirée dès que `status()` rapporte le modèle `ready` ou absent
+  (un POST jamais acquitté reste couvert par la grâce de 30 s). Le heartbeat
+  déclenche ce `status()` dès qu'une réservation n'apparaît pas dans
+  `loaded_model_ids` ou que sa grâce est échue : un load terminé en `failed`
+  n'y apparaît jamais, et sa réservation restait sinon à vie. Un unload
+  confirmé du modèle sur ce nœud la purge aussi, de même qu'un échec de
+  finalisation (unload global concurrent, réponse READY incomplète). Un
+  unload-all ne la jette **pas** à l'aveugle : l'agent ne décharge que les
+  managers existants, et une opération encore en validation lui survit ; c'est
+  l'inventaire suivant qui tranche.
+- **`evicting` jamais orphelin.** `_do_unload` remet `evicting=False` sur toute
+  issue, annulation comprise (y compris pendant la re-synchronisation
+  `health()` d'un unload admin), et une série d'évictions interrompue le remet
+  sur toutes ses victimes. La boucle de placement cède la main à chaque replan
+  et s'arrête après 64 tentatives.
 
 ### Protocole de chargement identifié (CLU-003, CLU-005)
 
@@ -1640,11 +1794,38 @@ Conséquences opérationnelles :
 
 - **Acceptation puis polling.** Le POST ne bloque plus sur le chargement : il
   retourne `202` (`state="accepted"`) dès que l'agent a réservé le travail.
-  L'orchestrateur interroge ensuite `GET /agent/operations/{operation_id}`
-  (`wait_for_operation`), avec progression (`progress`) et états terminaux
-  `ready`, `failed`, `conflict`, `deadline_exceeded`. Un timeout du RPC initial
-  ne crée plus de doublon : le même `operation_id` est réinterrogé, jamais
-  relancé sur un autre nœud.
+  L'orchestrateur interroge ensuite `GET /agent/operations/{operation_id}`,
+  avec progression (`progress`) et états terminaux `ready`, `failed`,
+  `conflict`, `deadline_exceeded`. Un timeout du RPC initial ne crée plus de
+  doublon : le même `operation_id` est réinterrogé, jamais relancé sur un autre
+  nœud. C'est l'unique chemin de chargement : l'ancien `load_model()` bloquant
+  a été retiré du client et de l'agent.
+- **Un résultat `ready` reste lié à son llama-server.** L'agent ne répond
+  `ready` (au GET comme au rejeu du POST) que tant que le manager qui l'a
+  produit est encore le manager READY du modèle. Après un unload, l'opération
+  répond `failed` (`error_code="unloaded"`) : son port, rendu au pool, peut
+  servir un autre modèle.
+- **Un `failed` n'est pas une panne de nœud.** L'agent a répondu : un état
+  `failed`/`deadline_exceeded` ne compte jamais vers le seuil offline. Il porte
+  `error_status` (champ additif : 422 artefact ou définition, 500 llama-server,
+  503 capacité du nœud, 504 échéance). L'orchestrateur tente les autres nœuds.
+  Un nœud qui échoue pour une raison propre au modèle (statut connu hors
+  409/429/503) est écarté **10 s** du placement de ce digest, nœud par nœud :
+  un nœud sain momentanément plein reste candidat. La requête n'échoue
+  immédiatement (« échec récent ») que si **tous** les nœuds online sont
+  écartés ; les requêtes en file partagent alors l'échec au lieu de rejouer
+  le chargement sur tout le cluster. Un `failed` sans `error_status` (agent
+  antérieur, en mise à jour progressive) n'est jamais mémorisé : il pourrait
+  s'agir d'une capacité. `ClusterManager.forget_load_failures(model_id)` oublie
+  ces échecs (chargement admin après correction de l'artefact). Avant, trois
+  requêtes pour un GGUF absent passaient tous les nœuds OFFLINE.
+- **Changement de définition.** Une ancienne génération du même modèle sur le
+  nœud choisi est déchargée avant le chargement de la nouvelle ; le scheduler
+  compte sa VRAM et son port comme libérables. Si elle traite encore des
+  requêtes, ce nœud est écarté ; sans autre nœud possible, le client reçoit
+  `ClusterLoadConflictError` (503) jusqu'à la fin de ces requêtes. Avant, le
+  modèle restait bloqué sur un 409 de l'agent jusqu'à un unload manuel, lui-même
+  sans effet.
 - **Une nouvelle définition ne peut plus servir une ancienne génération.** Si le
   digest reçu diffère de celui du modèle actif (ou de l'opération en cours), le
   node agent refuse le POST en **HTTP 409** (conflit d'identité ; le même code
@@ -1677,7 +1858,10 @@ Conséquences opérationnelles :
   évictable.
 
   ⚠️ `POST /admin/models/{id}/unload` ne purge **pas** une réservation en
-  cours : la purge reste pilotée par les bornes ci-dessus.
+  cours : la purge reste pilotée par les bornes ci-dessus. Une réservation
+  orpheline (load annulé) est en revanche purgée par l'inventaire ou par un
+  unload confirmé du modèle sur ce nœud (section « Inventaire, pins et
+  comptabilité VRAM »).
 - **Définition inchangée = chargement idempotent.** Digest et génération
   identiques → l'agent répond `already_loaded=True` sans redémarrer
   `llama-server`.

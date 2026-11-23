@@ -615,6 +615,11 @@ curl -sN https://gateway.example.com/v1/chat/completions \
 # data: [DONE]
 ```
 
+Chaque événement SSE est terminé par exactement une ligne vide (`\n\n`), et un
+événement du backend sur plusieurs lignes (`event:` + `data:`) arrive entier.
+Fermer la connexion interrompt la génération côté serveur, en streaming comme
+sans streaming : un client qui abandonne ne consomme plus de GPU.
+
 ### Modèles de raisonnement et appels d'outils
 
 Les backends compatibles DeepSeek peuvent séparer la phase de raisonnement de

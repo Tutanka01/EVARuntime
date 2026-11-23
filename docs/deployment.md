@@ -58,20 +58,38 @@ Cette règle est appliquée par un garde automatique,
 cd gateway && python -m pytest tests/test_deploy_trees_parity.py -v
 ```
 
-Le garde maintient un manifeste des huit fichiers communs avec trois
-politiques : **miroir** (`smoke_test.sh`, `llm-gateway-backup.sh` — identiques
-modulo les chemins plateformes), **fonctions partagées** (libs divergentes par
+`smoke_test.sh` et `llm-gateway-backup.sh` ont une **source unique** dans
+`gateway/deploy/` : ils ne différaient que par leurs chemins par défaut, qu'ils
+choisissent désormais à l'exécution (`uname -s` : `Darwin` → `~/.config/evaruntime/env`
+et `~/Library/Application Support/evaruntime/…`, sinon `/etc/llm-gateway/env` et
+`/var/lib/llm-gateway/…` ; `LLM_GATEWAY_CONFIG_DIR`, `--env-file`, `DB_PATH` et
+`BACKUP_DIR` restent prioritaires). `deploy-macos/` n'en a aucune copie :
+`deploy-macos/install.sh` et `update.sh` les installent depuis `deploy/` dans
+`~/Library/Application Support/evaruntime/gateway/deploy/`, avec le
+`deploy-mode-lib.sh` que la recette source, et `deploy-macos/update.sh` exécute
+`deploy/smoke_test.sh`. Relance en incident sur macOS (utilisateur courant, sans
+`sudo`) :
+
+```bash
+bash "$HOME/Library/Application Support/evaruntime/gateway/deploy/smoke_test.sh"
+```
+
+Pour les six fichiers encore présents dans les deux arbres, le garde maintient
+un manifeste à deux politiques : **fonctions partagées** (libs divergentes par
 nature dont les fonctions communes restent comparées) et **divergence
 déclarée** (`install.sh`, `update.sh`, … — justification écrite dans le
-manifeste). Il vérifie aussi les invariants transverses : chaque `update.sh`
-exécute le smoke test de **son** arbre, le signal SEC-002
-(`DEPLOY_HARDENING_KEYS`) est porté par les deux copies, aucun chemin Linux ne
-réside dans `deploy-macos/`, et les scripts des deux arbres passent `bash -n`.
+manifeste). Il vérifie aussi les invariants transverses : aucune copie d'un
+script à source unique ne réapparaît dans `deploy-macos/`, les deux installeurs
+livrent ces scripts et leurs libs depuis `deploy/`, les deux `update.sh`
+exécutent `deploy/smoke_test.sh`, le signal SEC-002 (`DEPLOY_HARDENING_KEYS`)
+est porté par les deux copies, aucun chemin Linux ne réside dans
+`deploy-macos/`, et les scripts des deux arbres passent `bash -n`.
 
 En cas d'échec du garde : porter le changement sur l'autre copie, ou — si la
 divergence est devenue légitime — la déclarer dans le manifeste avec sa
 justification. Tout nouveau fichier dupliqué doit être déclaré : un fichier
-commun non répertorié fait échouer la CI.
+commun non répertorié fait échouer la CI. Un fichier qui ne différerait que par
+ses chemins plateformes doit passer en source unique plutôt qu'être recopié.
 
 Les fichiers de **rôle équivalent mais de nom différent** — `deploy/nginx.conf`
 (référence) et `deploy-macos/nginx.conf.macOS` — échappent au mécanisme par nom
@@ -1224,7 +1242,9 @@ empreinte d'exemple.
 
    Avant toute mutation, la CLI recoupe trois chemins : `--registry` doit être
    le `MODELS_CONFIG_PATH` du service, le runtime publié doit être son
-   `LLAMA_SERVER_BIN`, et `--min-build` doit être strictement positif. Le secret
+   `LLAMA_SERVER_BIN`, et `--min-build` doit être strictement positif. Le
+   registre est validé avec `ALLOWED_MODEL_DIRS` de ce même fichier (pas avec
+   `--models-dir` seul), et `--models-dir` doit s'y trouver. Le secret
    admin est lu depuis `--env-file`; `/etc/llm-gateway/admin.secret` n'existe pas
    et n'est pas nécessaire. Après succès complet, la CLI publie atomiquement
    `LLAMA_SERVER_BIN` et `LLAMA_SERVER_MIN_BUILD` dans le même EnvironmentFile,
@@ -2029,7 +2049,10 @@ sudo bash /opt/llm-gateway/deploy/smoke_test.sh --json
 
 > Le script est copié dans `/opt/llm-gateway/deploy/` par `install.sh` et
 > `update.sh`. Sur une machine issue d'une ancienne version, le lancer depuis le
-> checkout : `sudo bash gateway/deploy/smoke_test.sh`.
+> checkout : `sudo bash gateway/deploy/smoke_test.sh`. Sur macOS, le même script
+> (source unique) est installé dans
+> `~/Library/Application Support/evaruntime/gateway/deploy/` et lit par défaut
+> `~/.config/evaruntime/env` : le lancer sans `sudo`.
 
 ##### Recette opt-in avec un vrai petit GGUF
 
@@ -2246,6 +2269,16 @@ peut avoir évolué et écraser la base sans arbitrage humain serait plus risqu�
 qu'utile. La sauvegarde `gateway-pre-update-*.db` reste disponible pour une
 restauration manuelle (voir [Sauvegardes SQLite](#14-sauvegardes-sqlite-et-restauration)).
 
+Conséquence à connaître **avant** une mise à jour qui apporte une migration de
+schéma : la nouvelle version migre la base à son premier démarrage, et
+l'ancienne version refuse de démarrer sur une base plus récente qu'elle
+(« rollback applicatif détecté »). Si la recette échoue ensuite, le rollback
+automatique restaure donc un code qui ne démarre pas, et la gateway reste à
+l'arrêt jusqu'à la restauration manuelle de `gateway-pre-update-*.db` (ou de la
+sauvegarde `*.pre-migration.*.bak`). C'est le cas de la migration 3, qui ne
+fait pourtant que remplacer un index (suivi `OPS-013` dans `ROADMAP.md`).
+Prévoyez la mise à jour sur une fenêtre où cette restauration est possible.
+
 ### Mettre à jour la configuration nginx
 
 Par défaut, `update.sh` ne touche pas au site nginx. L'option `--nginx` le
@@ -2261,11 +2294,22 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ### Comportements à vérifier avant une mise à jour
 
-Ces changements de durcissement peuvent concerner vos clients, vos scripts ou
-votre configuration. Aucun ne modifie le schéma de la base.
+Ces changements peuvent concerner vos clients, vos scripts ou votre
+configuration. Un seul modifie le schéma de la base : la migration 3, en tête
+du tableau.
 
 | Changement | À vérifier sur votre installation |
 |---|---|
+| Migration 3 du schéma SQLite : l'index du quota devient couvrant | Appliquée au premier démarrage, avec une sauvegarde `*.pre-migration.v2.*.bak`. La construction de l'index allonge ce démarrage sur une grosse table `usage_log`. Un retour à l'ancienne version exige de restaurer la base (voir [Rollback automatique](#rollback-automatique)). |
+| Les connexions SQLite du trafic passent en `synchronous=NORMAL` | Une coupure de courant peut perdre les dernières lignes d'usage validées, sans corruption de la base. |
+| Un événement SSE est relayé en un seul bloc terminé par une ligne vide | Un client qui comptait les lignes vides, ou qui attendait trois sauts de ligne entre deux événements, doit s'appuyer sur le format SSE standard. |
+| Une requête non streamée dont le client se déconnecte est annulée | La génération s'arrête, le journal d'accès et `usage_log` portent le statut `499`. Un script qui coupait la connexion en comptant sur la fin de la génération n'obtient plus de ligne d'usage facturée. |
+| `last_used` d'une clé est écrit au plus une fois par minute | Un rapport qui s'appuyait sur une précision à la seconde doit lire `usage_log`. |
+| `bootstrap-apply --registry` exige `ALLOWED_MODEL_DIRS`, en chemins absolus | Vide ou relatif, la commande sort en code 2, y compris en simulation. `--models-dir` doit être sous cette liste. Passez `--env-file` pour lire la configuration du service. |
+| `doctor` rend les mêmes verdicts GPU que la sonde d'exécution | `CUDA_VISIBLE_DEVICES=0,,1` échoue désormais ; une valeur MIG donne un avertissement non bloquant, sauf si le budget VRAM dépasse la mémoire physique de tout l'hôte, auquel cas `doctor` échoue. |
+| Cluster : `CLUSTER_UNLOAD_TIMEOUT` (30 s par défaut, au moins `CLUSTER_REQUEST_TIMEOUT`) | Une valeur explicite inférieure à `CLUSTER_REQUEST_TIMEOUT` empêche le démarrage. Gateway et node-agents doivent être mis à jour ensemble. |
+| Cluster : `POST /admin/models/{id}/unload` décharge toutes les copies suivies | Il répond `409` si l'une d'elles traite une requête. |
+| macOS : `smoke_test.sh` et `llm-gateway-backup.sh` ne sont plus dans `deploy-macos/` | Les lancer depuis `deploy/`, sans `sudo` ; les chemins installés ne changent pas. |
 | `/health` anonyme ne renvoie plus que `{"status": "ok"}` | Un monitoring ou un client qui lit `models_loaded` ou la VRAM doit passer à l'[exposition Prometheus](observability.md#2-exposition-prometheus) ou présenter `ADMIN_SECRET`. |
 | `max_tokens`, `max_completion_tokens` et `n_predict` négatifs, booléens ou non entiers sont refusés en `400` | Un client qui envoie `max_tokens: -1` doit omettre le champ. |
 | `DELETE /admin/keys/{prefix}` compare le préfixe à l'identique | Un script qui passe un préfixe partiel, ou qui révoque deux fois la même clé, reçoit `404`. |
@@ -3412,6 +3456,7 @@ inertes sans GPU / `nvidia-smi` / port occupé. Détails :
 |----------|--------|------|
 | `CLUSTER_STRICT_TLS_VERIFY` | `false` | Si `true`, refuse au démarrage une config `tls_verify: false` combinée à un nœud `https://` (fail-fast). Par défaut : simple avertissement (compatibilité dev/certs auto-signés). |
 | `CLUSTER_LOAD_TIMEOUT` | `300.0` | Timeout (s) dédié au chargement d'un modèle sur un agent — un gros GGUF prend plusieurs minutes, bien au-delà de `CLUSTER_REQUEST_TIMEOUT` (défaut `10.0`, plan de contrôle). |
+| `CLUSTER_UNLOAD_TIMEOUT` | `30.0` | Timeout (s) de `POST /agent/models/{id}/unload` et `/agent/unload-all`. L'agent attend l'arrêt du `llama-server` (SIGTERM, 10 s de grâce, puis SIGKILL et reap jusqu'à 15 s) ; unload-all arrête les modèles en parallèle sous ce même budget. Non défini : `max(30, CLUSTER_REQUEST_TIMEOUT)` — une installation existante qui ne le définit pas démarre donc sans changement. Défini explicitement sous `CLUSTER_REQUEST_TIMEOUT`, la gateway refuse de démarrer. Trop court, un unload simplement lent est déclaré « non confirmé » (`unload_uncertain`). |
 
 `tls_verify` lui-même (bundle CA, `true`/`false`) se déclare dans `nodes.yaml`
 (section `cluster:`), pas via une variable d'environnement — voir

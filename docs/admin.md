@@ -346,6 +346,10 @@ llmgw list-keys alice
 # API REST
 curl -s "$GW/admin/users/alice/keys" \
   -H "Authorization: Bearer $ADMIN_SECRET" | python3 -m json.tool
+
+# « Dernière utilisation » (`last_used`) est précise à ~1 minute : la gateway
+# ne la réécrit qu'une fois par clé et par minute. L'historique exact des
+# appels est dans le rapport d'usage.
 ```
 
 ### Révoquer une clé
@@ -525,7 +529,7 @@ La sémantique exacte dépend du mode :
 | Mode | Mesure |
 |---|---|
 | Local | Durée réelle du chargement, mesurée par la gateway du lancement du sous-processus à la santé OK — la même valeur figure désormais dans le log « llama-server prêt … en N.N s » |
-| Cluster | Durée de l'appel RPC `load_model` vers le node-agent (réseau inclus), côté orchestrateur — cohérente avec l'histogramme labellisé par nœud |
+| Cluster | Durée de l'opération de chargement sur le node-agent, du `POST` initial à son état terminal (réseau et polling inclus), côté orchestrateur — cohérente avec l'histogramme labellisé par nœud |
 | Cluster, modèle déjà chargé sur le nœud | `null` : le chargement d'origine n'a pas été observé par l'orchestrateur, aucune valeur n'est inventée |
 
 ### Surveiller la VRAM GPU
@@ -1473,7 +1477,7 @@ Contrôles structurels, partagés avec `GET /ready` (module `readiness.py`) :
 |---|---|---|
 | `models_config` | `models.yaml` présent et lisible | contrôlé |
 | `enabled_models` | au moins un modèle activé | contrôlé |
-| `secrets` | secrets non laissés à `CHANGE_ME_*` (avertissement) | contrôlé |
+| `secrets` | secrets non laissés à `CHANGE_ME_*`, et `ADMIN_SECRET` d'au moins 32 caractères (avertissement ; `admin_secret` ci-dessous en fait un blocage pour `doctor`) | contrôlé |
 | `llama_server_binary` | binaire présent et exécutable | `skip` (vit sur les nœuds) |
 | `model_files` | GGUF et projecteurs présents et lisibles | `skip` (vivent sur les nœuds) |
 | `database` | répertoire et fichier SQLite inscriptibles | contrôlé |
@@ -1488,12 +1492,14 @@ Contrôles propres à `doctor` :
 | Contrôle | Ce qu'il vérifie | Bloquant | Mode cluster |
 |---|---|---|---|
 | `config_env_file` | permissions du fichier de secrets (attendu 0600/0640), lisibilité par le `User=` de l'unité, chargement de la configuration | oui | contrôlé |
+| `config_load` | n'apparaît qu'en cas d'échec : la configuration lue depuis l'EnvironmentFile ne se charge pas (le service refuserait de démarrer) ; le rapport s'arrête là | oui | contrôlé |
+| `admin_secret` | `ADMIN_SECRET` ni vide, ni placeholder, et d'au moins 32 caractères — sinon les routes `/admin` sont désactivées (fail-closed). Seule la longueur est jugée, jamais la valeur affichée | oui | contrôlé |
 | `models_registry` | `models.yaml` se **parse** réellement : chemins absolus, `.gguf`, allowlist `ALLOWED_MODEL_DIRS`, paramètres `llama.cpp` valides | oui | contrôlé |
 | `database_permissions` | base, `-wal`, `-shm` et répertoire non exposés (jugé avec la traversée des parents) | oui si atteignable par tous | contrôlé |
 | `disk_space` | espace libre sur les volumes de la base et des logs | oui sous 0,5 Go | contrôlé |
 | `llama_server_version` | `llama-server --version` confronté à `LLAMA_SERVER_MIN_BUILD` | oui | `skip` |
 | `gpu_inventory` | `nvidia-smi` : modèle, VRAM, driver, compute capability. Distingue « GPU attendu mais absent » (`warn` / `nvidia_smi_unavailable`) de « pas de GPU, assumé » (`skip` / `gpu_absence_declared`, quand `ALLOW_NO_GPU=true` a été posé par `install.sh --allow-no-gpu`) ; une renonciation devenue fausse est signalée en `warn` / `gpu_waiver_stale` | non (avertissement) | `skip` |
-| `vram_detected` | budget VRAM net vs VRAM des devices **réellement exposés par `CUDA_VISIBLE_DEVICES`** | oui si le budget net dépasse le matériel ; avertissement si `TOTAL_VRAM_GB` est seulement nominalement supérieur | `skip` |
+| `vram_detected` | budget VRAM net vs VRAM des devices **réellement exposés par `CUDA_VISIBLE_DEVICES`**, résolu par le **même résolveur que la sonde d'admission** (`gpu_inventory`) : valeur vide ou `-1` → `fail` / `no_visible_gpu` ; jeton inconnu (`0,7,1`, troncature CUDA) ou élément vide (`0,,1`) → `fail` / `cuda_visible_devices_invalid` ; instance MIG ou GPU en mode MIG → `warn` / `mig_unsupported`, non bloquant mais visible (code de sortie « avertissements ») : VRAM non mesurable, budget de configuration, et UUID `MIG-…` non vérifié (le runtime ne lance pas `nvidia-smi -L`) ; un budget net supérieur à la VRAM de tout l'hôte reste `fail` / `vram_budget_exceeds_hardware` ; une valeur mêlant MIG et jeton invalide (`7,MIG-x`, `0,,MIG-x`) est `cuda_visible_devices_invalid` | oui si le budget net dépasse le matériel ou si le périmètre est vide/invalide ; avertissement si `TOTAL_VRAM_GB` est seulement nominalement supérieur | `skip` |
 | `model_artifacts` | taille et plausibilité des GGUF/mmproj ; intégrité SHA-256 **seulement** avec `--verify-hashes` | oui | `skip` |
 | `port_pool` | pool `BASE_LLAMA_PORT … +MAX_LOADED_MODELS-1` libre, pas de collision avec `GATEWAY_PORT` | oui pour la collision, avertissement pour un port occupé | `skip` |
 | `nginx_timeouts` | `proxy_read_timeout` des blocs proxifiants vs `MODEL_LOAD_TIMEOUT_SECONDS + 10` | non (avertissement) | contrôlé |
@@ -1522,6 +1528,10 @@ Points de conception à connaître :
   d'admission distribue. Un `TOTAL_VRAM_GB` nominal légèrement supérieur à la
   VRAM utilisable (48 « Go » commerciaux contre 46068 MiB exposés sur une L40S)
   n'est qu'un avertissement : la marge absorbe l'écart, mais il la ronge.
+- **MIG est un avertissement, jamais un `skip`** : la sonde du runtime ne mesure
+  pas une instance MIG et ne peut pas distinguer une coquille d'un UUID réel ;
+  le verdict doit donc rester visible (`warn`) sans bloquer, l'admission
+  retombant sur le budget configuré.
 - **Un port du pool occupé n'est qu'un avertissement**, car `update.sh` appelle
   `doctor` après bascule, où un port peut être tenu par un modèle légitimement
   chargé.
@@ -2199,7 +2209,9 @@ absent ou vide, une taille qui n'est pas un entier d'octets, `ram_total_bytes`
 (qui doublerait le budget VRAM), une `vram_total_bytes` nulle ou négative, un
 backend inconnu, un backend GPU annoncé alors que `gpus` est vide, et toute
 valeur ressemblant à un secret. `CUDA_VISIBLE_DEVICES` s'applique au profil
-déclaré comme à un profil sondé.
+déclaré comme à un profil sondé, avec le résolveur du runtime (`gpu_inventory`,
+partagé avec `doctor`) : `-1` → `cuda_visible_devices_empty`, `0,,1` →
+`cuda_visible_devices_invalid`, instance MIG → `mig_unsupported` (`warn`).
 
 Un profil déclaré porte **toujours** un avertissement
 `hardware_profile_declared` : les capacités n'ont été confrontées à aucune sonde,
@@ -2325,8 +2337,8 @@ problème » et « la machine est installée ».
 | `--json` | Rapport d'installation JSON au lieu du rendu français. |
 | `--allowed-root` | Répertoire que l'application a le droit de toucher. **Répétable et obligatoire** : une liste vide n'autorise rien. |
 | `--catalog` | Catalogue de modèles approuvés (défaut : celui du dépôt). |
-| `--models-dir` | Volume où atterrissent les GGUF. |
-| `--registry` | `models.yaml` à écrire. |
+| `--models-dir` | Volume où atterrissent les GGUF. Doit être sous `ALLOWED_MODEL_DIRS` du service, sinon refus au câblage (exit 2). |
+| `--registry` | `models.yaml` à écrire. Validé avec l'allowlist **du service** — `ALLOWED_MODEL_DIRS` lu dans `--env-file` — et non avec `--models-dir` seul : une entrée existante hors de `--models-dir` mais autorisée par le service (le registre livré déclare `/models` et `/data/models`) reste valide, et une entrée que la gateway refuserait au redémarrage n'est jamais écrite. **Sans `--env-file`, c'est l'environnement de la CLI** (variables et `.env` du répertoire courant) qui est lu : la garantie ne vaut alors que s'il porte la même valeur que le service — passez `--env-file` en production. `ALLOWED_MODEL_DIRS` vide ou absent, ou contenant un chemin relatif (la CLI et la gateway ne le résoudraient pas depuis le même répertoire) : refus (exit 2). |
 | `--runtime-root` | Racine versionnée où installer les releases de `llama-server`. |
 | `--llama-server-bin` | Binaire à employer pour la calibration ; sinon release installée ou configuration de la gateway. |
 | `--env-file` | EnvironmentFile systemd à relire et durcir. Obligatoire pour poser réellement un runtime ; en production : `/etc/llm-gateway/env`. |
@@ -2384,6 +2396,24 @@ distinguer.
   en mémoire, laisse terminer les requêtes déjà actives, puis décharge sans
   forçage. Un redémarrage avant confirmation relit donc l'état désactivé. Un
   modèle actif avant le run n'est jamais désactivé sous couvert de rollback.
+- **Un rollback dont le déchargement est refusé converge seul, porte fermée.**
+  Cas typique : le bail expire alors qu'une requête plus longue que
+  `ADMIN_UNLOAD_DRAIN_TIMEOUT_SECONDS` est encore en vol sur le modèle
+  provisoire. La transition reste en `rolling_back` : admission du modèle
+  fermée, et toute mutation du registre — `POST /admin/unload` compris —
+  répond 409. La gateway retente alors le déchargement en tâche de fond, avec
+  un backoff de 1 s doublé jusqu'à 30 s et sans limite de tentatives, jusqu'à
+  la fin de la requête ; elle passe ensuite en `rolled_back` et rouvre
+  l'admission. Il en va de même après un `rollback` explicite refusé, même si
+  l'applicateur ne revient pas. Procédure d'exploitation :
+  1. `GET /admin/status` : le champ `bootstrap_transitions` liste le modèle,
+     sa phase, `lease_expired` et `rollback_attempts` ; le journal porte un
+     `Rollback bootstrap de '<id>'` par tentative.
+  2. Attendre : la sortie est automatique dès que la requête en vol se
+     termine. Rien n'est à forcer.
+  3. Si une requête ne se termine jamais, redémarrer le service : l'état
+     provisoire est en mémoire seulement, et le disque porte toujours
+     `enabled: false`. Le modèle redémarre désactivé.
   La durée du bail additionne les pires bornes séquentielles de readiness,
   identité, chargement, stream, log d'usage, nettoyage et confirmation, plus
   une marge ; si le total dépasse 3600 s, la commande refuse au lieu de le
@@ -2421,6 +2451,13 @@ distinguer.
   celui de `model_registry`, pas un second : il n'y a qu'une politique
   d'écriture de `models.yaml` dans le dépôt. Une entrée réellement introuvable
   ou présente deux fois reste **refusée**, sans rien écrire.
+- **Aucune ligne de commentaire n'est perdue par une retouche.** Valeur
+  repliée, bloc `|`/`>`, valeur écrite sous sa clé : la valeur est remplacée en
+  entier et le commentaire de fin conservé. Toute retouche (bootstrap ou
+  `PATCH /admin/models/{id}`) qui ferait disparaître une ligne de commentaire
+  est refusée (422 côté admin), sans rien écrire. Le bootstrap conserve les
+  fins de ligne du fichier (CRLF compris) ; le chemin admin, lui, réécrit
+  toujours le fichier en LF.
 - **Aucun secret dans la sortie**, y compris dans un message d'erreur, y compris
   le chemin du fichier de plan.
 
