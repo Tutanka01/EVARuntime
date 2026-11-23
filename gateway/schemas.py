@@ -409,9 +409,24 @@ class CapacityQueueStatusResponse(BaseModel):
     timeout_seconds: int
 
 
+class BootstrapTransitionStatus(BaseModel):
+    """
+    Transition bootstrap-sync non terminée de ce worker.
+
+    `rolling_back` signifie admission fermée et registre verrouillé (409) : le
+    déchargement est refusé tant qu'une requête est en vol, et la gateway le
+    retente seule jusqu'à `rolled_back`.
+    """
+    model_id: str
+    phase: Literal["active", "rolling_back"]
+    lease_expired: bool
+    rollback_attempts: int
+
+
 class GatewayStatus(BaseModel):
     """Statut complet de la gateway — retourné par GET /admin/status."""
     status: str
     vram_budget: VramBudgetResponse
     models: list[ModelStatusResponse]
     capacity_queue: Optional[CapacityQueueStatusResponse] = None
+    bootstrap_transitions: list[BootstrapTransitionStatus] = Field(default_factory=list)

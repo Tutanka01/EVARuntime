@@ -165,6 +165,210 @@ def test_update_insere_le_bloc_llama_params_quand_il_est_absent(tmp_path):
     assert ModelRegistry(config_path=chemin).get("m1").llama_params.ctx_size == 4096
 
 
+# ── 3 bis. Valeurs longues, `#`, guillemets, valeurs repliées ───────────────
+# Régressions : `_render_scalar` repliait à 80 colonnes, l'expression régulière
+# prenait tout `#` pour un commentaire, et une seule ligne physique était
+# remplacée. Une description de 150 caractères — le schéma en autorise 200 —
+# était refusée, et `Model #1 for chat` puis `Plain` laissait un résidu.
+
+def _phrase(longueur: int) -> str:
+    return ("lorem ipsum dolor sit amet " * 10)[: longueur - 1] + "z"
+
+
+def _ligne_du_champ(texte: str, champ: str, model_id: str) -> list[str]:
+    """Lignes physiques de l'entrée `model_id` qui portent `champ:` ou sa suite."""
+    lignes = texte.splitlines()
+    debut, fin, indent = model_registry._entry_bounds(lignes, model_id)
+    sortie: list[str] = []
+    for ligne in lignes[debut:fin]:
+        if ligne.strip().startswith(f"{champ}:") or ligne.lstrip("- ").startswith(f"{champ}:"):
+            sortie.append(ligne)
+        elif sortie and len(ligne) - len(ligne.lstrip()) > indent and ligne.strip():
+            sortie.append(ligne)  # suite d'une valeur repliée
+        elif sortie:
+            break
+    return sortie
+
+
+@pytest.mark.parametrize("longueur", [81, 150, 200])
+def test_patch_d_une_longue_description_tient_sur_une_ligne(tmp_path, longueur):
+    registre, chemin = _shipped_registry(tmp_path)
+    avant = set(_comment_lines(chemin.read_text(encoding="utf-8")))
+    valeur = _phrase(longueur)
+    assert len(valeur) == longueur and " " in valeur
+
+    registre.update("llama-3.1-8b-instruct", description=valeur)
+    registre.update("llama-3.1-8b-instruct", vram_gb=7.0)  # nouvelle retouche du même bloc
+
+    texte = chemin.read_text(encoding="utf-8")
+    assert len(_ligne_du_champ(texte, "description", "llama-3.1-8b-instruct")) == 1
+    assert ModelRegistry(config_path=chemin).get("llama-3.1-8b-instruct").description == valeur
+    assert set(_comment_lines(texte)) == avant
+
+
+def test_une_longue_description_ajoutee_reste_modifiable(tmp_path):
+    registre, chemin = _shipped_registry(tmp_path)
+    valeur = _phrase(150)
+    registre.add({
+        "id": "nouveau-modele", "path": "/models/nouveau.gguf", "vram_gb": 8.0,
+        "enabled": False, "description": valeur,
+    })
+    assert len(_ligne_du_champ(chemin.read_text(encoding="utf-8"), "description", "nouveau-modele")) == 1
+
+    registre.update("nouveau-modele", description="courte")
+    registre.update("nouveau-modele", vram_gb=9.0)
+    relu = ModelRegistry(config_path=chemin).get("nouveau-modele")
+    assert (relu.description, relu.vram_gb) == ("courte", 9.0)
+
+
+@pytest.mark.parametrize(
+    "valeur",
+    [
+        "Model #1 for chat",
+        "a#b sans espace",
+        "Model: fast, cheap",
+        "it's \"quoted\" # not a comment",
+        "'entre apostrophes'",
+        "fin en points...",
+        "- tiret en tête",
+        "ligne un\nligne deux",
+    ],
+)
+def test_valeurs_speciales_aller_retour_puis_remplacement_sans_residu(tmp_path, valeur):
+    registre, chemin = _shipped_registry(tmp_path)
+    avant = set(_comment_lines(chemin.read_text(encoding="utf-8")))
+
+    registre.update("gemma-4-26b-a4b", description=valeur)
+    assert ModelRegistry(config_path=chemin).get("gemma-4-26b-a4b").description == valeur
+
+    registre.update("gemma-4-26b-a4b", description="Plain")
+    texte = chemin.read_text(encoding="utf-8")
+    assert _ligne_du_champ(texte, "description", "gemma-4-26b-a4b") == ["    description: Plain"]
+    assert ModelRegistry(config_path=chemin).get("gemma-4-26b-a4b").description == "Plain"
+    # Commentaire de fin de ligne de `path:` du même bloc : intact.
+    assert "# À ajuster selon le chemin réel" in texte
+    assert set(_comment_lines(texte)) == avant
+
+
+def test_une_valeur_deja_repliee_est_remplacee_en_entier(tmp_path):
+    """Fichier écrit avant le correctif (ou à la main) : valeur pliée sur trois lignes."""
+    chemin = tmp_path / "models.yaml"
+    chemin.write_text(
+        "models:\n"
+        "  - id: m1\n"
+        "    path: /models/m1.gguf\n"
+        "    description: lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem\n"
+        "      ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum dolor sit\n"
+        "      amet fin  # commentaire d'exploitation\n"
+        "    vram_gb: 5.0  # à affiner\n"
+        "  - id: m2\n"
+        "    path: /models/m2.gguf\n"
+        "    description: 'Modèle #2'  # garder\n"
+        "    vram_gb: 4.0\n",
+        encoding="utf-8",
+    )
+    registre = ModelRegistry(config_path=chemin)
+    assert registre.get("m1").description.endswith("amet fin")  # contrôle positif
+
+    registre.update("m1", description="Nouvelle description")
+    registre.update("m2", description="Plain")
+
+    texte = chemin.read_text(encoding="utf-8")
+    assert "    description: Nouvelle description  # commentaire d'exploitation\n" in texte
+    assert "    description: Plain  # garder\n" in texte
+    assert "ipsum dolor sit amet lorem ipsum" not in texte
+    assert "# à affiner" in texte
+    relu = ModelRegistry(config_path=chemin)
+    assert relu.get("m1").description == "Nouvelle description"
+    assert relu.get("m2").description == "Plain"
+    assert relu.get("m1").vram_gb == 5.0
+
+
+@pytest.mark.parametrize("style", [">", "|", "|-", ">+"])
+@pytest.mark.parametrize("indent_commentaire", [0, 2, 4])
+def test_un_commentaire_apres_un_scalaire_bloc_survit_a_la_retouche(
+    tmp_path, style, indent_commentaire
+):
+    """
+    Régression : un commentaire moins indenté que les champs, juste après un
+    scalaire bloc, devenait une ligne vide de l'extrait ; PyYAML la comptait
+    dans le bloc et la retouche l'effaçait. Le document restant identique, le
+    contrôle du candidat ne voyait rien : perte silencieuse.
+    """
+    commentaire = " " * indent_commentaire + "# OPERATOR: never raise vram above 40"
+    chemin = tmp_path / "models.yaml"
+    chemin.write_text(
+        "models:\n"
+        "  - id: m\n"
+        "    path: /models/m.gguf\n"
+        f"    description: {style}\n"
+        "      Long folded\n"
+        "      description\n"
+        f"{commentaire}\n"
+        "    vram_gb: 4.0\n",
+        encoding="utf-8",
+    )
+    registre = ModelRegistry(config_path=chemin)
+
+    registre.update("m", description="New")
+
+    texte = chemin.read_text(encoding="utf-8")
+    assert f"\n{commentaire}\n" in texte
+    assert "    description: New\n" in texte
+    relu = ModelRegistry(config_path=chemin).get("m")
+    assert (relu.description, relu.vram_gb) == ("New", 4.0)
+
+
+def test_une_retouche_qui_perdrait_un_commentaire_est_refusee(tmp_path, monkeypatch):
+    """
+    Garde-fou général, indépendant du calcul d'étendue : si ce calcul se
+    trompe et englobe une ligne de commentaire, l'écriture est REFUSÉE (422),
+    le fichier et la mémoire restent intacts.
+    """
+    from bootstrap import registry_writer as rw
+
+    chemin = tmp_path / "models.yaml"
+    chemin.write_text(
+        "models:\n  - id: m\n    path: /models/m.gguf\n    description: a\n"
+        "  # note d'exploitation\n    vram_gb: 4.0\n",
+        encoding="utf-8",
+    )
+    registre = ModelRegistry(config_path=chemin)
+    avant = chemin.read_bytes()
+    vraie_etendue = rw._scalar_value_span
+
+    def etendue_trop_large(lines, debut, fin, champ_indent, champ):
+        trouve = vraie_etendue(lines, debut, fin, champ_indent, champ)
+        assert trouve is not None  # contrôle positif : le champ est bien isolé
+        ligne_debut, prefixe, ligne_fin, commentaire = trouve
+        return ligne_debut, prefixe, ligne_fin + 1, commentaire  # avale le commentaire
+
+    monkeypatch.setattr(rw, "_scalar_value_span", etendue_trop_large)
+
+    with pytest.raises(RegistryWriteRefused, match="commentaire"):
+        registre.update("m", description="b")
+    assert chemin.read_bytes() == avant
+    assert registre.get("m").description == "a"
+    assert _backups(tmp_path) == []
+
+
+def test_une_valeur_sur_la_ligne_suivant_sa_cle_est_retouchee(tmp_path):
+    """Valeur écrite sous sa clé : la clé reçoit la valeur, les commentaires restent."""
+    chemin = tmp_path / "models.yaml"
+    chemin.write_text(
+        "models:\n  - id: m\n    path: /models/m.gguf\n"
+        "    vram_gb:   # clé\n      4.0   # valeur\n    enabled: false\n",
+        encoding="utf-8",
+    )
+    registre = ModelRegistry(config_path=chemin)
+
+    registre.update("m", vram_gb=8.0)
+
+    texte = chemin.read_text(encoding="utf-8")
+    assert "    vram_gb: 8.0  # clé # valeur\n    enabled: false\n" in texte
+    assert ModelRegistry(config_path=chemin).get("m").vram_gb == 8.0
+
+
 # ── 4. Suppression ───────────────────────────────────────────────────────────
 
 def test_remove_supprime_le_bloc_et_conserve_l_en_tete_et_les_voisins(tmp_path):
@@ -226,6 +430,59 @@ def test_les_sauvegardes_sont_bornees(tmp_path):
         registre.update("m1", vram_gb=float(tour + 1))
 
     assert len(_backups(tmp_path)) == model_registry.ADMIN_BACKUP_RETENTION
+
+
+def test_la_purge_garde_les_pre_etats_les_plus_recents_dans_la_meme_seconde(
+    tmp_path, monkeypatch
+):
+    """
+    Régression : la purge triait par nom, et `…Z-1.bak` se trie avant `…Z.bak`.
+    Au-delà de `ADMIN_BACKUP_RETENTION` mutations dans la même seconde, les
+    pré-états les plus récents étaient effacés aussitôt créés.
+    """
+    import datetime as _dt
+
+    class _Fige(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt.datetime(2026, 1, 1, 0, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(model_registry, "datetime", _Fige)
+    registre, chemin = _simple_registry(tmp_path, [_entry()])
+    mutations = model_registry.ADMIN_BACKUP_RETENTION + 3
+    for tour in range(1, mutations + 1):
+        registre.update("m1", vram_gb=5.0 + tour)  # pré-état : 5.0 + tour - 1
+
+    def _essai(p: Path) -> int:
+        suffixe = p.name.removesuffix(".bak").rpartition("Z")[2]
+        return int(suffixe.lstrip("-") or 0)
+
+    # essai N = sauvegarde de la mutation N+1 = pré-état vram_gb 5.0 + N.
+    conservees = {
+        _essai(p): next(
+            m for m in yaml.safe_load(p.read_text())["models"] if m["id"] == "m1"
+        )["vram_gb"]
+        for p in _backups(tmp_path)
+    }
+    premiere = mutations - model_registry.ADMIN_BACKUP_RETENTION
+    assert conservees == {n: 5.0 + n for n in range(premiere, mutations)}, (
+        "les plus récents pré-états doivent survivre, sous des numéros jamais réemployés"
+    )
+
+
+def test_la_purge_departage_une_mtime_identique_par_numero_d_essai(tmp_path):
+    """Système de fichiers à mtime grossière : l'ordre retombe sur `-N`, pas sur le nom."""
+    cible = tmp_path / "models.yaml"
+    cible.write_text("models: []\n", encoding="utf-8")
+    noms = [f"models.yaml.pre-admin.20260101T000000Z{s}.bak" for s in ("", "-1", "-2", "-10")]
+    for nom in noms:
+        (tmp_path / nom).write_text(nom, encoding="utf-8")
+        os.utime(tmp_path / nom, ns=(10**18, 10**18))
+
+    supprimees = model_registry.purge_registry_backups(cible, ".pre-admin.", ".bak", 2)
+
+    assert sorted(supprimees) == sorted(noms[:2])
+    assert sorted(p.name for p in _backups(tmp_path)) == sorted(noms[2:])
 
 
 def test_une_mutation_sans_effet_n_ecrit_ni_ne_sauvegarde(tmp_path):

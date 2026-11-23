@@ -101,9 +101,24 @@ from . import execution as ex
 from . import schema
 
 # ── Codes de cause ────────────────────────────────────────────────────────────
-# Volontairement IDENTIQUES à ceux de `gateway/deploy/smoke_test.sh` : les deux
-# recettes doivent produire le même mot pour la même panne, sinon un opérateur
-# qui passe de l'une à l'autre pendant un incident doit traduire.
+# Partage avec `gateway/deploy/smoke_test.sh` — PARTIEL, et c'est un contrat
+# opérateur : aucun code n'est renommé pour « aligner » les deux recettes.
+#
+# Identiques (même mot, même panne) :
+#   - flux : ok, http_status, upstream_error, no_sse_data, no_content, no_done,
+#     model_mismatch, bad_envelope, no_usage (le script les préfixe
+#     `generation:` dans son rapport) ;
+#   - hors flux : liveness_failed, identity_create_failed, identity_key_failed,
+#     model_load_failed, usage_log_missing, ttft_threshold_exceeded.
+# Différents pour une panne équivalente :
+#   - structural_readiness_failed  ↔ readiness_failed (+ cause /ready) ;
+#   - model_unresolved             ↔ model_discovery_failed / no_enabled_model ;
+#   - identity_residual            ↔ identity_cleanup_failed.
+# Propres à une seule recette :
+#   - ici : stream_timeout, transport_error, report_leak ;
+#   - script : model_unload_failed (cette recette ne décharge pas le modèle),
+#     identity_key_charset, identity_key_unreadable,
+#     ttft_threshold_exceeded_warning.
 
 REASON_OK = "ok"
 REASON_HTTP_STATUS = "http_status"

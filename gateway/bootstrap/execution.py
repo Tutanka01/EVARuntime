@@ -70,8 +70,11 @@ un script d'exploitation ne doit pas pouvoir confondre les deux.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -80,6 +83,8 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Protocol, Sequence
 
 from . import schema
+
+log = logging.getLogger(__name__)
 
 # Version du rapport d'exécution. Indépendante de `PLAN_SCHEMA_VERSION` : le
 # journal peut évoluer sans que le plan change, et l'inverse est vrai aussi.
@@ -250,6 +255,46 @@ def redact_for_log(message: str) -> str:
         + ", ".join(labels)
         + "]"
     )
+
+
+# errno d'un système de fichiers qui ne sait pas `fsync` un répertoire
+# (certains NFS, FUSE, CIFS) : ce n'est pas une panne d'écriture.
+_DIRECTORY_FSYNC_UNSUPPORTED = frozenset(
+    code for code in (
+        errno.EINVAL,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    ) if code is not None
+)
+
+
+def fsync_directory(directory: Path | str) -> bool:
+    """
+    `fsync` d'un répertoire après un `os.replace` DÉJÀ effectué (thread worker).
+
+    Discipline commune à `registry_writer._atomic_write` et au téléchargeur :
+    le `fsync` du FICHIER avant le renommage reste obligatoire chez l'appelant ;
+    celui du répertoire rend le renommage durable. Sur un système de fichiers
+    qui ne le supporte pas (`EINVAL`, `ENOTSUP`), le fichier est néanmoins
+    publié et vérifié : déclarer l'étape en échec mentirait sur l'état de
+    l'hôte. On journalise et on rend `False`. Toute autre erreur (`EIO`…) est
+    une vraie panne de durabilité et remonte.
+    """
+    descripteur = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descripteur)
+    except OSError as exc:
+        if exc.errno not in _DIRECTORY_FSYNC_UNSUPPORTED:
+            raise
+        log.warning(
+            "fsync du répertoire %s non supporté par ce système de fichiers (%s) : "
+            "le renommage est publié, sa durabilité après coupure n'est pas garantie.",
+            directory, exc.strerror or exc.errno,
+        )
+        return False
+    finally:
+        os.close(descripteur)
+    return True
 
 
 def ensure_within_allowed_roots(candidate: Path | str, roots: Sequence[Path]) -> Path:

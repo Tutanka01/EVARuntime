@@ -250,6 +250,44 @@ def test_client_http_concret_satisfait_requete_et_flux(monkeypatch):
     ]
 
 
+def _mock_transport_client(monkeypatch, handler):
+    real_client = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(prod.httpx, "AsyncClient", factory)
+    return prod.AsyncHttpClient()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(
+            502,
+            text="<html><body>502 Bad Gateway</body></html>",
+            headers={"content-type": "text/html"},
+        ),
+        httpx.Response(204),
+        httpx.Response(200, text=""),
+    ],
+    ids=["html_502", "empty_204", "empty_200"],
+)
+def test_client_http_reponse_non_json_garde_son_statut(monkeypatch, response):
+    """Régression : le paramètre ``json`` masquait le module dans ``except``."""
+    client = _mock_transport_client(monkeypatch, lambda request: response)
+
+    result = asyncio.run(client.request("GET", "http://127.0.0.1:8000/x", timeout=1))
+    assert result.status == response.status_code
+    assert result.body is None
+
+    # La recette voit le vrai statut, pas un faux « transport_error » à 0.
+    via_call = asyncio.run(ft._call(client, "GET", "http://127.0.0.1:8000/x", timeout=1))
+    assert via_call.status == response.status_code
+    assert via_call.body is None
+
+
 def test_client_http_refuse_les_identifiants_dans_url():
     client = prod.AsyncHttpClient()
     with pytest.raises(prod.ProductionWiringError, match="identifiants"):
@@ -956,6 +994,7 @@ def test_cablage_production_enregistre_les_neuf_actions(monkeypatch, tmp_path):
             _env_file=None,
             models_config_path=tmp_path / "models.yaml",
             llama_server_bin=tmp_path / "runtime" / "current" / "llama-server",
+            allowed_model_dirs=[str(tmp_path / "models"), str(tmp_path / "data")],
         ),
         admin_secret_environ=None,
         accepted_license_ids=(entry.id,),
@@ -966,6 +1005,8 @@ def test_cablage_production_enregistre_les_neuf_actions(monkeypatch, tmp_path):
     config = cli_module._build_applier_config(**common, dry_run=False)
     registry = ap.build_registry(config, ap.ProofLedger())
     assert set(registry.registered_actions()) == set(sc.PLAN_ACTIONS)
+    # L'écrivain valide avec l'allowlist DU SERVICE, pas avec `(--models-dir,)`.
+    assert config.writer.allowed_model_dirs == (tmp_path / "models", tmp_path / "data")
 
     monkeypatch.delenv("ADMIN_SECRET")
     dry_config = cli_module._build_applier_config(**common, dry_run=True)
@@ -989,6 +1030,7 @@ def test_cablage_production_enregistre_les_neuf_actions(monkeypatch, tmp_path):
         _env_file=None,
         models_config_path=tmp_path / "other-models.yaml",
         llama_server_bin=tmp_path / "runtime" / "current" / "llama-server",
+        allowed_model_dirs=[str(tmp_path / "models")],
     )
     with pytest.raises(prod.ProductionWiringError, match="MODELS_CONFIG_PATH"):
         cli_module._build_applier_config(**wrong_registry, dry_run=True)
@@ -998,6 +1040,7 @@ def test_cablage_production_enregistre_les_neuf_actions(monkeypatch, tmp_path):
         _env_file=None,
         models_config_path=tmp_path / "models.yaml",
         llama_server_bin=tmp_path / "other-runtime" / "llama-server",
+        allowed_model_dirs=[str(tmp_path / "models")],
     )
     with pytest.raises(prod.ProductionWiringError, match="LLAMA_SERVER_BIN"):
         cli_module._build_applier_config(**wrong_binary, dry_run=True)

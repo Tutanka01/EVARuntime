@@ -179,6 +179,26 @@ def test_symlink_escaping_allowed_dir_is_rejected(tmp_path):
         ModelRegistry(config_path=cfg, allowed_model_dirs=[str(allowed_dir)])
 
 
+def test_unresolvable_path_fails_closed(tmp_path):
+    """
+    `resolve()` lève sur un octet NUL : le registre ne doit pas retomber sur le
+    chemin brut (où `..` n'est jamais résolu) et l'accepter.
+    """
+    allowed_dir = tmp_path / "allowed"
+    allowed_dir.mkdir()
+    cfg = tmp_path / "models.yaml"
+    cfg.write_text("models: []\n", encoding="utf-8")
+    reg = ModelRegistry(config_path=cfg, allowed_model_dirs=[str(allowed_dir)])
+
+    # Contrôle positif : le même chemin sans NUL est refusé, un chemin sain passe.
+    with pytest.raises(ValueError, match="autoris"):
+        reg._validate_model_path(f"{allowed_dir}/../outside.gguf")
+    assert reg._validate_model_path(f"{allowed_dir}/ok.gguf") == allowed_dir / "ok.gguf"
+
+    with pytest.raises(ValueError, match="autoris"):
+        reg._validate_model_path(f"{allowed_dir}/../outside\x00.gguf")
+
+
 # ── 10. add() : persistance atomique + rejet doublon ────────────────────────
 
 def test_add_persists_atomically_and_is_visible_after_reload(tmp_path):

@@ -66,11 +66,22 @@ class _BootstrapLiveState:
     phase: str = "active"
     terminal_digest: str | None = None
     watchdog: asyncio.Task[None] | None = None
+    # Tentatives de déchargement du rollback en cours (bail expiré ou rollback
+    # explicite refusé) : visibles dans GET /admin/status.
+    rollback_attempts: int = 0
+    lease_expired: bool = False
 
 
 _bootstrap_sync_locks: dict[tuple[int, str], asyncio.Lock] = {}
 _bootstrap_sync_states: dict[tuple[int, str], _BootstrapLiveState] = {}
 _bootstrap_lease_sleep = asyncio.sleep
+
+# Reprise du rollback quand le déchargement est refusé (requête plus longue que
+# le drain admin encore en vol). Backoff exponentiel PLAFONNÉ, sans limite de
+# tentatives : s'arrêter laisserait le registre verrouillé (409) jusqu'au
+# redémarrage. Chaque tentative draine déjà `admin_unload_drain_timeout_seconds`.
+_BOOTSTRAP_ROLLBACK_RETRY_INITIAL_SECONDS = 1.0
+_BOOTSTRAP_ROLLBACK_RETRY_MAX_SECONDS = 30.0
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -293,31 +304,111 @@ async def _bootstrap_lease_watchdog(
         if _bootstrap_sync_states.get(key) is not state or state.phase != "active":
             return
 
-        manager = state.manager
-        manager.block_bootstrap_admission(model_id)
+        # Le gate et enabled=false sont publiés AVANT le premier await du
+        # drain : même si le déchargement échoue, aucune requête n'entre plus.
+        state.manager.block_bootstrap_admission(model_id)
         state.registry.publish_snapshot(state.baseline)
         state.phase = "rolling_back"
-        state.watchdog = None
-        try:
-            # Le gate et enabled=false sont déjà publiés : même si le drain
-            # échoue, aucune nouvelle requête ne peut entrer.
-            await _unload_for_admin(model_id, manager=manager)
-        except HTTPException as exc:
-            log.error(
-                "Lease bootstrap expirée pour '%s' : admission fermée, "
-                "déchargement à retenter (%s).",
-                model_id,
-                exc.detail,
-            )
+        state.lease_expired = True
+        if await _attempt_bootstrap_rollback_unload(model_id, state):
             return
 
-        state.phase = "rolled_back"
-        state.terminal_digest = state.baseline.sha256
-        manager.unblock_bootstrap_admission(model_id)
-        log.warning(
-            "Lease bootstrap expirée pour '%s' : activation mémoire annulée.",
+    await _retry_bootstrap_rollback(key, model_id, state)
+
+
+async def _attempt_bootstrap_rollback_unload(
+    model_id: str,
+    state: _BootstrapLiveState,
+) -> bool:
+    """
+    Une tentative de déchargement du rollback, sous le lock de la transition.
+
+    Succès : phase `rolled_back`, admission rouverte. Échec : phase
+    `rolling_back` inchangée, admission fermée (fail-closed), `False`.
+    """
+    state.rollback_attempts += 1
+    try:
+        await _unload_for_admin(model_id, manager=state.manager)
+    except HTTPException as exc:
+        log.error(
+            "Rollback bootstrap de '%s' : admission fermée, déchargement refusé "
+            "(tentative %d, %s) — nouvel essai automatique.",
             model_id,
+            state.rollback_attempts,
+            exc.detail,
         )
+        return False
+
+    state.phase = "rolled_back"
+    state.terminal_digest = state.baseline.sha256
+    state.watchdog = None
+    state.manager.unblock_bootstrap_admission(model_id)
+    log.warning(
+        "Rollback bootstrap de '%s' terminé : activation mémoire annulée "
+        "(tentative %d).",
+        model_id,
+        state.rollback_attempts,
+    )
+    return True
+
+
+async def _retry_bootstrap_rollback(
+    key: tuple[int, str],
+    model_id: str,
+    state: _BootstrapLiveState,
+) -> None:
+    """
+    Reprend le déchargement d'un rollback refusé jusqu'à ce qu'il aboutisse.
+
+    Sans cette reprise, un bail expiré pendant une requête plus longue que le
+    drain admin laissait la transition en `rolling_back` pour toujours : toute
+    mutation du registre et tout `POST /admin/unload` répondaient 409 jusqu'au
+    redémarrage. La requête en vol finit par se terminer ; la tentative
+    suivante décharge alors et rouvre l'admission. Le lock n'est pas tenu
+    pendant l'attente, pour qu'un `rollback` explicite puisse passer — il
+    annule alors cette tâche et reprend la main.
+    """
+    delay = _BOOTSTRAP_ROLLBACK_RETRY_INITIAL_SECONDS
+    lock = _bootstrap_sync_locks.setdefault(key, asyncio.Lock())
+    while True:
+        try:
+            await _bootstrap_lease_sleep(delay)
+        except asyncio.CancelledError:
+            return
+        delay = min(delay * 2, _BOOTSTRAP_ROLLBACK_RETRY_MAX_SECONDS)
+        async with lock:
+            if _bootstrap_sync_states.get(key) is not state or state.phase != "rolling_back":
+                return
+            if await _attempt_bootstrap_rollback_unload(model_id, state):
+                return
+
+
+def _arm_bootstrap_rollback_retry(
+    key: tuple[int, str],
+    model_id: str,
+    state: _BootstrapLiveState,
+) -> None:
+    """Confie à une tâche de fond la reprise d'un rollback explicite refusé."""
+    _cancel_bootstrap_watchdog(state)
+    state.watchdog = asyncio.create_task(
+        _retry_bootstrap_rollback(key, model_id, state),
+        name=f"bootstrap-rollback-retry-{model_id}",
+    )
+
+
+def bootstrap_transitions_status() -> list[dict]:
+    """Transitions bootstrap non terminées de ce worker, pour GET /admin/status."""
+    manager_id = id(model_manager)
+    return [
+        {
+            "model_id": model_id,
+            "phase": state.phase,
+            "lease_expired": state.lease_expired,
+            "rollback_attempts": state.rollback_attempts,
+        }
+        for (state_manager_id, model_id), state in sorted(_bootstrap_sync_states.items())
+        if state_manager_id == manager_id and state.phase in {"active", "rolling_back"}
+    ]
 
 
 def _refuse_provisional_mutation(model_id: str) -> None:
@@ -354,9 +445,15 @@ def _refuse_registry_mutation_during_bootstrap() -> None:
 @router.get("/status", response_model=GatewayStatus)
 async def get_status(_: None = Depends(require_admin)) -> dict:
     """
-    État complet de la gateway : budget VRAM + état de chaque modèle.
+    État complet de la gateway : budget VRAM + état de chaque modèle, et
+    transitions bootstrap-sync en cours (un `rolling_back` y explique un 409
+    sur les mutations du registre).
     """
-    return {"status": "ok", **model_manager.status()}
+    return {
+        "status": "ok",
+        **model_manager.status(),
+        "bootstrap_transitions": bootstrap_transitions_status(),
+    }
 
 
 # ── Registre des modèles ──────────────────────────────────────────────────────
@@ -568,10 +665,14 @@ async def bootstrap_sync_model(
             model_manager.block_bootstrap_admission(model_id)
             registry.publish_snapshot(snapshot)
             state.phase = "rolling_back"
+            state.rollback_attempts += 1
             try:
                 await _unload_for_admin(model_id, manager=model_manager)
             except HTTPException:
-                # Fail-closed : le gate reste fermé jusqu'à un retry explicite.
+                # Fail-closed : le gate reste fermé. Un retry explicite reste
+                # possible, mais la convergence ne dépend plus de l'applicateur :
+                # une reprise de fond décharge dès la fin de la requête en vol.
+                _arm_bootstrap_rollback_retry(key, model_id, state)
                 raise
             _require_current_snapshot(registry, snapshot)
             state.phase = "rolled_back"
@@ -866,6 +967,12 @@ async def load_model(
     Utile pour éviter la latence de cold-start sur la première requête.
     Évinçe un modèle LRU si le budget VRAM est dépassé.
     """
+    # Chargement explicite par l'opérateur : il vient peut-être de corriger
+    # l'artefact sur le nœud, donc l'échec récent mémorisé en mode cluster ne
+    # doit pas lui être resservi. Le mode local n'a pas ce cache.
+    forget_load_failures = getattr(model_manager, "forget_load_failures", None)
+    if forget_load_failures is not None:
+        forget_load_failures(model_id)
     try:
         await model_manager.ensure_model_loaded(model_id)
     except LookupError as exc:

@@ -1052,6 +1052,56 @@ def bootstrap_apply(
     raise typer.Exit(outcome.exit_code())
 
 
+def _service_allowed_model_dirs(effective_settings, models_dir, production_module):
+    """
+    Allowlist de modèles avec laquelle l'écrivain valide `models.yaml`.
+
+    C'est celle du SERVICE (`ALLOWED_MODEL_DIRS` de `--env-file`, sinon de
+    l'environnement de la CLI), jamais `(--models-dir,)` : la gateway rechargera
+    le fichier écrit avec SA liste. Une liste plus large accepterait une entrée
+    que la gateway refusera au prochain démarrage ; une liste plus étroite
+    refusait tout registre dont une entrée existante vit ailleurs — le
+    `models.yaml` livré déclare à la fois `/models` et `/data/models`.
+
+    Vide, elle n'est pas « sans contrainte » : refus, il faut la déclarer.
+    `--models-dir` doit être dedans, sinon chaque GGUF téléchargé produirait
+    une entrée que la gateway refuserait.
+    """
+    from pathlib import Path
+
+    from bootstrap import execution as _execution
+
+    declared = tuple(
+        Path(d) for d in (effective_settings.allowed_model_dirs or ()) if str(d).strip()
+    )
+    relatives = [str(d) for d in declared if not d.is_absolute()]
+    if relatives:
+        # La CLI résoudrait ces entrées depuis SON répertoire courant, la
+        # gateway depuis son WorkingDirectory : la validation ne prouverait
+        # plus rien sur ce que le service acceptera.
+        raise production_module.ProductionWiringError(
+            "ALLOWED_MODEL_DIRS contient des chemins relatifs "
+            f"({', '.join(relatives)}) : la CLI et la gateway ne les résolvent pas "
+            "depuis le même répertoire. Déclarez des chemins absolus."
+        )
+    if not declared:
+        raise production_module.ProductionWiringError(
+            "--registry exige ALLOWED_MODEL_DIRS dans la configuration du service "
+            "(--env-file, ou l'environnement de la CLI) : models.yaml est validé avec "
+            "l'allowlist que la gateway appliquera en le rechargeant. Une liste vide "
+            "n'est pas « sans contrainte »."
+        )
+    if models_dir is not None:
+        try:
+            _execution.ensure_within_allowed_roots(models_dir, declared)
+        except _execution.ExecutionError as exc:
+            raise production_module.ProductionWiringError(
+                f"--models-dir n'est pas sous ALLOWED_MODEL_DIRS du service : {exc}. "
+                "La gateway refuserait chaque modèle installé là."
+            ) from exc
+    return declared
+
+
 def _build_applier_config(
     *,
     applier_module,
@@ -1206,12 +1256,16 @@ def _build_applier_config(
 
     writer = None
     if registry_path is not None:
+        allowed_model_dirs = _service_allowed_model_dirs(
+            effective_settings, models_dir, production_module
+        )
         writer = writer_module.WriterConfig(
             registry_path=registry_path,
-            models_dir=models_dir if models_dir is not None else registry_path.parent,
-            allowed_model_dirs=(
-                (models_dir,) if models_dir is not None else (registry_path.parent,)
-            ),
+            # Sans --models-dir, aucun catalogue n'est câblé : l'écrivain ne crée
+            # aucune entrée et n'emploie ce répertoire que pour son contrôle
+            # d'appartenance. Le premier répertoire autorisé y satisfait.
+            models_dir=models_dir if models_dir is not None else allowed_model_dirs[0],
+            allowed_model_dirs=allowed_model_dirs,
             runtime_version=effective_runtime_version,
             hardware_fingerprint=effective_hardware_fingerprint,
             vram_budget_gb=vram_budget_gb,

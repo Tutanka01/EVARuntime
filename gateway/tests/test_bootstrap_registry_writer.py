@@ -31,6 +31,7 @@ import asyncio
 import copy
 import inspect
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -750,6 +751,264 @@ def test_les_sauvegardes_sont_bornees(atelier):
     assert intrus.read_text(encoding="utf-8") == "ne pas toucher"
     # Contrôle positif : sans borne, il y en aurait bien eu quatre.
     assert config.backup_retention == 2
+
+
+def test_le_rendu_ne_replie_jamais_une_longue_valeur():
+    """Régression : repli à 80 (scalaire) ou 100 colonnes (bloc d'entrée)."""
+    longue = ("lorem ipsum dolor sit amet " * 8)[:199] + "z"
+    assert "\n" not in rw._render_scalar(longue)
+    assert yaml.safe_load(f"d: {rw._render_scalar(longue)}") == {"d": longue}
+    assert rw._render_scalar("fin en points...") == "fin en points..."
+    multiligne = rw._render_scalar("a\nb")
+    assert "\n" not in multiligne
+    assert yaml.safe_load(f"d: {multiligne}") == {"d": "a\nb"}
+
+    bloc = rw._render_entry_block({"id": "m", "description": longue}, 2, "T0")
+    assert [ligne for ligne in bloc.splitlines() if "lorem" in ligne] == [
+        f"    description: {longue}"
+    ]
+
+
+def test_la_retouche_d_un_champ_lit_la_valeur_comme_yaml():
+    """`#` dans une valeur entre guillemets n'est pas un commentaire ; celui de fin l'est."""
+    lignes = [
+        "  - id: m",
+        "    description: 'Model #1: chat'   # note d'exploitant",
+        "    vram_gb: 4  # à affiner",
+    ]
+    sortie = rw._set_scalar_field(lignes, 0, 3, 4, "description", rw._render_scalar("Plain"))
+    assert sortie == [
+        "  - id: m",
+        "    description: Plain  # note d'exploitant",
+        "    vram_gb: 4  # à affiner",
+    ]
+
+
+# ── Retouche textuelle : propriété, fins de ligne ─────────────────────────────
+# Version déterministe et réduite du fuzzer de revue : registres générés avec
+# des valeurs dans tous les styles YAML (plain, guillemets, repliées, blocs `|`
+# et `>`, valeur sous sa clé) et des commentaires à toutes les indentations.
+# Propriété : une retouche est soit REFUSÉE, soit exacte ET sans perte d'une
+# seule ligne de commentaire. Une perte silencieuse fait échouer le test.
+
+_ATOMES = ["a", "Model", "#1", " # ", "x#y", ": ", "'", '"', "\\", "é", "—", "yes", "1.5", "-", "|", ">"]
+
+
+def _valeur_rendue(r, valeur, indent):
+    suite = " " * (indent + 2)
+    style = r.choice(["plain", "double", "double_ml", "plain_ml", "literal", "folded", "nextline"])
+    if style == "plain":
+        return [" " + rw._render_scalar(valeur)], style
+    if style == "double":
+        return [" " + yaml.safe_dump(valeur, default_style='"', width=float("inf")).rstrip("\n")], style
+    if style == "double_ml":
+        rendu = yaml.safe_dump(valeur, default_style='"', width=12, allow_unicode=True).rstrip("\n")
+        morceaux = rendu.split("\n")
+        return [" " + morceaux[0]] + [suite + m.lstrip() for m in morceaux[1:]], style
+    if style == "plain_ml" and isinstance(valeur, str) and " " in valeur.strip():
+        mots = valeur.split(" ", 1)
+        return [" " + mots[0], suite + mots[1]], style
+    if style in ("literal", "folded") and isinstance(valeur, str) and valeur == valeur.strip() and valeur:
+        tete = ("|" if style == "literal" else ">") + r.choice(["", "-", "+"])
+        return [" " + tete] + [suite + morceau for morceau in valeur.split("\n")], style
+    if style == "nextline":
+        return ["", suite + rw._render_scalar(valeur)], style
+    return [" " + rw._render_scalar(valeur)], "plain"
+
+
+def _registre_genere(r):
+    """(texte, document attendu, lignes de commentaire insérées)."""
+    lignes = ["# en-tête d'exploitation", "models:"]
+    commentaires = ["# en-tête d'exploitation"]
+    for rang in range(r.randint(1, 3)):
+        champs = [
+            ("description", "".join(r.choice(_ATOMES) for _ in range(r.randint(1, 6))).strip() or "d"),
+            ("vram_gb", round(r.uniform(1, 40), 1)),
+            ("enabled", r.choice([True, False])),
+        ]
+        r.shuffle(champs)
+        lignes.append(f"  - id: m{rang}")
+        lignes.append(f"    path: /models/m{rang}.gguf")
+        for cle, valeur in champs:
+            for _ in range(20):
+                rendu, style = _valeur_rendue(r, valeur, 4)
+                essai = "\n".join(
+                    [f"{cle}:{rendu[0]}"] + [ligne[4:] for ligne in rendu[1:]]
+                ) + "\n"
+                try:
+                    if yaml.safe_load(essai) == {cle: valeur}:
+                        break
+                except yaml.YAMLError:
+                    pass
+            else:
+                rendu, style = [" " + rw._render_scalar(valeur)], "plain"
+            fin = "  # fin 'q' #x" if r.random() < 0.4 and style not in ("literal", "folded") else ""
+            bloc = [f"    {cle}:{rendu[0]}"] + rendu[1:]
+            bloc[-1] += fin
+            lignes.extend(bloc)
+            if r.random() < 0.45:
+                commentaire = " " * r.choice([0, 2, 4]) + r.choice(["# note", "# 'q' : x", "#"])
+                lignes.append(commentaire)
+                commentaires.append(commentaire)
+    texte = "\n".join(lignes) + "\n"
+    return texte, yaml.safe_load(texte), commentaires
+
+
+@pytest.mark.parametrize("graine", range(4))
+def test_propriete_une_retouche_est_refusee_ou_sans_perte(graine):
+    r = __import__("random").Random(graine)
+    bilan = {"ok": 0, "refus": 0}
+    for _ in range(60):
+        texte, document, commentaires = _registre_genere(r)
+        rang = r.randrange(len(document["models"]))
+        model_id = document["models"][rang]["id"]
+        champ = r.choice(["description", "vram_gb", "enabled"])
+        valeur = {
+            "description": r.choice(["Plain", "Model #1: x", "it's", "a\nb", "z" * 150 + " y"]),
+            "vram_gb": r.choice([1.5, 33.0]),
+            "enabled": r.choice([True, False]),
+        }[champ]
+        attendu = copy.deepcopy(document)
+        attendu["models"][rang][champ] = valeur
+        try:
+            if r.random() < 0.5:
+                sortie = model_registry._set_entry_scalar(rw, texte, model_id, champ, valeur)
+            else:
+                lignes = rw._split_keepends(texte)
+                debut, fin, indent = rw._entry_block_bounds(lignes, model_id)
+                sortie = "".join(rw._set_scalar_field(
+                    lignes, debut, fin, indent, champ, rw._render_scalar(valeur)
+                ))
+        except (rw.RegistryWriterError, model_registry.RegistryWriteRefused):
+            bilan["refus"] += 1
+            continue
+        try:
+            relu = yaml.safe_load(sortie)
+        except yaml.YAMLError:
+            relu = None
+        if relu != attendu:
+            # Le contrôle du candidat refuserait ce texte : un refus, pas une perte.
+            bilan["refus"] += 1
+            continue
+        restantes = sortie.split("\n")
+        for commentaire in commentaires:
+            assert restantes.count(commentaire) >= texte.split("\n").count(commentaire), (
+                f"perte silencieuse de {commentaire!r}\n--- avant\n{texte}--- après\n{sortie}"
+            )
+        bilan["ok"] += 1
+    # Contrôle positif : la propriété a bien porté sur des retouches réussies.
+    assert bilan["ok"] >= 40, bilan
+
+
+def test_un_registre_crlf_garde_ses_fins_de_ligne_a_l_activation(atelier):
+    """
+    Régression : `split("\\n")` laissait le `\\r` dans la ligne et la ligne
+    retouchée le perdait ; la lecture traduisait en outre CRLF → LF, si bien
+    que le fichier entier changeait de fins de ligne et que l'empreinte
+    publiée ne portait pas sur les octets que hache la gateway.
+    """
+    texte = REGISTRE_EXISTANT.format(models_dir=atelier["models_dir"]).replace("\n", "\r\n")
+    atelier["registry"].write_bytes(texte.encode("utf-8"))
+    calibration = _calibration(
+        model_id="llama-3.1-8b-instruct",
+        params_fingerprint=rw.params_fingerprint(
+            _entree(atelier["registry"], "llama-3.1-8b-instruct")["llama_params"]
+        ),
+        peak_vram_gb=6.0,
+    )
+    preuve = _preuve(calibration, _smoke_test(model_id="llama-3.1-8b-instruct"))
+
+    change = rw.enable_model_entry(
+        _config(atelier), "llama-3.1-8b-instruct", preuve, mode=ex.ExecutionMode.APPLY
+    )
+
+    assert change.status == ex.STEP_DONE, change.error
+    octets = atelier["registry"].read_bytes()
+    assert octets.count(b"\n") == octets.count(b"\r\n") > 10  # aucune fin LF isolée
+    assert b"    enabled: true\r\n" in octets
+    assert b"# relev\xc3\xa9 au nvidia-smi le 2026-07-30\r\n" in octets
+    assert _entree(atelier["registry"], "llama-3.1-8b-instruct")["enabled"] is True
+
+
+@pytest.mark.parametrize("separateur", [" ", "\x85"])
+def test_un_saut_de_ligne_unicode_dans_une_valeur_ne_decale_pas_la_retouche(
+    atelier, separateur
+):
+    """
+    PyYAML compte U+2028 et U+0085 comme des fins de ligne, `split("\\n")` non :
+    la ligne retouchée était la mauvaise, et l'activation refusée.
+    """
+    texte = REGISTRE_EXISTANT.format(models_dir=atelier["models_dir"]).replace(
+        '"Llama 3.1 8B — modèle léger"', f'"Llama{separateur}3.1 8B"'
+    )
+    atelier["registry"].write_text(texte, encoding="utf-8")
+    description_avant = _entree(atelier["registry"], "llama-3.1-8b-instruct")["description"]
+    calibration = _calibration(
+        model_id="llama-3.1-8b-instruct",
+        params_fingerprint=rw.params_fingerprint(
+            _entree(atelier["registry"], "llama-3.1-8b-instruct")["llama_params"]
+        ),
+        peak_vram_gb=6.0,
+    )
+    preuve = _preuve(calibration, _smoke_test(model_id="llama-3.1-8b-instruct"))
+
+    change = rw.enable_model_entry(
+        _config(atelier), "llama-3.1-8b-instruct", preuve, mode=ex.ExecutionMode.APPLY
+    )
+
+    assert change.status == ex.STEP_DONE, change.error
+    entree = _entree(atelier["registry"], "llama-3.1-8b-instruct")
+    assert entree["enabled"] is True
+    assert entree["description"] == description_avant
+    assert separateur in atelier["registry"].read_text(encoding="utf-8")
+
+
+def test_un_fsync_de_repertoire_non_supporte_ne_fait_pas_echouer_l_ecriture(
+    atelier, monkeypatch
+):
+    """
+    NFS/FUSE/CIFS : `fsync` d'un répertoire peut rendre EINVAL alors que le
+    fichier est publié et validé. Journalisé, pas un échec. Une vraie panne
+    (EIO) remonte toujours.
+    """
+    import errno
+    import stat as stat_mod
+
+    vrai_fsync = os.fsync
+    code = {"errno": errno.EINVAL}
+
+    def fsync(fd):
+        if stat_mod.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(code["errno"], os.strerror(code["errno"]))
+        return vrai_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    change = rw.write_model_entry(_config(atelier), MODEL_ID, mode=ex.ExecutionMode.APPLY)
+    assert change.status == ex.STEP_DONE, change.error
+    assert MODEL_ID in atelier["registry"].read_text(encoding="utf-8")
+
+    code["errno"] = errno.EIO
+    with pytest.raises(OSError):
+        rw._atomic_write(atelier["registry"], atelier["registry"].read_text(), (atelier["models_dir"],), "T1")
+
+
+def test_la_purge_garde_les_plus_recentes_dans_la_meme_seconde(atelier):
+    """
+    Régression : tri par nom — `…Z-1.bak` avant `…Z.bak` — d'où l'effacement
+    des pré-états les plus récents quand plusieurs écritures tombent dans la
+    même seconde. L'ordre suit désormais la création (mtime_ns, puis `-N`).
+    """
+    registry = atelier["registry"]
+    stamp = T0.strftime("%Y%m%dT%H%M%SZ")
+    noms = [f"{registry.name}{rw.BACKUP_INFIX}{stamp}{s}{rw.BACKUP_SUFFIX}" for s in ("", "-1", "-2")]
+    for rang, nom in enumerate(noms):
+        (registry.parent / nom).write_text(nom, encoding="utf-8")
+        os.utime(registry.parent / nom, ns=(10**18 + rang, 10**18 + rang))
+
+    supprimees = rw._purge_backups(registry, 2)
+
+    assert supprimees == (noms[0],)
+    assert [p.name for p in _sauvegardes(registry)] == sorted(noms[1:])
 
 
 def test_une_retention_nulle_est_refusee(atelier):

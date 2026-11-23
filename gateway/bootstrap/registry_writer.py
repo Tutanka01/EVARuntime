@@ -108,6 +108,7 @@ import json
 import math
 import os
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -906,12 +907,21 @@ class _Document:
         return trouves[0] if trouves else None
 
 
-def _read_document(path: Path) -> _Document:
-    """Lit le registre. Un fichier absent est un cas normal, pas une erreur."""
+def _read_document(path: Path, *, universal_newlines: bool = False) -> _Document:
+    """
+    Lit le registre. Un fichier absent est un cas normal, pas une erreur.
+
+    Par défaut le texte est relu SANS traduction des fins de ligne : un fichier
+    CRLF garde ses `\r\n`, que la retouche conserve, et `_registry_sha256`
+    porte alors sur les octets mêmes que hache la gateway (`read_snapshot`).
+    `universal_newlines=True` est le comportement historique du chemin admin
+    (`ModelRegistry`), qui réécrit le fichier entier en LF.
+    """
     if not path.exists():
         return _Document(text="", data={"models": []}, exists=False)
     try:
-        text = path.read_text(encoding="utf-8")
+        with open(path, encoding="utf-8", newline=None if universal_newlines else "") as handle:
+            text = handle.read()
     except OSError as exc:
         raise RegistryWriterError(f"lecture impossible de {path} : {exc}") from exc
 
@@ -956,7 +966,7 @@ def _render_entry_block(entry: Mapping[str, Any], indent: int, stamp: str) -> st
         allow_unicode=True,
         default_flow_style=False,
         sort_keys=False,
-        width=100,
+        width=_NO_FOLD,  # cf. `_render_scalar` : jamais de repli
     )
     prefix = " " * indent
     lignes = [
@@ -979,12 +989,14 @@ def _append_entry_text(document: _Document, entry: Mapping[str, Any], stamp: str
     qui était voulu, on refuse au lieu de se rabattre sur une réécriture.
     """
     if not document.exists or not document.text.strip():
-        base = _NEW_FILE_HEADER
-        indent = 2
-    else:
-        base = document.text if document.text.endswith("\n") else document.text + "\n"
-        indent = _list_indent(document.text)
-    return base + _render_entry_block(entry, indent, stamp)
+        return _NEW_FILE_HEADER + _render_entry_block(entry, 2, stamp)
+    # Le bloc ajouté prend la fin de ligne du fichier : un registre CRLF ne doit
+    # pas devenir un fichier aux fins de ligne mélangées.
+    premiere = _YAML_EOL_RE.search(document.text)
+    eol = premiere.group(0) if premiere is not None else "\n"
+    base = document.text if _YAML_EOL_AT_END_RE.search(document.text) else document.text + eol
+    bloc = _render_entry_block(entry, _list_indent(document.text), stamp)
+    return base + (bloc.replace("\n", eol) if eol != "\n" else bloc)
 
 
 def _entry_block_bounds(lines: Sequence[str], model_id: str) -> tuple[int, int, int]:
@@ -1031,6 +1043,76 @@ def _entry_block_bounds(lines: Sequence[str], model_id: str) -> tuple[int, int, 
         raise RegistryWriterError(str(exc)) from exc
 
 
+# Fins de ligne telles que PyYAML les compte. `str.split("\n")` ne voyait pas
+# U+0085 ni U+2028/U+2029 (lignes de PyYAML décalées, donc mauvaise ligne
+# retouchée) et laissait le `\r` d'un fichier CRLF dans le corps de la ligne.
+_YAML_EOL_RE = re.compile(r"\r\n|[\r\n\x85  ]")
+_YAML_EOL_AT_END_RE = re.compile(r"(?:\r\n|[\r\n\x85  ])\Z")
+
+
+def _split_keepends(text: str) -> list[str]:
+    """
+    Découpe `text` aux fins de ligne de PyYAML, chacune gardée sur sa ligne.
+
+    `"".join(_split_keepends(t)) == t`, et le dernier élément est la ligne non
+    terminée (`""` si le texte finit par une fin de ligne), comme `split("\n")`.
+    """
+    lignes: list[str] = []
+    position = 0
+    for match in _YAML_EOL_RE.finditer(text):
+        lignes.append(text[position:match.end()])
+        position = match.end()
+    lignes.append(text[position:])
+    return lignes
+
+
+def _split_eol(ligne: str) -> tuple[str, str]:
+    match = _YAML_EOL_AT_END_RE.search(ligne)
+    if match is None:
+        return ligne, ""
+    return ligne[:match.start()], match.group(0)
+
+
+def _protected_comment_lines(text: str) -> Counter[str]:
+    """
+    Lignes de commentaire d'un texte YAML, hors contenu d'un scalaire multiligne.
+
+    Une ligne `# …` située À L'INTÉRIEUR d'un scalaire bloc ou entre guillemets
+    est de la valeur ; toutes les autres sont des commentaires d'exploitation.
+    Le découpage vient du parseur, appliqué au document ENTIER — indépendamment
+    de l'extrait qu'emploie `_scalar_value_span` : c'est ce qui en fait un
+    garde-fou et non une seconde copie du même calcul. Un texte que le parseur
+    refuse est traité prudemment : toute ligne `#` y est protégée.
+    """
+    lignes = [_split_eol(ligne)[0] for ligne in _split_keepends(text)]
+    contenu = model_registry.scalar_content_lines(lignes)
+    return Counter(
+        ligne for rang, ligne in enumerate(lignes)
+        if ligne.lstrip().startswith("#") and rang not in contenu
+    )
+
+
+def _assert_comments_kept(avant: str, apres: str, contexte: str) -> None:
+    """
+    Refuse toute retouche qui ferait disparaître une ligne de commentaire.
+
+    Chaque ligne de commentaire d'exploitation de `avant` doit se retrouver,
+    octet pour octet (fin de ligne exceptée), dans `apres`. Le contrôle du
+    candidat (`_assert_candidate_matches`) ne voit pas les commentaires — un
+    texte qui les perd reste sémantiquement identique — : sans ce garde-fou, la
+    seule copie restante était la sauvegarde, purgée après cinq écritures.
+    Un refus est toujours acceptable ; une perte silencieuse, jamais.
+    """
+    perdus = _protected_comment_lines(avant) - _protected_comment_lines(apres)
+    if perdus:
+        exemple = next(iter(perdus)).strip()
+        raise RegistryWriterError(
+            f"{contexte} : la retouche ferait disparaître {sum(perdus.values())} ligne(s) "
+            f"de commentaire (par ex. « {exemple[:80]} »). Rien n'a été écrit ; "
+            "modifiez l'entrée à la main."
+        )
+
+
 def _set_scalar_field(
     lines: list[str], debut: int, fin: int, champ_indent: int, champ: str, rendu: str
 ) -> list[str]:
@@ -1040,26 +1122,201 @@ def _set_scalar_field(
     Un commentaire de fin de ligne (« # à affiner via nvidia-smi ») est de
     l'information d'exploitation : le perdre en changeant une valeur serait une
     perte de données silencieuse.
+
+    L'étendue de la valeur existante est celle que le parseur YAML lui donne
+    (`_scalar_value_span`), pas celle d'une expression régulière : une valeur
+    entre guillemets contenant `#` (« 'Model #1 for chat' ») n'est pas un
+    commentaire, une valeur repliée sur plusieurs lignes est remplacée en
+    entier, et une valeur écrite sur la ligne qui suit sa clé aussi (la clé
+    porte alors la nouvelle valeur). L'ancienne retouche d'une seule ligne
+    physique laissait la fin d'une telle valeur en place, et le texte produit
+    ne signifiait plus rien.
+
+    `lines` peut porter ses fins de ligne (`_split_keepends`, chemin bootstrap)
+    ou non (`splitlines()`, chemin admin) : la ligne retouchée garde la sienne.
+    Toute retouche qui perdrait une ligne de commentaire est refusée
+    (`_assert_comments_kept`).
     """
-    motif = re.compile(r"^(\s*)" + re.escape(champ) + r":\s*(?P<valeur>[^#]*)(?P<comment>#.*)?$")
-    sortie = list(lines)
-    for i in range(debut, fin):
-        match = motif.match(sortie[i])
-        if not match or len(match.group(1)) != champ_indent:
+    corps: list[str] = []
+    fins: list[str] = []
+    for ligne in lines:
+        texte, eol = _split_eol(ligne)
+        corps.append(texte)
+        fins.append(eol)
+
+    sortie_corps = list(corps)
+    sortie_fins = list(fins)
+    etendue = _scalar_value_span(corps, debut, fin, champ_indent, champ)
+    if etendue is not None:
+        ligne_debut, prefixe, ligne_fin, commentaire = etendue
+        suffixe = f"  {commentaire}" if commentaire else ""
+        sortie_corps[ligne_debut:ligne_fin + 1] = [f"{prefixe} {rendu}{suffixe}"]
+        sortie_fins[ligne_debut:ligne_fin + 1] = [fins[ligne_fin]]
+    else:
+        # Repli : bloc que le parseur ne sait pas isoler (alias vers une ancre
+        # hors de l'entrée…). Retouche d'une ligne, commentaire détecté hors
+        # guillemets ; le contrôle du candidat refusera toujours un texte qui ne
+        # signifie pas ce qui était prévu.
+        motif = re.compile(r"^(\s*)" + re.escape(champ) + r":(?:\s+(?P<valeur>.*))?$")
+        for i in range(debut, fin):
+            match = motif.match(corps[i])
+            if not match or len(match.group(1)) != champ_indent:
+                continue
+            _, comment = _split_trailing_comment(match.group("valeur") or "")
+            suffixe = f"  {comment}" if comment else ""
+            sortie_corps[i] = f"{' ' * champ_indent}{champ}: {rendu}{suffixe}"
+            break
+        else:
+            # Champ absent — entrée écrite à la main qui s'appuie sur les
+            # défauts du registre. On l'insère juste après la ligne `- id:`.
+            eol = fins[debut]
+            if not eol:
+                # Ligne `- id:` sans fin de ligne (fin de fichier) : elle prend
+                # celle du fichier, la ligne insérée hérite de son absence.
+                eol = next((f for f in fins if f), "")
+                sortie_fins[debut] = eol
+                eol = ""
+            sortie_corps.insert(debut + 1, f"{' ' * champ_indent}{champ}: {rendu}")
+            sortie_fins.insert(debut + 1, eol)
+
+    _assert_comments_kept(
+        "\n".join(corps), "\n".join(sortie_corps), f"retouche du champ « {champ} »"
+    )
+    return [c + f for c, f in zip(sortie_corps, sortie_fins)]
+
+
+def _split_trailing_comment(valeur: str) -> tuple[str, str | None]:
+    """
+    Sépare `valeur  # commentaire` selon la règle YAML.
+
+    `#` n'ouvre un commentaire que hors guillemets et précédé d'un blanc (ou en
+    tête) : `a#b` et `'x # y'` sont des valeurs, pas des commentaires.
+    """
+    guillemet: str | None = None
+    index = 0
+    while index < len(valeur):
+        car = valeur[index]
+        if guillemet is not None:
+            if guillemet == '"' and car == "\\":
+                index += 2
+                continue
+            if car == guillemet:
+                if guillemet == "'" and valeur[index + 1:index + 2] == "'":
+                    index += 2
+                    continue
+                guillemet = None
+        elif car in "'\"" and not valeur[:index].strip():
+            guillemet = car
+        elif car == "#" and (index == 0 or valeur[index - 1] in " \t"):
+            return valeur[:index].rstrip(), valeur[index:].strip()
+        index += 1
+    return valeur.rstrip(), None
+
+
+def _scalar_value_span(
+    lines: Sequence[str], debut: int, fin: int, champ_indent: int, champ: str
+) -> tuple[int, str, int, str] | None:
+    """
+    Étendue textuelle de la valeur scalaire de `champ` dans le bloc, selon PyYAML.
+
+    `lines` sont des corps de ligne, sans fin de ligne. Retourne `(première ligne
+    à remplacer, préfixe à garder — « <indentation>champ: » —, dernière ligne à
+    remplacer, commentaire de fin à conserver)`, ou `None` si le champ est
+    absent ou si le bloc ne s'isole pas proprement.
+
+    Le bloc est ramené à un mapping autonome (indentation des champs retirée,
+    tiret de la première ligne effacé, commentaires moins indentés ramenés en
+    colonne 0) : le numéro de ligne et la colonne restent ceux du fichier,
+    décalés d'une constante. Un commentaire moins indenté que les champs ne
+    peut pas devenir une ligne vide de l'extrait : PyYAML l'aurait comptée dans
+    un scalaire bloc qui précède, et la retouche l'aurait effacé.
+    """
+    extrait: list[str] = []
+    for decalage, ligne in enumerate(lines[debut:fin]):
+        tete = ligne[:champ_indent]
+        if not tete.strip() or (decalage == 0 and re.fullmatch(r"\s*-\s+", tete)):
+            extrait.append(ligne[champ_indent:])
+        elif ligne.lstrip().startswith("#"):
+            extrait.append(ligne.lstrip())
+        else:
+            return None
+    try:
+        noeud = yaml.compose("\n".join(extrait) + "\n", Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(noeud, yaml.MappingNode):
+        return None
+    for cle, valeur in noeud.value:
+        if not (isinstance(cle, yaml.ScalarNode) and cle.value == champ):
             continue
-        comment = match.group("comment")
-        suffixe = f"  {comment.strip()}" if comment else ""
-        sortie[i] = f"{' ' * champ_indent}{champ}: {rendu}{suffixe}"
-        return sortie
-    # Champ absent — cas d'une entrée écrite à la main qui s'appuie sur les
-    # défauts du registre. On l'insère juste après la ligne `- id:`.
-    sortie.insert(debut + 1, f"{' ' * champ_indent}{champ}: {rendu}")
-    return sortie
+        if not isinstance(valeur, yaml.ScalarNode):
+            return None
+        ligne_cle = debut + cle.end_mark.line
+        apres_cle = lines[ligne_cle][champ_indent + cle.end_mark.column:]
+        deux_points = re.match(r"^[ \t]*:", apres_cle)
+        if deux_points is None:
+            return None
+        ligne_debut = debut + valeur.start_mark.line
+        colonne = champ_indent + valeur.start_mark.column
+        commentaires: list[str] = []
+        if ligne_debut == ligne_cle:
+            prefixe = lines[ligne_debut][:colonne].rstrip()
+        else:
+            # Valeur sur la ligne qui suit sa clé : la clé reçoit la valeur, et
+            # l'éventuel commentaire de la ligne de clé est conservé.
+            prefixe = lines[ligne_cle][:champ_indent + cle.end_mark.column] + ":"
+            reste_cle = apres_cle[deux_points.end():].strip()
+            if reste_cle and not reste_cle.startswith("#"):
+                return None
+            if reste_cle:
+                commentaires.append(reste_cle)
+            ligne_debut = ligne_cle
+        if valeur.style in ("|", ">"):
+            # Scalaire bloc : sa fin est le début de la ligne qui le suit ; le
+            # commentaire éventuel est sur la ligne d'en-tête (`|-  # …`).
+            ligne_fin = debut + valeur.end_mark.line - (1 if valeur.end_mark.column == 0 else 0)
+            ligne_fin = min(ligne_fin, fin - 1)
+            while ligne_fin > ligne_debut and not lines[ligne_fin].strip():
+                ligne_fin -= 1
+            entete = re.match(
+                r"^[|>][0-9+-]*\s*(?P<comment>#.*)?$",
+                lines[debut + valeur.start_mark.line][colonne:],
+            )
+            if entete is None:
+                return None
+            reste = entete.group("comment") or ""
+        else:
+            ligne_fin = debut + valeur.end_mark.line
+            reste = lines[ligne_fin][champ_indent + valeur.end_mark.column:]
+        reste = reste.strip()
+        if reste:
+            if not reste.startswith("#"):
+                return None
+            commentaires.append(reste)
+        return ligne_debut, prefixe, ligne_fin, " ".join(commentaires)
+    return None
+
+
+# Jamais de repli de ligne : `models.yaml` est retouché ligne à ligne, et une
+# valeur pliée par `yaml.safe_dump` (80 colonnes par défaut) ne se retouche plus.
+_NO_FOLD = float("inf")
 
 
 def _render_scalar(value: Any) -> str:
-    """Rendu YAML d'un scalaire, tel que `yaml.safe_dump` l'écrirait."""
-    return yaml.safe_dump(value, default_flow_style=True).strip().rstrip("...").strip()
+    """
+    Rendu YAML d'un scalaire sur UNE ligne, tel que `yaml.safe_dump` l'écrirait.
+
+    Largeur infinie : une description de 150 caractères repliée à 80 colonnes
+    donnait un rendu sur deux lignes, inséré tel quel dans une ligne de champ.
+    Une valeur contenant un saut de ligne est rendue entre guillemets doubles,
+    où `\\n` reste échappé sur la même ligne.
+    """
+    rendu = yaml.safe_dump(value, default_flow_style=True, width=_NO_FOLD).rstrip("\n")
+    if rendu.endswith("\n..."):  # marqueur de fin de document d'un scalaire nu
+        rendu = rendu[: -len("\n...")]
+    if "\n" in rendu:
+        rendu = yaml.safe_dump(value, default_style='"', width=_NO_FOLD).rstrip("\n")
+    return rendu
 
 
 def _assert_candidate_matches(candidate_text: str, expected: dict[str, Any], contexte: str) -> None:
@@ -1091,10 +1348,6 @@ def _stamp(config: WriterConfig) -> str:
     return config.now().astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _backup_path(target: Path, stamp: str) -> Path:
-    return target.with_name(f"{target.name}{BACKUP_INFIX}{stamp}{BACKUP_SUFFIX}")
-
-
 def _backup(target: Path, stamp: str, retention: int) -> tuple[Path, tuple[str, ...]]:
     """
     Copie horodatée du registre AVANT toute écriture, puis purge bornée.
@@ -1111,13 +1364,9 @@ def _backup(target: Path, stamp: str, retention: int) -> tuple[Path, tuple[str, 
     contenu = target.read_bytes()
     mode = os.stat(target).st_mode & 0o777
 
-    chemin = _backup_path(target, stamp)
-    for essai in range(1, 100):
-        try:
-            fd = os.open(chemin, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            chemin = _backup_path(target, f"{stamp}-{essai}")
+    reservee = model_registry.open_registry_backup(target, BACKUP_INFIX, BACKUP_SUFFIX, stamp)
+    if reservee is not None:
+        fd, chemin = reservee
     else:
         raise RegistryWriterError(
             f"impossible de créer une sauvegarde libre pour {target} — 100 tentatives"
@@ -1132,25 +1381,16 @@ def _backup(target: Path, stamp: str, retention: int) -> tuple[Path, tuple[str, 
 
 
 def _purge_backups(target: Path, retention: int) -> tuple[str, ...]:
-    """Ne garde que les `retention` sauvegardes les plus récentes. Motif strict."""
-    motif = re.compile(
-        r"^" + re.escape(target.name + BACKUP_INFIX)
-        + r"\d{8}T\d{6}Z(-\d+)?" + re.escape(BACKUP_SUFFIX) + r"$"
+    """
+    Ne garde que les `retention` sauvegardes les plus récentes. Motif strict.
+
+    Même implémentation que les sauvegardes `.pre-admin.` (seul l'infixe
+    change) : l'ordre par nom effaçait les pré-états les plus récents dès que
+    plusieurs écritures tombaient dans la même seconde.
+    """
+    return model_registry.purge_registry_backups(
+        target, BACKUP_INFIX, BACKUP_SUFFIX, retention
     )
-    existantes = sorted(
-        (p for p in target.parent.iterdir() if p.is_file() and motif.match(p.name)),
-        key=lambda p: p.name,
-    )
-    supprimees: list[str] = []
-    for vieille in existantes[:-retention] if retention < len(existantes) else []:
-        try:
-            vieille.unlink()
-            supprimees.append(vieille.name)
-        except OSError:
-            # Une sauvegarde non supprimable n'est pas un motif d'échec de
-            # l'installation : elle occupe de la place, elle ne casse rien.
-            continue
-    return tuple(supprimees)
 
 
 def _validate_loadable(path: Path, allowed_model_dirs: Sequence[Path]) -> int:
@@ -1183,7 +1423,10 @@ def _atomic_write(
     renommage atomique sur le même système de fichiers, comme le fait déjà
     `ModelRegistry._save()` et comme `update.sh` bascule ses artefacts. Le
     répertoire est `fsync`é après le renommage : sans cela, un arrêt brutal peut
-    laisser le répertoire pointant sur l'ancien inode.
+    laisser le répertoire pointant sur l'ancien inode. Un système de fichiers
+    qui ne supporte pas ce `fsync` (`EINVAL`/`ENOTSUP`) est journalisé, pas
+    traité en échec : le fichier est déjà publié et validé
+    (`execution.fsync_directory`, même discipline que le téléchargeur).
     """
     tmp = target.with_name(f".{target.name}.bootstrap-{stamp}.tmp")
     essai = 0
@@ -1193,7 +1436,8 @@ def _atomic_write(
 
     fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # `newline=""` : le texte est écrit tel quel, fins de ligne comprises.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -1205,11 +1449,7 @@ def _atomic_write(
         tmp.unlink(missing_ok=True)
         raise
 
-    dir_fd = os.open(target.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    execution.fsync_directory(target.parent)
     return nombre
 
 
@@ -1642,14 +1882,14 @@ def provisionally_enable_model_entry(
 
     # Le diff reste publié pour que la simulation décrive la transition qui
     # deviendra persistante après le smoke. Il n'est jamais écrit ici.
-    lignes = document.text.split("\n")
+    lignes = _split_keepends(document.text)
     debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
     lignes = _set_scalar_field(lignes, debut, fin, champ_indent, "enabled", "true")
     debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
     lignes = _set_scalar_field(
         lignes, debut, fin, champ_indent, "vram_gb", _render_scalar(cible_vram)
     )
-    candidat = "\n".join(lignes)
+    candidat = "".join(lignes)
     attendu = copy.deepcopy(document.data)
     cible = dict(attendu["models"][index])
     cible["enabled"] = True
@@ -1739,9 +1979,9 @@ def rollback_provisional_model_entry(
     cible = dict(attendu["models"][index])
     cible["enabled"] = False
     attendu["models"][index] = cible
-    lignes = document.text.split("\n")
+    lignes = _split_keepends(document.text)
     debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
-    candidat = "\n".join(
+    candidat = "".join(
         _set_scalar_field(lignes, debut, fin, champ_indent, "enabled", "false")
     )
     _assert_candidate_matches(candidat, attendu, f"rollback de « {model_id} »")
@@ -1931,14 +2171,14 @@ def enable_model_entry(
     cible["vram_gb"] = cible_vram
     attendu["models"][index] = cible
 
-    lignes = document.text.split("\n")
+    lignes = _split_keepends(document.text)
     debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
     lignes = _set_scalar_field(lignes, debut, fin, champ_indent, "enabled", "true")
     debut, fin, champ_indent = _entry_block_bounds(lignes, model_id)
     lignes = _set_scalar_field(
         lignes, debut, fin, champ_indent, "vram_gb", _render_scalar(cible_vram)
     )
-    candidat = "\n".join(lignes)
+    candidat = "".join(lignes)
     _assert_candidate_matches(candidat, attendu, f"activation de « {model_id} »")
     evidence["registry_sha256"] = hashlib.sha256(candidat.encode("utf-8")).hexdigest()
     evidence["diff"] = _diff(document.text, candidat, config.registry_path)

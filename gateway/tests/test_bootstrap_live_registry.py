@@ -230,29 +230,127 @@ async def test_update_rechecks_provisional_state_after_await(bootstrap_runtime):
 
 
 @pytest.mark.anyio
-async def test_expired_lease_rolls_back_and_unload_failure_is_fail_closed(
+async def test_expired_lease_unload_failure_is_fail_closed_then_converges(
     bootstrap_runtime,
     monkeypatch,
 ):
+    """
+    Bail expiré pendant une requête plus longue que le drain admin.
+
+    Tant que le déchargement est refusé, l'admission reste fermée et le registre
+    verrouillé (fail-closed). Régression : le watchdog abandonnait après le
+    premier refus et la transition restait `rolling_back` jusqu'au redémarrage.
+    Il retente désormais avec un backoff plafonné et converge dès la fin de la
+    requête en vol, sans applicateur.
+    """
     manager, _, _, _, digest = bootstrap_runtime
     await admin.bootstrap_sync_model("candidate", _activate(digest), None)
     state = admin._bootstrap_sync_states[(id(manager), "candidate")]
     admin._cancel_bootstrap_watchdog(state)
     manager.loaded = True
     manager.fail_unload = True
+    sleeps: list[float] = []
+    refusals_seen = 0
 
-    async def immediate_sleep(_: float) -> None:
-        return None
+    async def recording_sleep(delay: float) -> None:
+        nonlocal refusals_seen
+        sleeps.append(delay)
+        if len(sleeps) == 1:
+            return None  # le bail lui-même
+        # Entre deux tentatives : toujours fail-closed.
+        assert state.phase == "rolling_back"
+        assert manager.registry.get("candidate").enabled is False
+        assert "candidate" in manager.blocked
+        with pytest.raises(HTTPException) as caught:
+            admin._refuse_registry_mutation_during_bootstrap()
+        assert caught.value.status_code == 409
+        transitions = admin.bootstrap_transitions_status()
+        assert transitions == [{
+            "model_id": "candidate", "phase": "rolling_back",
+            "lease_expired": True, "rollback_attempts": manager.unload_calls,
+        }]
+        refusals_seen += 1
+        if len(sleeps) == 5:
+            manager.fail_unload = False  # la requête en vol s'est terminée
 
-    monkeypatch.setattr(admin, "_bootstrap_lease_sleep", immediate_sleep)
+    monkeypatch.setattr(admin, "_bootstrap_lease_sleep", recording_sleep)
     await admin._bootstrap_lease_watchdog(
         (id(manager), "candidate"), "candidate", state,
     )
 
-    assert state.phase == "rolling_back"
-    assert manager.registry.get("candidate").enabled is False
-    assert "candidate" in manager.blocked
-    assert manager.unload_calls == 1
+    assert refusals_seen == 4
+    assert sleeps[0] == state.lease_seconds
+    assert sleeps[1:] == [1.0, 2.0, 4.0, 8.0]  # backoff exponentiel
+    assert manager.unload_calls == 5
+    assert state.phase == "rolled_back"
+    assert state.terminal_digest == digest
+    assert "candidate" not in manager.blocked
+    assert manager.loaded is False
+    assert admin.bootstrap_transitions_status() == []
+    admin._refuse_registry_mutation_during_bootstrap()  # registre déverrouillé
+
+    # Un rollback tardif de l'applicateur reste idempotent.
+    late = await admin.bootstrap_sync_model(
+        "candidate", BootstrapModelSync(action="rollback", digest=digest), None,
+    )
+    assert late["idempotent"] is True
+
+
+def test_rollback_retry_backoff_is_capped():
+    delay = admin._BOOTSTRAP_ROLLBACK_RETRY_INITIAL_SECONDS
+    for _ in range(20):
+        delay = min(delay * 2, admin._BOOTSTRAP_ROLLBACK_RETRY_MAX_SECONDS)
+    assert delay == admin._BOOTSTRAP_ROLLBACK_RETRY_MAX_SECONDS <= 60
+
+
+@pytest.mark.anyio
+async def test_refused_explicit_rollback_converges_without_the_applier(
+    bootstrap_runtime,
+    monkeypatch,
+):
+    """Rollback explicite refusé puis applicateur disparu : la gateway termine seule."""
+    manager, _, _, _, digest = bootstrap_runtime
+    await admin.bootstrap_sync_model("candidate", _activate(digest), None)
+    manager.loaded = True
+    manager.fail_unload = True
+    retry_sleeps: list[float] = []
+
+    async def retry_sleep(delay: float) -> None:
+        retry_sleeps.append(delay)
+        manager.fail_unload = False
+
+    monkeypatch.setattr(admin, "_bootstrap_lease_sleep", retry_sleep)
+    with pytest.raises(HTTPException):
+        await admin.bootstrap_sync_model(
+            "candidate", BootstrapModelSync(action="rollback", digest=digest), None,
+        )
+    state = admin._bootstrap_sync_states[(id(manager), "candidate")]
+    assert state.phase == "rolling_back" and "candidate" in manager.blocked
+    assert state.watchdog is not None
+
+    await state.watchdog
+
+    assert retry_sleeps == [1.0]
+    assert state.phase == "rolled_back"
+    assert "candidate" not in manager.blocked
+    assert manager.unload_calls == 2
+
+
+@pytest.mark.anyio
+async def test_admin_status_exposes_open_bootstrap_transition(bootstrap_runtime):
+    manager, _, _, _, digest = bootstrap_runtime
+    manager.status = lambda: {
+        "vram_budget": {"total_gb": 1.0, "used_gb": 0.0, "available_gb": 1.0},
+        "models": [],
+    }
+    await admin.bootstrap_sync_model("candidate", _activate(digest), None)
+
+    status = await admin.get_status(None)
+
+    assert status["bootstrap_transitions"] == [{
+        "model_id": "candidate", "phase": "active",
+        "lease_expired": False, "rollback_attempts": 0,
+    }]
 
 
 @pytest.mark.anyio

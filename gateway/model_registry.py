@@ -29,6 +29,7 @@ import math
 import os
 import re
 import logging
+import stat
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -786,15 +787,21 @@ class ModelRegistry:
 
         # Vérification des répertoires autorisés (si configuré)
         if self._allowed_dirs:
+            allowed_str = ", ".join(str(d) for d in self._allowed_dirs)
+            # Fail-closed : un chemin non résolvable (octet NUL, boucle de liens…)
+            # est refusé. Retomber sur le chemin brut laissait passer
+            # `<autorisé>/../hors\x00.gguf`, `..` n'étant alors jamais résolu.
             try:
                 resolved = path.resolve()
             except Exception:
-                resolved = path
+                raise ValueError(
+                    f"Chemin refusé : {raw_path!r} n'est pas sous un répertoire autorisé. "
+                    f"Répertoires autorisés : {allowed_str}"
+                ) from None
             if not any(
                 resolved == allowed or resolved.is_relative_to(allowed)
                 for allowed in self._allowed_dirs
             ):
-                allowed_str = ", ".join(str(d) for d in self._allowed_dirs)
                 raise ValueError(
                     f"Chemin refusé : {raw_path!r} n'est pas sous un répertoire autorisé. "
                     f"Répertoires autorisés : {allowed_str}"
@@ -975,14 +982,21 @@ class ModelRegistry:
         horodatage = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
         try:
-            document = rw._read_document(self._path)
+            # Comportement historique du chemin admin : fins de ligne traduites,
+            # fichier réécrit en LF (antérieur à la retouche CRLF du bootstrap).
+            document = rw._read_document(self._path, universal_newlines=True)
         except Exception as exc:
             raise RegistryWriteRefused(
                 f"{self._path} n'a pas pu être relu avant écriture ({exc}). Rien n'a été "
                 "écrit : la gateway ne remplace pas un registre qu'elle ne comprend pas."
             ) from exc
 
-        texte, attendu = self._plan_registry_text(rw, document, horodatage, precedent)
+        try:
+            texte, attendu = self._plan_registry_text(rw, document, horodatage, precedent)
+        except rw.RegistryWriterError as exc:
+            # Refus de la politique d'écriture textuelle (commentaire qui serait
+            # perdu, champ non isolable…) : un refus, donc un 422, jamais un 500.
+            raise RegistryWriteRefused(str(exc)) from exc
 
         if document.exists and texte == document.text:
             # Mutation sans effet sur le disque (valeur réécrite à l'identique) :
@@ -1052,6 +1066,11 @@ class ModelRegistry:
         for identifiant in retires:
             texte = _delete_entry_block(rw, texte, identifiant)
 
+        # Seules les suppressions perdent des commentaires, et à dessein : ceux
+        # internes au bloc supprimé (gardés par la sauvegarde). Au-delà de ce
+        # point, plus aucune ligne de commentaire ne peut disparaître.
+        avant_retouches = texte
+
         # 2. Mises à jour, champ par champ.
         for identifiant in communs:
             brute = brutes[positions[identifiant]]
@@ -1086,6 +1105,7 @@ class ModelRegistry:
             texte = _append_entry_block(rw, texte, entree, horodatage)
             restantes.append(entree)
 
+        rw._assert_comments_kept(avant_retouches, texte, f"écriture de {self._path.name}")
         attendu = copy.deepcopy(document.data) if document.exists else {}
         attendu["models"] = restantes
         return texte, attendu
@@ -1256,6 +1276,40 @@ def _join(lignes: list[str]) -> str:
     return ("\n".join(lignes) + "\n") if lignes else ""
 
 
+_YAML_EOL_AT_END_RE = re.compile(r"(?:\r\n|[\r\n\x85\u2028\u2029])\Z")
+
+
+def scalar_content_lines(lignes: list[str]) -> set[int]:
+    """
+    Rangs des lignes qui CONTINUENT un scalaire multiligne (bloc `|`/`>`, plain
+    replié, entre guillemets), selon PyYAML.
+
+    `lignes` doit être découpé aux fins de ligne que PyYAML compte — `splitlines()`
+    (chemin admin) ou `registry_writer._split_keepends()` (chemin bootstrap) —,
+    fins de ligne gardées ou non. Une telle ligne est de la VALEUR : ni un tiret
+    de séquence, ni une clé `id:`, ni une ligne moins indentée qui fermerait
+    l'entrée, ni un commentaire. Texte que le parseur refuse : ensemble vide.
+    """
+    texte = "\n".join(_YAML_EOL_AT_END_RE.sub("", ligne) for ligne in lignes)
+    try:
+        racine = yaml.compose(texte, Loader=yaml.SafeLoader)
+    except yaml.YAMLError:
+        return set()
+    contenu: set[int] = set()
+    pile = [racine] if racine is not None else []
+    while pile:
+        noeud = pile.pop()
+        if isinstance(noeud, yaml.MappingNode):
+            for cle, valeur in noeud.value:
+                pile.extend((cle, valeur))
+        elif isinstance(noeud, yaml.SequenceNode):
+            pile.extend(noeud.value)
+        elif isinstance(noeud, yaml.ScalarNode):
+            derniere = noeud.end_mark.line - (1 if noeud.end_mark.column == 0 else 0)
+            contenu.update(range(noeud.start_mark.line + 1, derniere + 1))
+    return contenu
+
+
 def _entry_bounds(lignes: list[str], model_id: str) -> tuple[int, int, int]:
     """
     Bornes textuelles de l'entrée `model_id` : (début, fin exclue, indentation des champs).
@@ -1275,9 +1329,15 @@ def _entry_bounds(lignes: list[str], model_id: str) -> tuple[int, int, int]:
     correspondances ⇒ **refus** : la gateway ne retouche pas un fichier dont elle
     n'identifie pas l'entrée avec certitude.
     """
+    # Les suites de scalaires multilignes sont de la valeur (une description
+    # en bloc peut contenir « - x » ou « id: y », ou une ligne en colonne 0
+    # après un U+2028 entre guillemets) : elles ne délimitent rien.
+    contenu = scalar_content_lines(lignes)
     debuts: list[tuple[int, int]] = []  # (ligne, indentation des champs)
     indent_liste: int | None = None
     for index, ligne in enumerate(lignes):
+        if index in contenu:
+            continue
         match = re.match(r"^(\s*)-(\s+)(?=\S)", ligne)
         if not match:
             continue
@@ -1295,7 +1355,7 @@ def _entry_bounds(lignes: list[str], model_id: str) -> tuple[int, int, int]:
         # l'élément suivant (une autre clé racine, par exemple).
         for curseur in range(debut + 1, fin):
             depouillee = lignes[curseur].strip()
-            if not depouillee or depouillee.startswith("#"):
+            if not depouillee or depouillee.startswith("#") or curseur in contenu:
                 continue
             if len(lignes[curseur]) - len(lignes[curseur].lstrip()) < champ_indent:
                 fin = curseur
@@ -1304,6 +1364,8 @@ def _entry_bounds(lignes: list[str], model_id: str) -> tuple[int, int, int]:
             r"^(\s*)id:\s*[\"']?" + re.escape(model_id) + r"[\"']?\s*(#.*)?$"
         )
         for curseur in range(debut, fin):
+            if curseur in contenu:
+                continue
             candidate = lignes[curseur]
             if curseur == debut:
                 candidate = " " * champ_indent + candidate[champ_indent:]
@@ -1462,7 +1524,7 @@ def _insert_entry_mapping(
     debut, fin, champ_indent = _entry_bounds(lignes, model_id)
 
     rendu = yaml.safe_dump(
-        dict(mapping), allow_unicode=True, default_flow_style=False, sort_keys=False, width=100
+        dict(mapping), allow_unicode=True, default_flow_style=False, sort_keys=False, width=rw._NO_FOLD
     )
     bloc = [f"{' ' * champ_indent}{champ}:"]
     bloc += [
@@ -1493,7 +1555,7 @@ def _append_entry_block(rw, texte: str, entree: Mapping[str, Any], horodatage: s
     indent = rw._list_indent(texte)
     prefixe = " " * indent
     rendu = yaml.safe_dump(
-        [dict(entree)], allow_unicode=True, default_flow_style=False, sort_keys=False, width=100
+        [dict(entree)], allow_unicode=True, default_flow_style=False, sort_keys=False, width=rw._NO_FOLD
     )
     bloc = [f"{prefixe}# Entrée ajoutée par l'API admin le {horodatage}."]
     bloc += [prefixe + ligne if ligne else "" for ligne in rendu.rstrip("\n").split("\n")]
@@ -1504,8 +1566,39 @@ def _append_entry_block(rw, texte: str, entree: Mapping[str, Any], horodatage: s
 
 # ── Sauvegarde bornée et propriété du fichier ────────────────────────────────
 
-def _admin_backup_path(cible: Path, horodatage: str) -> Path:
-    return cible.with_name(f"{cible.name}{_ADMIN_BACKUP_INFIX}{horodatage}{_ADMIN_BACKUP_SUFFIX}")
+def _backup_name_re(cible: Path, infix: str, suffixe: str) -> re.Pattern[str]:
+    """Motif strict `<cible><infix>AAAAMMJJTHHMMSSZ[-N]<suffixe>` des sauvegardes."""
+    return re.compile(
+        r"^" + re.escape(cible.name + infix)
+        + r"(?P<stamp>\d{8}T\d{6}Z)(?:-(?P<essai>\d+))?" + re.escape(suffixe) + r"$"
+    )
+
+
+def open_registry_backup(
+    cible: Path, infix: str, suffixe: str, horodatage: str
+) -> tuple[int, Path] | None:
+    """
+    Réserve (`O_EXCL`) le nom de la prochaine sauvegarde ; `None` après 100 essais.
+
+    Commun aux sauvegardes `.pre-admin.` et `.pre-bootstrap.`. Le numéro `-N`
+    repart AU-DELÀ du plus grand déjà présent pour cet horodatage, jamais du
+    premier trou : après une purge, réemployer un nom libéré rendait l'ordre
+    des noms d'une même seconde sans rapport avec l'ordre de création.
+    """
+    motif = _backup_name_re(cible, infix, suffixe)
+    dernier = -1
+    for chemin in cible.parent.iterdir():
+        match = motif.match(chemin.name)
+        if match is not None and match.group("stamp") == horodatage:
+            dernier = max(dernier, int(match.group("essai") or 0))
+    for essai in range(dernier + 1, dernier + 101):
+        nom = horodatage if essai == 0 else f"{horodatage}-{essai}"
+        chemin = cible.with_name(f"{cible.name}{infix}{nom}{suffixe}")
+        try:
+            return os.open(chemin, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), chemin
+        except FileExistsError:
+            continue
+    return None
 
 
 def _backup_registry(cible: Path, horodatage: str, retention: int) -> Path:
@@ -1519,13 +1612,9 @@ def _backup_registry(cible: Path, horodatage: str, retention: int) -> Path:
     contenu = cible.read_bytes()
     mode = os.stat(cible).st_mode & 0o777
 
-    chemin = _admin_backup_path(cible, horodatage)
-    for essai in range(1, 100):
-        try:
-            descripteur = os.open(chemin, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            break
-        except FileExistsError:
-            chemin = _admin_backup_path(cible, f"{horodatage}-{essai}")
+    reservee = open_registry_backup(cible, _ADMIN_BACKUP_INFIX, _ADMIN_BACKUP_SUFFIX, horodatage)
+    if reservee is not None:
+        descripteur, chemin = reservee
     else:
         raise RegistryWriteRefused(
             f"impossible de créer une sauvegarde libre pour {cible} — 100 tentatives. "
@@ -1550,16 +1639,41 @@ def _purge_admin_backups(cible: Path, retention: int) -> tuple[str, ...]:
     laisse s'accumuler (OPS-002) non plus. Le dashboard peut déclencher une
     écriture à chaque clic : ne pas borner ici recréerait ce défaut en pire.
     """
-    motif = re.compile(
-        r"^" + re.escape(cible.name + _ADMIN_BACKUP_INFIX)
-        + r"\d{8}T\d{6}Z(-\d+)?" + re.escape(_ADMIN_BACKUP_SUFFIX) + r"$"
-    )
-    existantes = sorted(
-        (p for p in cible.parent.iterdir() if p.is_file() and motif.match(p.name)),
-        key=lambda p: p.name,
-    )
+    return purge_registry_backups(cible, _ADMIN_BACKUP_INFIX, _ADMIN_BACKUP_SUFFIX, retention)
+
+
+def purge_registry_backups(
+    cible: Path, infix: str, suffixe: str, retention: int
+) -> tuple[str, ...]:
+    """
+    Purge bornée commune aux sauvegardes `.pre-admin.` et `.pre-bootstrap.`.
+
+    Seuls les fichiers `<cible><infix>AAAAMMJJTHHMMSSZ[-N]<suffixe>` du même
+    répertoire sont candidats. L'ordre n'est PAS celui des noms : `…Z-1.bak` se
+    trie avant `…Z.bak`, si bien qu'au-delà de `retention` mutations dans la même
+    seconde les pré-états les plus récents étaient effacés aussitôt créés. On
+    trie par `mtime_ns`, puis par horodatage et numéro d'essai (`-N`) décodés du
+    nom — départage d'un système de fichiers à mtime grossière, fiable parce que
+    `open_registry_backup` ne réemploie jamais un numéro inférieur.
+    """
+    motif = _backup_name_re(cible, infix, suffixe)
+    candidates: list[tuple[int, str, int, Path]] = []
+    for chemin in cible.parent.iterdir():
+        match = motif.match(chemin.name)
+        if match is None:
+            continue
+        try:
+            etat = chemin.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(etat.st_mode):
+            continue
+        candidates.append(
+            (etat.st_mtime_ns, match.group("stamp"), int(match.group("essai") or 0), chemin)
+        )
+    candidates.sort(key=lambda c: c[:3])
     supprimees: list[str] = []
-    for vieille in existantes[:-retention] if retention < len(existantes) else []:
+    for *_, vieille in candidates[:-retention] if retention < len(candidates) else []:
         try:
             vieille.unlink()
             supprimees.append(vieille.name)

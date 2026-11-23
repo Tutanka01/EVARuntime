@@ -1179,6 +1179,144 @@ def test_verification_refuse_un_fichier_altere_apres_coup(tmp_path):
     assert "empreinte SHA-256 différente" in result.error
 
 
+# ── 11 bis. Durabilité du renommage, un seul hachage par run ─────────────────
+
+def test_le_gguf_est_fsynce_avant_le_renommage_et_le_repertoire_apres(tmp_path, monkeypatch):
+    """
+    Régression : `os.replace(part, final)` sans `fsync` du fichier. Après une
+    coupure, le nom définitif pouvait porter un contenu incomplet, ensuite
+    traité comme « divergent, ni écrasé ni réparé ».
+    """
+    import stat as stat_mod
+    import threading
+
+    _, config = granted(tmp_path)
+    evenements: list[tuple[str, str]] = []
+    principal = threading.main_thread()
+    vrai_fsync, vrai_replace = downloader.os.fsync, downloader.os.replace
+
+    def fsync(fd):
+        assert threading.current_thread() is not principal, "fsync hors boucle d'événements"
+        genre = "dir" if stat_mod.S_ISDIR(downloader.os.fstat(fd).st_mode) else "file"
+        evenements.append(("fsync", genre))
+        return vrai_fsync(fd)
+
+    def replace(src, dst):
+        evenements.append(("replace", Path(dst).name))
+        return vrai_replace(src, dst)
+
+    monkeypatch.setattr(downloader.os, "fsync", fsync)
+    monkeypatch.setattr(downloader.os, "replace", replace)
+
+    assert run_download(tmp_path, config).status == execution.STEP_DONE
+
+    for nom in (WEIGHTS_NAME, MMPROJ_NAME):
+        rang = evenements.index(("replace", nom))
+        assert evenements[rang - 1] == ("fsync", "file")
+        assert evenements[rang + 1] == ("fsync", "dir")
+
+
+def test_un_fsync_de_repertoire_non_supporte_ne_fait_pas_echouer_le_telechargement(
+    tmp_path, monkeypatch
+):
+    """
+    Régression : sur NFS/FUSE/CIFS, `fsync` d'un répertoire peut rendre EINVAL.
+    Le fichier est alors publié et vérifié ; l'étape ne doit pas être déclarée
+    en échec. Le `fsync` du FICHIER reste obligatoire : son échec, lui, fait
+    échouer l'étape avant tout renommage.
+    """
+    import errno
+    import stat as stat_mod
+
+    _, config = granted(tmp_path)
+    vrai_fsync = downloader.os.fsync
+    echec = {"dir": errno.EINVAL, "file": None}
+
+    def fsync(fd):
+        genre = "dir" if stat_mod.S_ISDIR(downloader.os.fstat(fd).st_mode) else "file"
+        if echec[genre] is not None:
+            raise OSError(echec[genre], downloader.os.strerror(echec[genre]))
+        return vrai_fsync(fd)
+
+    monkeypatch.setattr(downloader.os, "fsync", fsync)
+    result = run_download(tmp_path, config)
+    assert result.status == execution.STEP_DONE, result.error
+    assert (config.models_dir / WEIGHTS_NAME).read_bytes() == WEIGHTS
+
+    # Contrôle : un fsync de fichier en échec n'est jamais toléré.
+    second = tmp_path / "second"
+    second.mkdir()
+    _, autre = granted(second)
+    echec.update({"dir": None, "file": errno.EIO})
+    result = run_download(second, autre)
+    assert result.status == execution.STEP_FAILED
+    assert not (autre.models_dir / WEIGHTS_NAME).exists()
+
+
+def _compter_les_lectures(monkeypatch) -> list[str]:
+    lectures: list[str] = []
+    vrai = downloader._hash_file
+
+    def compte(path, chunk_bytes, hasher=None):
+        lectures.append(Path(path).name)
+        return vrai(path, chunk_bytes, hasher)
+
+    monkeypatch.setattr(downloader, "_hash_file", compte)
+    return lectures
+
+
+def _download_puis_verify(tmp_path, config):
+    """Un run : UNE paire d'exécuteurs, comme `applier.build_registry`."""
+    executeurs = downloader.make_executors(config)
+    contexte = make_context(tmp_path)
+    telechargement = run(executeurs[schema.ACTION_DOWNLOAD_MODEL], download_step(1), contexte)
+    verification = run(executeurs[schema.ACTION_VERIFY_ARTIFACT], verify_step(2), contexte)
+    return telechargement, verification
+
+
+def test_un_gguf_inchange_n_est_hache_qu_une_fois_par_run(tmp_path, monkeypatch):
+    """
+    Régression : installation neuve = hachage en flux PUIS relecture complète
+    par `verify_artifact` ; reprise = deux relectures. Désormais : aucune
+    relecture sur une installation neuve, une seule à la reprise.
+    """
+    _, config = granted(tmp_path)
+    lectures = _compter_les_lectures(monkeypatch)
+
+    telechargement, verification = _download_puis_verify(tmp_path, config)
+    assert telechargement.status == execution.STEP_DONE
+    assert verification.status == execution.STEP_ALREADY_SATISFIED
+    assert lectures == [], "l'empreinte calculée en flux suffit pour ce run"
+
+    # Run suivant : nouveau mémo, chaque fichier est relu une fois, pas deux.
+    telechargement, verification = _download_puis_verify(tmp_path, config)
+    assert telechargement.status == execution.STEP_ALREADY_SATISFIED
+    assert verification.status == execution.STEP_ALREADY_SATISFIED
+    assert sorted(lectures) == sorted([WEIGHTS_NAME, MMPROJ_NAME])
+
+
+def test_un_fichier_modifie_entre_download_et_verify_est_rehache_et_refuse(
+    tmp_path, monkeypatch
+):
+    _, config = granted(tmp_path)
+    lectures = _compter_les_lectures(monkeypatch)
+    executeurs = downloader.make_executors(config)
+    contexte = make_context(tmp_path)
+    assert run(
+        executeurs[schema.ACTION_DOWNLOAD_MODEL], download_step(1), contexte
+    ).status == execution.STEP_DONE
+
+    poids = config.models_dir / WEIGHTS_NAME
+    mtime = poids.stat().st_mtime_ns
+    poids.write_bytes(b"Z" * len(WEIGHTS))  # même taille, même inode
+    downloader.os.utime(poids, ns=(mtime + 1_000_000_000, mtime + 1_000_000_000))
+
+    verification = run(executeurs[schema.ACTION_VERIFY_ARTIFACT], verify_step(2), contexte)
+    assert verification.status == execution.STEP_FAILED
+    assert "empreinte SHA-256 différente" in verification.error
+    assert lectures == [WEIGHTS_NAME]  # seul le fichier modifié est relu
+
+
 # ── 12. Entrée non planifiable ───────────────────────────────────────────────
 
 def test_entree_non_epinglee_nest_pas_telechargeable(tmp_path):

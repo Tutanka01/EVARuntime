@@ -1047,7 +1047,15 @@ def test_l_application_reelle_n_est_pas_le_defaut():
     assert param.secondary_opts == []
 
 
-def test_une_simulation_complete_ne_sort_jamais_en_zero(tmp_path, hote):
+@pytest.fixture
+def allowlist_service(monkeypatch, hote):
+    """`ALLOWED_MODEL_DIRS` de la configuration lue par la CLI (sans --env-file)."""
+    dirs = [str(hote["models_dir"])]
+    monkeypatch.setattr(cli_module.settings, "allowed_model_dirs", dirs)
+    return dirs
+
+
+def test_une_simulation_complete_ne_sort_jamais_en_zero(tmp_path, hote, allowlist_service):
     resultat = CliRunner().invoke(cli_module.app, [
         "bootstrap-apply", str(_plan_file(tmp_path, ETAPES_CHAINE)),
         "--allowed-root", str(hote["tmp_path"]),
@@ -1145,7 +1153,7 @@ def test_une_erreur_environmentfile_expurge_la_valeur_reelle_du_secret(
     assert secret not in sortie
 
 
-def test_le_rendu_json_est_du_json_pur(tmp_path, hote):
+def test_le_rendu_json_est_du_json_pur(tmp_path, hote, allowlist_service):
     """
     Le rapport JSON ne doit porter aucun balisage : un script le relit.
 
@@ -1170,3 +1178,98 @@ def test_le_rendu_json_est_du_json_pur(tmp_path, hote):
     document = json.loads(resultat.stdout)
     assert document["execution"]["mode"] == ex.ExecutionMode.DRY_RUN.value
     assert document["execution"]["applied"] is False
+
+
+# ── Allowlist de modèles : celle du service, pas `(--models-dir,)` ───────────
+# Régression : la CLI validait `models.yaml` contre `(--models-dir,)`. Sur le
+# registre livré (entrées sous `/models` ET `/data/models`), la commande
+# documentée `--models-dir /models` échouait dès la simulation ; à l'inverse,
+# un `--models-dir` hors `ALLOWED_MODEL_DIRS` du service écrivait une entrée
+# que la gateway refusait au démarrage suivant.
+
+_SHIPPED_REGISTRY = Path(__file__).resolve().parent.parent / "models.yaml"
+
+
+def _apply_write_registry(tmp_path, hote, *extra):
+    catalogue_id = "smollm2-360m-instruct-q8_0"
+    (hote["models_dir"] / f"{catalogue_id}.gguf").write_bytes(b"GGUF")
+    chemin = _plan_file(
+        tmp_path, [(sc.ACTION_WRITE_REGISTRY, f"models.yaml → {catalogue_id}")]
+    )
+    return CliRunner().invoke(cli_module.app, [
+        "bootstrap-apply", str(chemin), "--json",
+        "--allowed-root", str(hote["tmp_path"]),
+        "--registry", str(hote["registry"]),
+        "--runtime-version", "b6042",
+        "--hardware-fingerprint", "L40S-48G-driver-570.86",
+        "--vram-budget-gb", "43.6",
+        *extra,
+    ])
+
+
+def test_registre_livre_sur_deux_repertoires_valide_avec_l_allowlist_du_service(
+    tmp_path, hote, monkeypatch
+):
+    hote["registry"].write_text(_SHIPPED_REGISTRY.read_text(encoding="utf-8"), encoding="utf-8")
+    chemins = [
+        Path(m["path"])
+        for m in yaml.safe_load(hote["registry"].read_text(encoding="utf-8"))["models"]
+    ]
+    # Contrôle positif : le matériau porte bien les deux répertoires.
+    assert any(p.is_relative_to("/data/models") for p in chemins)
+    assert any(p.parent == Path("/models") for p in chemins)
+    monkeypatch.setattr(
+        cli_module.settings, "allowed_model_dirs",
+        [str(hote["models_dir"]), "/models", "/data/models"],
+    )
+
+    resultat = _apply_write_registry(tmp_path, hote, "--models-dir", str(hote["models_dir"]))
+
+    assert resultat.exit_code == sc.EXIT_WARNINGS, resultat.output  # simulation réussie
+    document = json.loads(resultat.stdout)
+    assert document["execution"]["applied"] is False
+
+
+def test_registry_sans_allowed_model_dirs_du_service_est_refuse(tmp_path, hote, monkeypatch):
+    monkeypatch.setattr(cli_module.settings, "allowed_model_dirs", [])
+
+    resultat = _apply_write_registry(tmp_path, hote, "--models-dir", str(hote["models_dir"]))
+
+    assert resultat.exit_code == sc.EXIT_USAGE
+    assert "ALLOWED_MODEL_DIRS" in _propre(resultat.output)
+
+
+def test_models_dir_hors_allowlist_du_service_est_refuse_au_cablage(
+    tmp_path, hote, monkeypatch
+):
+    autorise = tmp_path / "service-models"
+    autorise.mkdir()
+    monkeypatch.setattr(cli_module.settings, "allowed_model_dirs", [str(autorise)])
+
+    resultat = _apply_write_registry(tmp_path, hote, "--models-dir", str(hote["models_dir"]))
+
+    sortie = _propre(resultat.output)
+    assert resultat.exit_code == sc.EXIT_USAGE
+    assert "Câblage refusé" in sortie and "ALLOWED_MODEL_DIRS" in sortie
+    assert hote["registry"].read_text(encoding="utf-8") == REGISTRE_DESACTIVE.format(
+        models_dir=hote["models_dir"]
+    )
+
+
+def test_allowed_model_dirs_relatif_est_refuse_au_cablage(tmp_path, hote, monkeypatch):
+    """
+    La CLI résoudrait une entrée relative depuis son répertoire courant, la
+    gateway depuis son WorkingDirectory : la validation ne prouverait plus rien
+    sur ce que le service acceptera. Refus explicite, rien n'est écrit.
+    """
+    monkeypatch.setattr(
+        cli_module.settings, "allowed_model_dirs", [str(hote["models_dir"]), "models"]
+    )
+    avant = hote["registry"].read_bytes()
+
+    resultat = _apply_write_registry(tmp_path, hote, "--models-dir", str(hote["models_dir"]))
+
+    sortie = _propre(resultat.output)
+    assert resultat.exit_code == sc.EXIT_USAGE
+    assert "relatifs" in sortie and "absolus" in sortie
+    assert hote["registry"].read_bytes() == avant

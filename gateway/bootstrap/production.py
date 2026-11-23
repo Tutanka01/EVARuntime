@@ -494,9 +494,12 @@ class AsyncHttpClient:
             response = await client.request(
                 method, url, json=json, headers=headers, timeout=timeout
             )
+        # Le paramètre ``json`` masque le module : ``json.JSONDecodeError``
+        # vaudrait ``None.JSONDecodeError`` (AttributeError) sur toute réponse
+        # non JSON. ``JSONDecodeError`` hérite de ``ValueError`` : suffisant.
         try:
             body = response.json()
-        except (ValueError, json.JSONDecodeError):
+        except ValueError:
             body = None
         return first_token.HttpResponse(
             status=response.status_code,

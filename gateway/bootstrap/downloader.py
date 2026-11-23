@@ -675,6 +675,78 @@ async def _hash_file_async(path: Path, chunk_bytes: int) -> str:
     return await asyncio.to_thread(_hash_file, path, chunk_bytes)
 
 
+_FileKey = tuple[str, int, int, int, int]
+
+
+def _file_key(path: Path) -> _FileKey | None:
+    """Identité matérielle (chemin résolu, dev, inode, taille, mtime_ns), ou `None`."""
+    try:
+        resolved = path.resolve(strict=True)
+        etat = resolved.stat()
+    except OSError:
+        return None
+    return (str(resolved), etat.st_dev, etat.st_ino, etat.st_size, etat.st_mtime_ns)
+
+
+def _hash_with_key(path: Path, chunk_bytes: int) -> tuple[str, _FileKey | None]:
+    """Hache puis recoupe l'identité : `None` si le fichier a bougé pendant la lecture."""
+    avant = _file_key(path)
+    digest = _hash_file(path, chunk_bytes)
+    apres = _file_key(path)
+    return digest, (apres if apres is not None and apres == avant else None)
+
+
+class _DigestMemo:
+    """
+    Empreintes déjà établies pendant CE run, par identité matérielle de fichier.
+
+    Un GGUF était lu en entier trois fois sur une installation neuve (hachage en
+    flux au téléchargement, puis `verify_artifact`) et deux fois à la reprise
+    (`download_model` recontrôle l'existant, `verify_artifact` recommence). La
+    clé suit `integrity.py` : un fichier remplacé, tronqué ou réécrit change
+    d'inode, de taille ou de mtime_ns, la clé ne correspond plus et l'empreinte
+    est recalculée — la vérification reste fail-closed. Une instance par
+    `make_executors()`, donc par run : rien ne survit d'une exécution à l'autre.
+    """
+
+    def __init__(self) -> None:
+        self._known: dict[_FileKey, str] = {}
+
+    async def digest(self, path: Path, chunk_bytes: int) -> str:
+        cle = await asyncio.to_thread(_file_key, path)
+        if cle is not None and cle in self._known:
+            return self._known[cle]
+        digest, stable = await asyncio.to_thread(_hash_with_key, path, chunk_bytes)
+        if stable is not None:
+            self._known[stable] = digest
+        return digest
+
+    def remember(self, cle: _FileKey | None, digest: str) -> None:
+        if cle is not None:
+            self._known[cle] = digest
+
+
+def _durable_replace(part: Path, final: Path) -> _FileKey | None:
+    """
+    `fsync` du fichier, renommage atomique, `fsync` du répertoire (thread worker).
+
+    Sans le premier `fsync`, un arrêt brutal après `os.replace` peut laisser le
+    nom définitif sur un contenu incomplet — que l'exécution suivante prend pour
+    un « fichier divergent » qu'elle ne répare jamais. Sans le second, le
+    renommage lui-même n'est pas durable. Même discipline que
+    `registry_writer._atomic_write` (`execution.fsync_directory`) : le `fsync`
+    du fichier est obligatoire, celui du répertoire est toléré s'il n'est pas
+    supporté par le système de fichiers — le fichier est alors publié et
+    vérifié, l'étape ne doit pas être déclarée en échec. Rend l'identité du
+    fichier publié.
+    """
+    with open(part, "rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(part, final)
+    execution.fsync_directory(final.parent)
+    return _file_key(final)
+
+
 # ── Reprise : la preuve d'origine du fichier partiel ──────────────────────────
 
 @dataclass(frozen=True)
@@ -766,6 +838,7 @@ async def _download_one(
     models_dir: Path,
     config: DownloadConfig,
     token: str | None,
+    memo: _DigestMemo | None = None,
 ) -> _FileOutcome:
     """
     Télécharge un fichier, le vérifie, puis seulement alors lui donne son nom.
@@ -922,7 +995,11 @@ async def _download_one(
             findings=tuple(findings),
         )
 
-    os.replace(part, final)
+    publie = await asyncio.to_thread(_durable_replace, part, final)
+    if memo is not None:
+        # Empreinte calculée EN FLUX sur ces octets mêmes : `verify_artifact`
+        # n'a pas à relire le fichier tant que son identité n'a pas changé.
+        memo.remember(publie, digest)
     try:
         sidecar.unlink()
     except OSError:
@@ -1154,6 +1231,7 @@ async def inspect_fileset(
     *,
     chunk_bytes: int,
     verify_digest: bool,
+    memo: _DigestMemo | None = None,
 ) -> tuple[FileState, ...]:
     """
     État de chaque fichier de l'ensemble. `verify_digest=False` en simulation.
@@ -1172,7 +1250,11 @@ async def inspect_fileset(
         size_ok = cfile.size_bytes is not None and size == cfile.size_bytes
         digest_ok: bool | None = None
         if verify_digest and size_ok and cfile.sha256 is not None:
-            digest_ok = await _hash_file_async(final, chunk_bytes) == cfile.sha256
+            digest = (
+                await memo.digest(final, chunk_bytes) if memo is not None
+                else await _hash_file_async(final, chunk_bytes)
+            )
+            digest_ok = digest == cfile.sha256
         elif verify_digest and not size_ok:
             digest_ok = False
         states.append(FileState(cfile.name, True, size_ok, digest_ok, size))
@@ -1233,7 +1315,10 @@ def _license_gate(
 
 
 async def _execute_download(
-    step: schema.PlanStep, context: execution.ExecutionContext, config: DownloadConfig
+    step: schema.PlanStep,
+    context: execution.ExecutionContext,
+    config: DownloadConfig,
+    memo: _DigestMemo | None = None,
 ) -> execution.StepResult:
     """Télécharge l'ensemble indivisible d'une entrée. Tout, ou rien d'utilisable."""
     entry = resolve_entry(step, config.catalog)
@@ -1255,7 +1340,7 @@ async def _execute_download(
 
     verify = context.applying
     states = await inspect_fileset(
-        entry, models_dir, chunk_bytes=config.chunk_bytes, verify_digest=verify
+        entry, models_dir, chunk_bytes=config.chunk_bytes, verify_digest=verify, memo=memo
     )
 
     conflicting = [s for s in states if s.conflicting]
@@ -1360,7 +1445,7 @@ async def _execute_download(
             ))
             continue
         try:
-            outcome = await _download_one(entry, cfile, models_dir, config, token)
+            outcome = await _download_one(entry, cfile, models_dir, config, token, memo)
         # Volontairement large, et c'est le seul endroit du module qui l'est.
         # Le transport est injectable, donc arbitraire : rien n'empêche une
         # implémentation de lever une exception dont le message recopie les
@@ -1507,7 +1592,10 @@ def _dry_run_result(
 
 
 async def _execute_verify(
-    step: schema.PlanStep, context: execution.ExecutionContext, config: DownloadConfig
+    step: schema.PlanStep,
+    context: execution.ExecutionContext,
+    config: DownloadConfig,
+    memo: _DigestMemo | None = None,
 ) -> execution.StepResult:
     """
     Vérifie l'ensemble complet et son manifeste. Ne modifie jamais rien.
@@ -1535,7 +1623,7 @@ async def _execute_verify(
         )
 
     states = await inspect_fileset(
-        entry, models_dir, chunk_bytes=config.chunk_bytes, verify_digest=True
+        entry, models_dir, chunk_bytes=config.chunk_bytes, verify_digest=True, memo=memo
     )
     manifest = _read_json(provenance_path(models_dir, entry.id))
     problems = list(manifest_problems(manifest, entry))
@@ -1699,13 +1787,19 @@ async def _execute_accept_license(
 # ── Enregistrement ────────────────────────────────────────────────────────────
 
 def make_executors(config: DownloadConfig) -> dict[str, execution.StepExecutor]:
-    """Les trois exécuteurs, liés à une configuration. Utile pour les tester un par un."""
+    """
+    Les trois exécuteurs, liés à une configuration. Utile pour les tester un par un.
+
+    `download` et `verify` partagent un `_DigestMemo` : un appel par run, donc
+    un fichier inchangé n'est haché qu'une fois par run (cf. `_DigestMemo`).
+    """
+    memo = _DigestMemo()
 
     async def download(step: schema.PlanStep, context: execution.ExecutionContext):
-        return await _execute_download(step, context, config)
+        return await _execute_download(step, context, config, memo)
 
     async def verify(step: schema.PlanStep, context: execution.ExecutionContext):
-        return await _execute_verify(step, context, config)
+        return await _execute_verify(step, context, config, memo)
 
     async def accept(step: schema.PlanStep, context: execution.ExecutionContext):
         return await _execute_accept_license(step, context, config)

@@ -52,6 +52,39 @@
         "title": "BootstrapModelSync",
         "type": "object"
       },
+      "BootstrapTransitionStatus": {
+        "description": "Transition bootstrap-sync non terminée de ce worker.\n\n`rolling_back` signifie admission fermée et registre verrouillé (409) : le\ndéchargement est refusé tant qu'une requête est en vol, et la gateway le\nretente seule jusqu'à `rolled_back`.",
+        "properties": {
+          "lease_expired": {
+            "title": "Lease Expired",
+            "type": "boolean"
+          },
+          "model_id": {
+            "title": "Model Id",
+            "type": "string"
+          },
+          "phase": {
+            "enum": [
+              "active",
+              "rolling_back"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "rollback_attempts": {
+            "title": "Rollback Attempts",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "model_id",
+          "phase",
+          "lease_expired",
+          "rollback_attempts"
+        ],
+        "title": "BootstrapTransitionStatus",
+        "type": "object"
+      },
       "CapacityQueueStatusResponse": {
         "description": "État de la queue d'admission VRAM locale.",
         "properties": {
@@ -84,6 +117,13 @@
       "GatewayStatus": {
         "description": "Statut complet de la gateway — retourné par GET /admin/status.",
         "properties": {
+          "bootstrap_transitions": {
+            "items": {
+              "$ref": "#/components/schemas/BootstrapTransitionStatus"
+            },
+            "title": "Bootstrap Transitions",
+            "type": "array"
+          },
           "capacity_queue": {
             "anyOf": [
               {
@@ -2183,7 +2223,7 @@
     },
     "/admin/status": {
       "get": {
-        "description": "État complet de la gateway : budget VRAM + état de chaque modèle.",
+        "description": "État complet de la gateway : budget VRAM + état de chaque modèle, et\ntransitions bootstrap-sync en cours (un `rolling_back` y explique un 409\nsur les mutations du registre).",
         "operationId": "get_status_admin_status_get",
         "responses": {
           "200": {
