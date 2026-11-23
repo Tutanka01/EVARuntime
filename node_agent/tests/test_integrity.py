@@ -35,7 +35,7 @@ from fastapi import HTTPException
 # sans ambiguïté.
 import main
 import integrity
-from test_main import FakeServerManager
+from test_main import FakeServerManager, load_and_wait
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -153,7 +153,7 @@ class TestHashOffEventLoop:
             # Le scénario EST la coroutine de la boucle : son thread est celui
             # de l'event loop.
             loop_ident = threading.get_ident()
-            load_task = asyncio.create_task(fake_state.load(model_dict))
+            load_task = asyncio.create_task(load_and_wait(fake_state, model_dict))
 
             # Attendre que le hachage soit réellement en vol (gate fermée).
             await _until(lambda: probe.calls >= 1 and started.is_set())
@@ -196,7 +196,7 @@ class TestIntegrityFailClosed:
         model_dict = make_model_dict("substitue", gguf, sha256="0" * 64)
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(fake_state.load(model_dict))
+            asyncio.run(load_and_wait(fake_state, model_dict))
 
         exc = exc_info.value
         assert exc.status_code == 422
@@ -222,7 +222,7 @@ class TestVisionIntegrity:
             }
         )
 
-        response = asyncio.run(fake_state.load(model_dict))
+        response = asyncio.run(load_and_wait(fake_state, model_dict))
 
         assert response.already_loaded is False
         assert FakeServerManager.ENSURE_CALLS["vision"] == 1
@@ -246,7 +246,7 @@ class TestVisionIntegrity:
         )
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(fake_state.load(model_dict))
+            asyncio.run(load_and_wait(fake_state, model_dict))
 
         assert exc_info.value.status_code == 422
         assert "projecteur multimodal" in exc_info.value.detail
@@ -262,7 +262,7 @@ class TestVisionIntegrity:
         model_dict = make_model_dict("absent", tmp_path / "absent.gguf", sha256="0" * 64)
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(fake_state.load(model_dict))
+            asyncio.run(load_and_wait(fake_state, model_dict))
 
         exc = exc_info.value
         assert exc.status_code == 422
@@ -287,8 +287,8 @@ class TestAttestedCache:
         monkeypatch.setattr(integrity, "_hash_file", probe)
 
         async def scenario():
-            first = await fake_state.load(model_dict)
-            second = await fake_state.load(model_dict)
+            first = await load_and_wait(fake_state, model_dict)
+            second = await load_and_wait(fake_state, model_dict)
             return first, second
 
         first, second = asyncio.run(scenario())
@@ -314,20 +314,20 @@ class TestAttestedCache:
         monkeypatch.setattr(integrity, "_hash_file", probe)
 
         async def scenario():
-            await fake_state.load(model_dict)  # hachage n°1, charge OK
+            await load_and_wait(fake_state, model_dict)  # hachage n°1, charge OK
             await fake_state.unload("mute")
 
             # Contenu remplacé + empreinte déclarée mise à jour → re-hachage, OK.
             content2 = b"contenu v2 - plus long"
             gguf.write_bytes(content2)
             model_dict["sha256"] = hashlib.sha256(content2).hexdigest()
-            reloaded = await fake_state.load(model_dict)  # hachage n°2
+            reloaded = await load_and_wait(fake_state, model_dict)  # hachage n°2
             await fake_state.unload("mute")
 
             # Contenu remplacé SANS mettre à jour l'empreinte déclarée → 422.
             gguf.write_bytes(b"contenu v3 - encore plus long, taille differente")
             with pytest.raises(HTTPException) as exc_info:
-                await fake_state.load(model_dict)  # hachage n°3, empreinte obsolète
+                await load_and_wait(fake_state, model_dict)  # hachage n°3, empreinte obsolète
             return reloaded, exc_info.value
 
         reloaded, exc = asyncio.run(scenario())
@@ -351,9 +351,9 @@ class TestSingleFlight:
         monkeypatch.setattr(integrity, "_hash_file", probe)
 
         async def scenario():
-            first = asyncio.create_task(fake_state.load(model_dict))
+            first = asyncio.create_task(load_and_wait(fake_state, model_dict))
             await _until(lambda: probe.calls == 1)  # hachage en vol, retenu par la gate
-            second = asyncio.create_task(fake_state.load(model_dict))
+            second = asyncio.create_task(load_and_wait(fake_state, model_dict))
             await asyncio.sleep(0.05)  # laisse le second appelant rejoindre le vol
             assert not first.done() and not second.done()
             gate.set()
@@ -387,13 +387,13 @@ class TestNoSha256Noop:
         monkeypatch.setattr(integrity, "_hash_file", probe)
 
         async def scenario():
-            resp = await fake_state.load(model_dict)
+            resp = await load_and_wait(fake_state, model_dict)
             noop_calls = probe.calls
             await fake_state.unload("non-signe")
             # Contrôle positif : empreinte déclarée (fausse) → l'attestation hache.
             model_dict["sha256"] = "0" * 64
             with pytest.raises(HTTPException) as exc_info:
-                await fake_state.load(model_dict)
+                await load_and_wait(fake_state, model_dict)
             return resp, noop_calls, exc_info.value
 
         resp, noop_calls, exc = asyncio.run(scenario())

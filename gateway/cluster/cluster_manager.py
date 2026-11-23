@@ -27,7 +27,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import NoReturn
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -102,6 +103,50 @@ class ClusterLoadAbandonedError(RuntimeError):
             f"Le chargement du modèle '{model_id}' sur le nœud '{node_id}' "
             f"est abandonné (opération {operation_id}) : {reason}."
         )
+
+
+# Statuts d'un `failed` agent qui décrivent la capacité du nœud ou une course
+# transitoire, pas le modèle : jamais mémorisés comme échec du modèle.
+_TRANSIENT_FAILURE_STATUSES = frozenset({409, 429, 503})
+
+
+class ClusterModelLoadFailedError(RuntimeError):
+    """
+    Un agent joignable rapporte l'échec terminal d'un chargement (`failed`,
+    `deadline_exceeded`). Le nœud a répondu : ce n'est pas une panne du plan de
+    contrôle et cela ne compte jamais vers le seuil offline.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        node_id: str,
+        response: LoadResponse,
+    ) -> None:
+        self.model_id = model_id
+        self.node_id = node_id
+        self.state = response.state
+        self.error_status = response.error_status
+        self.error_code = response.error_code
+        super().__init__(
+            response.message
+            or f"Échec de chargement de '{model_id}' sur '{node_id}' ({response.state})"
+        )
+
+    @property
+    def is_model_failure(self) -> bool:
+        """True si l'échec tient au modèle (artefact, llama-server, échéance)."""
+        if self.error_code == "unloaded" or self.error_status is None:
+            # None : agent antérieur sans `error_status` — un 503 de capacité
+            # y serait indiscernable d'un échec du modèle. Inconnu = pas de
+            # cache négatif (le nœud ne compte pas non plus comme en panne).
+            return False
+        return self.error_status not in _TRANSIENT_FAILURE_STATUSES
+
+
+class _StaleGenerationBlocked(NoPlacementError):
+    """Aucun placement : le seul nœud possible sert encore l'ancienne génération."""
+
 
 # ── État interne par modèle chargé sur un nœud ───────────────────────────────
 
@@ -217,8 +262,16 @@ class _NodeState:
             if mid not in self.loaded
         )
         all_loaded = loaded_snapshots + pending_snapshots
-        pending_vram = sum(p.vram_gb for p in self.pending_loads.values())
-        pending_ports = len(self.pending_loads)
+        # L'agent compte déjà un modèle LOADING dans sa VRAM utilisée, ses
+        # ports et `loaded_model_ids` : seule une réservation qu'il ne publie
+        # pas encore (POST en vol, health antérieur) est retranchée ici.
+        unreported = [
+            pending
+            for mid, pending in self.pending_loads.items()
+            if mid not in h.loaded_model_ids
+        ]
+        pending_vram = sum(p.vram_gb for p in unreported)
+        pending_ports = len(unreported)
         return NodeSnapshot(
             node_id=self.node_id,
             online=self.online,
@@ -309,6 +362,13 @@ class ClusterManager:
     # l'échéance négociée pour publier un état terminal. Couvre l'attente du
     # verrou de modèle côté agent pendant un unload (SIGTERM 10 s + SIGKILL).
     _operation_grace_seconds: float = 30.0
+    # Durée pendant laquelle l'échec d'un chargement (rapporté `failed` par
+    # tous les nœuds candidats) est renvoyé sans nouvelle tentative pour la
+    # même définition. Court : un opérateur qui corrige l'artefact sur le nœud
+    # n'attend jamais plus que cette fenêtre.
+    _load_failure_ttl_seconds: float = 10.0
+    # Borne défensive des itérations de placement (replans, failovers).
+    _max_placement_attempts: int = 64
 
     def __init__(
         self,
@@ -342,6 +402,14 @@ class ClusterManager:
         self._desired_identities: dict[str, tuple[str, str]] = {}
         self._bootstrap_blocked: set[str] = set()
         self._unloading_all = False
+        # Cache négatif court PAR NŒUD : (model_id, node_id) → (digest,
+        # échéance monotone). Un nœud qui a rapporté un échec propre au modèle
+        # (GGUF absent, llama-server qui crashe…) est écarté du placement de
+        # cette définition ; la requête n'échoue vite que si TOUS les nœuds
+        # online sont écartés. Les requêtes en file partagent ainsi l'échec au
+        # lieu de rejouer le load sur tout le cluster, sans qu'un seul nœud
+        # défaillant bloque un nœud sain momentanément plein.
+        self._load_failures: dict[tuple[str, str], tuple[str, float]] = {}
 
         self._monitor_task: asyncio.Task | None = None
 
@@ -377,7 +445,7 @@ class ClusterManager:
         Note : status() ne renvoie PAS l'internal_api_key du llama-server. Une
         entrée réconciliée porte donc un internal_api_key vide, ce qui la marque
         comme "à rafraîchir" : le fast-path de ensure_model_loaded déclenchera
-        un load_model() idempotent (already_loaded côté agent) pour récupérer la
+        un start_load_model() idempotent (already_loaded côté agent) pour récupérer la
         vraie clé + l'URL de confiance lors de la première requête sur ce modèle.
         La réconciliation elle-même ne déclenche AUCUN rechargement.
         """
@@ -441,19 +509,27 @@ class ClusterManager:
             if llama_url is not None:
                 ready[model.id] = (model, llama_url)
 
+        retained: set[str] = set()
         for model_id in set(state.loaded) - set(ready) - set(loading):
-            info = state.loaded.pop(model_id)
-            if self._placement.get(model_id) == state.node_id:
-                self._placement.pop(model_id, None)
-            log.warning(
-                "Réconciliation : '%s' a disparu de '%s'%s.",
-                model_id,
-                state.node_id,
-                " pendant une requête active" if info.active_requests else "",
-            )
+            if not self._forget_vanished_locked(state, model_id, "Réconciliation"):
+                retained.add(model_id)
 
         for model_id, (model, llama_url) in ready.items():
             info = state.loaded.get(model_id)
+            if (
+                info is not None
+                and info.unload_uncertain
+                and info.generation_id == model.generation_id
+            ):
+                # Le nœud sert toujours la même génération : l'unload non
+                # confirmé n'a pas eu lieu, l'entrée redevient routable.
+                info.unload_uncertain = False
+                log.info(
+                    "Réconciliation : '%s' toujours READY sur '%s' — "
+                    "déchargement non confirmé levé.",
+                    model_id,
+                    state.node_id,
+                )
             if info is None:
                 info = _LoadedInfo(
                     node_id=state.node_id,
@@ -509,7 +585,12 @@ class ClusterManager:
                     model.deployment_digest,
                     model.generation_id,
                 )
-                if self._placement.get(model_id) is None:
+                # Un suspect (échec data-plane) n'est jamais republié comme
+                # route primaire par un simple READY du plan de contrôle.
+                if (
+                    self._placement.get(model_id) is None
+                    and model_id not in state.suspect_models
+                ):
                     self._placement[model_id] = state.node_id
             elif (
                 self._registry.get(model_id) is not None
@@ -531,6 +612,16 @@ class ClusterManager:
             if model.deployment_digest != deployment_digest(registry_model.to_dict()):
                 state.suspect_models.add(model_id)
                 continue
+            existing = state.pending_loads.get(model_id)
+            if (
+                existing is not None
+                and existing.operation_id == model.operation_id
+            ):
+                # Conserver l'identité de l'objet : les comparaisons `is`
+                # d'un appelant qui finalise cette même opération restent vraies.
+                existing.progress = model.progress
+                existing.acknowledged = True
+                continue
             state.pending_loads[model_id] = _PendingLoad(
                 model_id=model_id,
                 deployment_digest=model.deployment_digest,
@@ -543,10 +634,61 @@ class ClusterManager:
                 acknowledged=True,
             )
 
+        # Le caller tient `operation_lock` : aucune réservation encore suivie
+        # ici n'a de chargement en cours côté orchestrateur (annulé ou
+        # incertain). READY → l'entrée `loaded` fait foi ; absent → l'agent ne
+        # la produira plus. Seul un POST jamais acquitté reste couvert par la
+        # grâce, il peut encore être en vol vers l'agent.
+        now = time.monotonic()
+        for model_id, pending in list(state.pending_loads.items()):
+            if model_id in loading:
+                continue
+            if (
+                model_id in ready
+                or pending.acknowledged
+                or now >= pending.created_at + self._operation_grace_seconds
+            ):
+                state.pending_loads.pop(model_id, None)
+
         # Un status READY du control-plane ne prouve pas que le port data-plane
         # est routable (pare-feu, route, bind). Conserver ces suspects ; un
-        # modèle absent peut en revanche être rechargé sans ambiguïté.
-        state.suspect_models.intersection_update(ready)
+        # modèle absent peut en revanche être rechargé sans ambiguïté. Une
+        # entrée disparue mais encore pinnée reste suspecte jusqu'à son unpin.
+        state.suspect_models.intersection_update(set(ready) | retained)
+
+    def _forget_vanished_locked(
+        self, state: _NodeState, model_id: str, source: str
+    ) -> bool:
+        """
+        Retire un modèle que le nœud ne rapporte plus. Retourne False si
+        l'entrée est conservée.
+
+        Une entrée encore pinnée n'est jamais jetée : les handles en vol
+        pointent vers CET objet. La jeter puis réadopter le modèle créerait un
+        `_LoadedInfo` neuf à zéro requête active, évictable sous un stream en
+        cours. Elle perd sa route primaire, devient suspecte, et sera soit
+        réadoptée en place (même entrée), soit retirée au prochain inventaire
+        une fois les requêtes terminées.
+        """
+        info = state.loaded.get(model_id)
+        if info is None:
+            return True
+        if self._placement.get(model_id) == state.node_id:
+            self._placement.pop(model_id, None)
+        if info.active_requests > 0:
+            state.suspect_models.add(model_id)
+            log.warning(
+                "%s : '%s' a disparu de '%s' pendant %d requête(s) active(s) — "
+                "entrée conservée (suspecte) jusqu'à la fin des requêtes.",
+                source,
+                model_id,
+                state.node_id,
+                info.active_requests,
+            )
+            return False
+        state.loaded.pop(model_id, None)
+        log.warning("%s : '%s' a disparu de '%s'.", source, model_id, state.node_id)
+        return True
 
     @staticmethod
     def _reconciled_llama_url(state: _NodeState, port: int | None) -> str | None:
@@ -654,17 +796,16 @@ class ClusterManager:
                 health = None
 
             async with self._lock:
-                removed = list(state.loaded)
-                tracked_vram = sum(info.vram_gb for info in state.loaded.values())
-                for model_id in removed:
-                    if self._placement.get(model_id) == state.node_id:
-                        self._placement.pop(model_id, None)
-                state.loaded.clear()
-                state.suspect_models.clear()
-                if health is not None:
-                    state.last_health = health
-                elif state.last_health is not None:
+                if health is None and state.last_health is not None:
                     old = state.last_health
+                    # Ne retrancher que ce que le dernier health comptait
+                    # (même règle que _account_load_locked / _do_unload).
+                    counted = {
+                        model_id: info.vram_gb
+                        for model_id, info in state.loaded.items()
+                        if model_id in old.loaded_model_ids
+                    }
+                    tracked_vram = sum(counted.values())
                     state.last_health = old.model_copy(
                         update={
                             "used_vram_gb": max(0.0, old.used_vram_gb - tracked_vram),
@@ -672,11 +813,26 @@ class ClusterManager:
                             "loaded_model_ids": [
                                 model_id
                                 for model_id in old.loaded_model_ids
-                                if model_id not in removed
+                                if model_id not in counted
                             ],
-                            "free_ports": old.free_ports + len(removed),
+                            "free_ports": old.free_ports + len(counted),
                         }
                     )
+                elif health is not None:
+                    state.last_health = health
+                for model_id in list(state.loaded):
+                    if self._placement.get(model_id) == state.node_id:
+                        self._placement.pop(model_id, None)
+                state.loaded.clear()
+                state.suspect_models.clear()
+                # Les réservations (orphelines : operation_lock est tenu) sont
+                # CONSERVÉES. L'unload-all de l'agent ne décharge que les
+                # managers présents à son appel, après avoir attendu le verrou
+                # de modèle d'un load en cours ; une opération encore en
+                # validation n'a pas de manager et lui survit, puis chargera.
+                # Les vider sous-compterait VRAM et port jusqu'à ce que l'agent
+                # publie ce modèle. Le heartbeat suivant déclenche status() pour
+                # toute réservation non publiée et purge celles qui ont disparu.
                 state.inventory_revision += 1
             return None
 
@@ -803,10 +959,11 @@ class ClusterManager:
                             node_state.node_id,
                         )
                     elif info.evicting:
-                        # Cas rarissime : l'éviction a été décidée juste
-                        # avant cette requête. Le lock de modèle de l'éviction
-                        # empêche normalement ce chemin ; refuser un handle
-                        # instable reste plus sûr qu'un 502 en plein stream.
+                        # L'éviction de ce modèle est décidée (unload en cours
+                        # pour placer un autre modèle sur ce nœud) : elle ne
+                        # prend pas le lock de CE modèle, ce chemin est donc
+                        # atteignable. Refuser ce handle instable et replacer
+                        # reste plus sûr qu'un 502 en plein stream.
                         self._placement.pop(model_id, None)
                     elif not info.internal_api_key:
                         refresh_state = node_state
@@ -838,20 +995,142 @@ class ClusterManager:
                         pending_node.suspect_models.add(model_id)
                     response = None
                 if response is not None and response.state == "ready":
-                    return await self._finish_pending_load(
-                        pending_node, model, pending, response
-                    )
+                    try:
+                        return await self._finish_pending_load(
+                            pending_node, model, pending, response
+                        )
+                    except BaseException:
+                        await self._clear_pending_load(pending_node, pending)
+                        raise
                 await self._clear_pending_load(pending_node, pending)
 
+            refreshed_nodes: set[str] = set()
             if refresh_state is not None:
+                refreshed_nodes.add(refresh_state.node_id)
                 refreshed = await self._refresh_reconciled(refresh_state, model)
                 if refreshed is not None:
                     self._admitted_model(model_id)
                     return refreshed
 
+            self._raise_if_recent_load_failure(model.id, model_digest)
+
+            reused = await self._reuse_existing_copy(
+                model, model_digest, exclude=refreshed_nodes
+            )
+            if reused is not None:
+                self._admitted_model(model_id)
+                return reused
+
             handle = await self._place_and_load(model)
             self._admitted_model(model_id)
             return handle
+
+    def _recent_failure_nodes(self, model_id: str, digest: str) -> set[str]:
+        """Nœuds écartés pour cette définition (échec récent propre au modèle)."""
+        now = time.monotonic()
+        excluded: set[str] = set()
+        for key, (cached_digest, expires_at) in list(self._load_failures.items()):
+            if key[0] != model_id:
+                continue
+            if cached_digest != digest or now >= expires_at:
+                self._load_failures.pop(key, None)
+                continue
+            excluded.add(key[1])
+        return excluded
+
+    def _remember_load_failure(
+        self, model_id: str, node_id: str, digest: str
+    ) -> None:
+        self._load_failures[(model_id, node_id)] = (
+            digest,
+            time.monotonic() + self._load_failure_ttl_seconds,
+        )
+
+    def forget_load_failures(self, model_id: str) -> None:
+        """
+        Oublie les échecs récents d'un modèle (chargement admin explicite).
+
+        Un opérateur qui vient de corriger l'artefact sur le nœud et demande
+        `POST /admin/models/{id}/load` ne doit pas recevoir « échec récent ».
+        """
+        for key in [key for key in self._load_failures if key[0] == model_id]:
+            self._load_failures.pop(key, None)
+
+    def _raise_if_recent_load_failure(self, model_id: str, digest: str) -> None:
+        """Échoue vite si TOUS les nœuds online ont récemment échoué ce modèle."""
+        excluded = self._recent_failure_nodes(model_id, digest)
+        if not excluded:
+            return
+        online = {state.node_id for state in self._nodes.values() if state.online}
+        if not online or not online <= excluded:
+            return
+        raise RuntimeError(
+            f"Le modèle '{model_id}' n'a pas pu être chargé sur les nœuds "
+            "disponibles (échec récent, détail dans les logs). Réessayez dans "
+            "quelques secondes."
+        )
+
+    async def _reuse_existing_copy(
+        self,
+        model: ModelDefinition,
+        model_digest: str,
+        *,
+        exclude: set[str],
+    ) -> ClusterModelHandle | None:
+        """
+        Réutilise une copie déjà chargée de la même définition avant de passer
+        par le scheduler.
+
+        Après un échec data-plane, le placement est retiré mais la copie reste
+        sur le nœud. Le scheduler exigerait `vram_gb` libre EN PLUS de cette
+        copie : 503 si elle est pinnée, sinon évictions et rechargement à froid
+        pour un modèle qui tourne déjà. Le load idempotent (`already_loaded`
+        côté agent) ne demande aucune VRAM supplémentaire. Une alternative saine
+        capable d'accueillir le modèle reste prioritaire sur un nœud suspect.
+        """
+        async with self._lock:
+            holders: list[_NodeState] = []
+            for state in self._nodes.values():
+                info = state.loaded.get(model.id)
+                if (
+                    info is None
+                    or state.node_id in exclude
+                    or not state.online
+                    or state.last_health is None
+                    or model.id not in state.last_health.loaded_model_ids
+                    or model.id in state.pending_loads
+                    or info.evicting
+                    or info.unload_uncertain
+                    or (
+                        info.deployment_digest
+                        and info.deployment_digest != model_digest
+                    )
+                ):
+                    continue
+                holders.append(state)
+            healthy = [s for s in holders if model.id not in s.suspect_models]
+            suspect = [s for s in holders if model.id in s.suspect_models]
+            if suspect and not healthy:
+                suspects = {
+                    state.node_id
+                    for state in self._nodes.values()
+                    if model.id in state.suspect_models
+                }
+                try:
+                    self._pick_locked(model, suspects)
+                except NoPlacementError:
+                    pass
+                else:
+                    # Une alternative saine a la capacité : le replacement
+                    # normal la préfère au nœud qui vient d'échouer.
+                    suspect = []
+            candidates = healthy + suspect
+
+        for state in candidates:
+            handle = await self._refresh_reconciled(state, model)
+            if handle is not None:
+                return handle
+        return None
 
     @staticmethod
     def _load_deadline_seconds(model: ModelDefinition, client: NodeClient) -> float:
@@ -996,50 +1275,43 @@ class ClusterManager:
         model: ModelDefinition,
         pending: _PendingLoad,
     ) -> LoadResponse:
-        """Démarre le nouveau contrat ou adapte un client local legacy."""
-        model_dict = model.to_dict()
-        if getattr(node_state.client, "supports_load_operations", False):
-            try:
-                initial = await node_state.client.start_load_model(
-                    model_dict,
-                    deployment_digest=pending.deployment_digest,
-                    generation_id=pending.generation_id,
-                    operation_id=pending.operation_id,
-                    deadline_seconds=pending.deadline_seconds or 300.0,
+        """Démarre l'opération `pending` sur le nœud et en résout l'issue."""
+        try:
+            initial = await node_state.client.start_load_model(
+                model.to_dict(),
+                deployment_digest=pending.deployment_digest,
+                generation_id=pending.generation_id,
+                operation_id=pending.operation_id,
+                deadline_seconds=pending.deadline_seconds or 300.0,
+            )
+        except asyncio.CancelledError:
+            raise
+        except NodeProtocolError as exc:
+            if exc.status_code == 409:
+                # Conflit d'identité (autre génération active) ou unload en
+                # cours côté agent. Le corps de l'agent reste au journal :
+                # ce message remonte jusqu'au client.
+                log.warning(
+                    "Chargement de '%s' refusé par '%s' (409) : %s",
+                    model.id, node_state.node_id, exc,
                 )
-            except asyncio.CancelledError:
+                raise ClusterLoadConflictError(
+                    f"Le chargement du modèle '{model.id}' est refusé par le "
+                    "nœud : conflit de génération ou déchargement en cours. "
+                    "Réessayez dans quelques secondes."
+                ) from exc
+            if exc.is_rejection:
+                # Refus explicite (404, 422, 401…) : l'agent n'a rien
+                # enregistré, un polling ne pourrait que répondre 404 et
+                # bloquer le modèle (P0-2). Échec franc → failover.
                 raise
-            except NodeProtocolError as exc:
-                if exc.status_code == 409:
-                    # Conflit d'identité (autre génération active) ou unload en
-                    # cours côté agent. Le corps de l'agent reste au journal :
-                    # ce message remonte jusqu'au client.
-                    log.warning(
-                        "Chargement de '%s' refusé par '%s' (409) : %s",
-                        model.id, node_state.node_id, exc,
-                    )
-                    raise ClusterLoadConflictError(
-                        f"Le chargement du modèle '{model.id}' est refusé par le "
-                        "nœud : conflit de génération ou déchargement en cours. "
-                        "Réessayez dans quelques secondes."
-                    ) from exc
-                if exc.is_rejection:
-                    # Refus explicite (404, 422, 401…) : l'agent n'a rien
-                    # enregistré, un polling ne pourrait que répondre 404 et
-                    # bloquer le modèle (P0-2). Échec franc → failover.
-                    raise
-                # 5xx, 408/429, JSON invalide : le POST a peut-être été traité.
-                return await self._poll_load_operation(node_state, pending, None)
-            except NodeUnreachableError:
-                # Le POST a peut-être été reçu. Résoudre avec le même identifiant
-                # avant de considérer un échec ou un failover.
-                return await self._poll_load_operation(node_state, pending, None)
-            return await self._poll_load_operation(node_state, pending, initial)
-
-        # Les adaptateurs de tests/backends pré-CLU-005 restent synchrones et
-        # renvoient directement READY ; ils ne peuvent pas avoir de réponse
-        # tardive indépendante du processus appelant.
-        return await node_state.client.load_model(model_dict)
+            # 5xx, 408/429, JSON invalide : le POST a peut-être été traité.
+            return await self._poll_load_operation(node_state, pending, None)
+        except NodeUnreachableError:
+            # Le POST a peut-être été reçu. Résoudre avec le même identifiant
+            # avant de considérer un échec ou un failover.
+            return await self._poll_load_operation(node_state, pending, None)
+        return await self._poll_load_operation(node_state, pending, initial)
 
     async def _clear_pending_load(
         self, node_state: _NodeState, pending: _PendingLoad
@@ -1063,20 +1335,6 @@ class ClusterManager:
             raise NodeProtocolError(
                 f"Réponse READY incomplète pour '{model.id}'"
             )
-        info = _LoadedInfo(
-            node_id=node_state.node_id,
-            llama_url=response.llama_url,
-            internal_api_key=response.internal_api_key or "",
-            vram_gb=model.vram_gb,
-            last_load_seconds=(
-                None
-                if response.already_loaded
-                else load_seconds
-            ),
-            deployment_digest=pending.deployment_digest,
-            generation_id=pending.generation_id,
-            operation_id=pending.operation_id,
-        )
         async with self._lock:
             if self._unloading_all:
                 raise RuntimeError(
@@ -1084,9 +1342,36 @@ class ClusterManager:
                 )
             if node_state.pending_loads.get(model.id) is pending:
                 node_state.pending_loads.pop(model.id, None)
-            node_state.loaded[model.id] = info
+            info = node_state.loaded.get(model.id)
+            if info is None:
+                info = _LoadedInfo(
+                    node_id=node_state.node_id,
+                    llama_url=response.llama_url,
+                    internal_api_key=response.internal_api_key or "",
+                    vram_gb=model.vram_gb,
+                )
+                node_state.loaded[model.id] = info
+            else:
+                # Replacement sur le nœud qui détient déjà l'entrée (suspect,
+                # réconcilié, réponse `already_loaded`) : mise à jour EN PLACE.
+                # Les handles distribués avant pinent cet objet ; un objet neuf
+                # repartirait à zéro requête active et deviendrait évictable
+                # sous un stream en cours.
+                info.llama_url = response.llama_url
+                info.internal_api_key = (
+                    response.internal_api_key or info.internal_api_key
+                )
+                info.vram_gb = model.vram_gb
+                info.unload_uncertain = False
+            if not response.already_loaded:
+                info.last_load_seconds = load_seconds
+            info.deployment_digest = pending.deployment_digest
+            info.generation_id = pending.generation_id
+            info.operation_id = pending.operation_id
+            info.touch()
             node_state.suspect_models.discard(model.id)
             self._placement[model.id] = node_state.node_id
+            self._load_failures.pop((model.id, node_state.node_id), None)
             self._account_load_locked(
                 node_state, model, already_loaded=response.already_loaded
             )
@@ -1105,16 +1390,19 @@ class ClusterManager:
         failed_nodes: set[str] = set()
         failures: list[str] = []
         suspect_exclusions: set[str] = set()
-        model_dict = model.to_dict()
-        model_digest = deployment_digest(model_dict)
+        model_digest = deployment_digest(model.to_dict())
 
         async with self._lock:
             _, generation_id = self._identity_for_model_locked(model.id, model_digest)
+            # Nœuds ayant récemment échoué CETTE définition : écartés pour
+            # toute la durée du placement (jamais réintégrés comme suspects).
+            recently_failed = self._recent_failure_nodes(model.id, model_digest)
+            failed_nodes.update(recently_failed)
             suspects = {
                 state.node_id
                 for state in self._nodes.values()
                 if model.id in state.suspect_models
-            }
+            } - recently_failed
             healthy_alternative = any(
                 state.online and state.node_id not in suspects
                 for state in self._nodes.values()
@@ -1123,7 +1411,26 @@ class ClusterManager:
                 suspect_exclusions.update(suspects)
                 failed_nodes.update(suspect_exclusions)
 
+        attempts = 0
         while True:
+            attempts += 1
+            if attempts > self._max_placement_attempts:
+                log.error(
+                    "Placement de '%s' abandonné après %d tentatives (plans "
+                    "obsolètes répétés) : %s",
+                    model.id,
+                    attempts - 1,
+                    "; ".join(failures) or "aucun échec de chargement",
+                )
+                raise RuntimeError(
+                    f"Le placement du modèle '{model.id}' n'a pas convergé ; "
+                    "réessayez dans quelques secondes."
+                )
+            if attempts > 1:
+                # Un plan obsolète (`continue`) n'attend rien de suspendant :
+                # sans ce point de suspension, la boucle monopoliserait
+                # l'event loop tant que l'état qui l'invalide ne change pas.
+                await asyncio.sleep(0)
             async with self._lock:
                 try:
                     chosen_snapshot, _ = self._pick_locked(model, failed_nodes)
@@ -1136,26 +1443,14 @@ class ClusterManager:
                         failed_nodes.difference_update(suspect_exclusions)
                         suspect_exclusions.clear()
                         continue
-                    if failures:
-                        # Le détail des échecs embarque les corps HTTP renvoyés
-                        # par les node-agents (stderr llama-server, chemins de
-                        # modèles) : journal serveur uniquement, jamais dans le
-                        # message client (SEC — fuite d'infra, audit 2026-08-28).
-                        log.error(
-                            "Chargement de '%s' impossible sur tous les nœuds "
-                            "candidats : %s",
-                            model.id,
-                            "; ".join(failures),
-                        )
-                        raise RuntimeError(
-                            f"Le modèle '{model.id}' n'a pas pu être chargé sur "
-                            "les nœuds disponibles (détail dans les logs)."
-                        ) from exc
-                    raise RuntimeError(str(exc)) from exc
+                    self._raise_placement_exhausted(
+                        model, exc, failures, recently_failed
+                    )
                 chosen_state = self._nodes[chosen_snapshot.node_id]
 
             # Ne jamais attendre le lock d'un nœud en conservant le lock global.
             async with chosen_state.operation_lock:
+                evictions: list[tuple[str, _LoadedInfo]] = []
                 async with self._lock:
                     # La capacité peut avoir changé pendant l'attente : recalcul
                     # atomique. Si le best-fit a changé, on libère ce nœud et
@@ -1169,57 +1464,62 @@ class ClusterManager:
                             failed_nodes.difference_update(suspect_exclusions)
                             suspect_exclusions.clear()
                             continue
-                        if failures:
-                            log.error(
-                                "Chargement de '%s' impossible sur tous les "
-                                "nœuds candidats : %s",
-                                model.id,
-                                "; ".join(failures),
-                            )
-                            raise RuntimeError(
-                                f"Le modèle '{model.id}' n'a pas pu être chargé "
-                                "sur les nœuds disponibles (détail dans les "
-                                "logs)."
-                            ) from exc
-                        raise RuntimeError(str(exc)) from exc
+                        self._raise_placement_exhausted(
+                            model, exc, failures, recently_failed
+                        )
                     if current_choice.node_id != chosen_state.node_id:
                         continue
 
-                    evictions: list[tuple[str, _LoadedInfo]] = []
+                    victims = list(eviction_plan.models_to_evict)
+                    if (
+                        self._stale_generation_locked(
+                            chosen_state, model.id, model_digest
+                        )
+                        is not None
+                        and model.id not in victims
+                    ):
+                        # L'agent refuse (409) une nouvelle génération tant que
+                        # l'ancienne occupe l'identifiant : elle part d'abord.
+                        # `_pick_locked` a déjà compté sa VRAM comme libérable.
+                        victims.insert(0, model.id)
                     stale_plan = False
-                    for model_id in eviction_plan.models_to_evict:
-                        info = chosen_state.loaded.get(model_id)
+                    for victim_id in victims:
+                        info = chosen_state.loaded.get(victim_id)
                         if info is None or info.active_requests > 0 or info.evicting:
                             stale_plan = True
                             break
                         info.evicting = True
-                        evictions.append((model_id, info))
+                        evictions.append((victim_id, info))
                     if stale_plan:
                         for _, info in evictions:
                             info.evicting = False
                         continue
 
                 eviction_failed = False
-                for model_id, info in evictions:
-                    if not await self._do_unload(chosen_state, model_id, info):
-                        eviction_failed = True
-                        break
+                try:
+                    for victim_id, info in evictions:
+                        if not await self._do_unload(chosen_state, victim_id, info):
+                            eviction_failed = True
+                            break
+                finally:
+                    # Échec, annulation ou succès : aucune entrée de la série ne
+                    # garde `evicting`. Une victime non déchargée resterait sinon
+                    # ni servie ni évictable (fast-path et plans la refusent).
+                    # Affectations synchrones : sûres même sous annulation.
+                    for _, info in evictions:
+                        info.evicting = False
                 if eviction_failed:
-                    async with self._lock:
-                        for _, info in evictions:
-                            info.evicting = False
                     failed_nodes.add(chosen_state.node_id)
                     failures.append(
                         f"{chosen_state.node_id}: éviction non confirmée"
                     )
                     continue
 
-                operation_id = uuid4().hex
                 pending = _PendingLoad(
                     model_id=model.id,
                     deployment_digest=model_digest,
                     generation_id=generation_id,
-                    operation_id=operation_id,
+                    operation_id=uuid4().hex,
                     vram_gb=model.vram_gb,
                     deadline_seconds=self._load_deadline_seconds(
                         model, chosen_state.client
@@ -1231,46 +1531,26 @@ class ClusterManager:
 
                 load_started_at = time.monotonic()
                 load_outcome = "success"
-                modern_operation = getattr(
-                    chosen_state.client, "supports_load_operations", False
-                )
                 try:
                     resp = await self._start_load_operation(
                         chosen_state, model, pending
                     )
-                    if modern_operation:
-                        self._validate_load_identity(resp, pending)
-                    elif resp.model_id != model.id:
-                        raise NodeProtocolError(
-                            f"réponse load incohérente : demandé '{model.id}', "
-                            f"reçu '{resp.model_id}'"
-                        )
-                    if not modern_operation:
-                        resp = resp.model_copy(
-                            update={
-                                "deployment_digest": model_digest,
-                                "generation_id": generation_id,
-                                "operation_id": operation_id,
-                                "state": "ready",
-                                "progress": 1.0,
-                                "deadline_seconds": pending.deadline_seconds,
-                            }
-                        )
+                    self._validate_load_identity(resp, pending)
                     if resp.state == "conflict":
                         raise ClusterLoadConflictError(
                             resp.message
                             or f"Génération incompatible pour '{model.id}'"
                         )
                     if resp.state in {"failed", "deadline_exceeded"}:
-                        raise NodeProtocolError(
-                            resp.message
-                            or f"Échec de chargement de '{model.id}'"
+                        raise ClusterModelLoadFailedError(
+                            model.id, chosen_state.node_id, resp
                         )
                 except asyncio.CancelledError:
                     load_outcome = "cancelled"
                     # Le pending reste volontairement en place : le nœud peut
                     # encore terminer le chargement après la déconnexion du
-                    # demandeur.
+                    # demandeur. L'inventaire le purgera s'il devient READY ou
+                    # disparaît.
                     raise
                 except ClusterLoadUncertainError:
                     load_outcome = "uncertain"
@@ -1280,13 +1560,22 @@ class ClusterManager:
                     await self._clear_pending_load(chosen_state, pending)
                     raise
                 except Exception as exc:
-                    # Inclut ClusterLoadAbandonedError et les refus 4xx : l'agent
-                    # ne produira pas ce résultat, la réservation est purgée.
+                    # Inclut ClusterLoadAbandonedError, les refus 4xx et les
+                    # échecs rapportés : l'agent ne produira pas ce résultat,
+                    # la réservation est purgée.
                     load_outcome = "error"
                     await self._clear_pending_load(chosen_state, pending)
                     if self._counts_as_node_failure(exc):
                         async with self._lock:
                             self._record_failure_locked(chosen_state, exc)
+                    if (
+                        isinstance(exc, ClusterModelLoadFailedError)
+                        and exc.is_model_failure
+                    ):
+                        async with self._lock:
+                            self._remember_load_failure(
+                                model.id, chosen_state.node_id, model_digest
+                            )
                     failed_nodes.add(chosen_state.node_id)
                     failures.append(f"{chosen_state.node_id}: {exc}")
                     log.warning(
@@ -1305,27 +1594,112 @@ class ClusterManager:
                         outcome=load_outcome,
                     )
 
-                return await self._finish_pending_load(
-                    chosen_state,
-                    model,
-                    pending,
-                    resp,
-                    load_seconds=load_seconds,
-                )
+                try:
+                    return await self._finish_pending_load(
+                        chosen_state,
+                        model,
+                        pending,
+                        resp,
+                        load_seconds=load_seconds,
+                    )
+                except BaseException:
+                    # Sans cette purge, une réservation READY refusée (unload
+                    # global concurrent, réponse incomplète) survivait jusqu'au
+                    # prochain inventaire et faussait la capacité.
+                    await self._clear_pending_load(chosen_state, pending)
+                    raise
+
+    def _raise_placement_exhausted(
+        self,
+        model: ModelDefinition,
+        exc: NoPlacementError,
+        failures: list[str],
+        recently_failed: set[str],
+    ) -> NoReturn:
+        """Lève l'erreur client finale d'un placement sans candidat restant."""
+        if recently_failed:
+            # Les nœuds écartés auraient été tentés sans le cache : leur échec
+            # fait partie de la réponse, même si les autres sont seulement pleins.
+            failures = [
+                *failures,
+                *(f"{node_id}: échec récent (cache)" for node_id in sorted(recently_failed)),
+            ]
+        if failures:
+            # Le détail des échecs embarque les corps HTTP renvoyés par les
+            # node-agents (stderr llama-server, chemins de modèles) : journal
+            # serveur uniquement, jamais dans le message client (SEC — fuite
+            # d'infra, audit 2026-08-28).
+            log.error(
+                "Chargement de '%s' impossible sur tous les nœuds candidats : %s",
+                model.id,
+                "; ".join(failures),
+            )
+            raise RuntimeError(
+                f"Le modèle '{model.id}' n'a pas pu être chargé sur les nœuds "
+                "disponibles (détail dans les logs)."
+            ) from exc
+        if isinstance(exc, _StaleGenerationBlocked):
+            raise ClusterLoadConflictError(
+                f"Une génération précédente du modèle '{model.id}' traite encore "
+                "des requêtes ; la nouvelle définition sera chargée après leur "
+                "fin. Réessayez dans quelques secondes."
+            ) from exc
+        raise RuntimeError(str(exc)) from exc
+
+    @staticmethod
+    def _stale_generation_locked(
+        state: _NodeState, model_id: str, digest: str
+    ) -> _LoadedInfo | None:
+        """Entrée de ce modèle servant une AUTRE définition sur ce nœud."""
+        info = state.loaded.get(model_id)
+        if info is None or not info.deployment_digest:
+            return None
+        return info if info.deployment_digest != digest else None
 
     def _pick_locked(
         self, model: ModelDefinition, excluded_nodes: set[str]
     ) -> tuple[NodeSnapshot, EvictionPlan]:
         if self._unloading_all:
             raise RuntimeError("Déchargement global en cours, réessayer.")
-        snapshots = [
-            state.snapshot()
-            for state in self._nodes.values()
-            if state.node_id not in excluded_nodes
-        ]
-        return pick_node(
-            ModelToPlace(id=model.id, vram_gb=model.vram_gb), snapshots
-        )
+        digest = deployment_digest(model.to_dict())
+        snapshots: list[NodeSnapshot] = []
+        blocked: list[str] = []
+        for state in self._nodes.values():
+            if state.node_id in excluded_nodes:
+                continue
+            snapshot = state.snapshot()
+            stale = self._stale_generation_locked(state, model.id, digest)
+            if stale is not None:
+                if stale.active_requests > 0 or stale.evicting:
+                    # L'agent refuserait la nouvelle génération (409).
+                    blocked.append(state.node_id)
+                    continue
+                # Son éviction est obligatoire avant le load : sa VRAM et son
+                # port sont donc disponibles pour ce placement-ci.
+                health = state.last_health
+                counted = health is not None and model.id in health.loaded_model_ids
+                snapshot = replace(
+                    snapshot,
+                    reported_available_vram_gb=(
+                        snapshot.available_vram_gb
+                        + (stale.vram_gb if counted else 0.0)
+                    ),
+                    free_ports=snapshot.free_ports + (1 if counted else 0),
+                    loaded_models=tuple(
+                        loaded
+                        for loaded in snapshot.loaded_models
+                        if loaded.id != model.id
+                    ),
+                )
+            snapshots.append(snapshot)
+        try:
+            return pick_node(
+                ModelToPlace(id=model.id, vram_gb=model.vram_gb), snapshots
+            )
+        except NoPlacementError as exc:
+            if blocked:
+                raise _StaleGenerationBlocked(str(exc)) from exc
+            raise
 
     def _account_load_locked(
         self,
@@ -1334,10 +1708,19 @@ class ClusterManager:
         *,
         already_loaded: bool,
     ) -> None:
+        """
+        Applique localement un load confirmé en attendant le prochain health.
+
+        L'agent compte un modèle dès LOADING (VRAM, port, `loaded_model_ids`) :
+        s'il figure déjà dans le dernier health, celui-ci l'inclut et toute
+        déduction supplémentaire le compterait deux fois jusqu'au heartbeat.
+        """
         if node_state.last_health is None:
             return
         health = node_state.last_health
-        loaded_ids = list(dict.fromkeys([*health.loaded_model_ids, model.id]))
+        if model.id in health.loaded_model_ids:
+            return
+        loaded_ids = [*health.loaded_model_ids, model.id]
         used_delta = 0.0 if already_loaded else model.vram_gb
         port_delta = 0 if already_loaded else 1
         node_state.last_health = health.model_copy(
@@ -1378,23 +1761,12 @@ class ClusterManager:
                     node_state.pending_loads[model.id] = pending
                     node_state.inventory_revision += 1
                 resp = await self._start_load_operation(node_state, model, pending)
-                if not getattr(node_state.client, "supports_load_operations", False):
-                    if resp.model_id != model.id:
-                        raise NodeProtocolError(
-                            f"réponse load incohérente pour '{model.id}'"
-                        )
-                    resp = resp.model_copy(
-                        update={
-                            "deployment_digest": model_digest,
-                            "generation_id": generation_id,
-                            "operation_id": pending.operation_id,
-                            "state": "ready",
-                            "progress": 1.0,
-                            "deadline_seconds": pending.deadline_seconds,
-                        }
-                    )
                 self._validate_load_identity(resp, pending)
-                if resp.state != "ready":
+                if resp.state in {"failed", "deadline_exceeded"}:
+                    raise ClusterModelLoadFailedError(
+                        model.id, node_state.node_id, resp
+                    )
+                if resp.state != "ready" or not resp.llama_url:
                     raise NodeProtocolError(
                         resp.message or f"Rafraîchissement de '{model.id}' incomplet"
                     )
@@ -1425,21 +1797,31 @@ class ClusterManager:
                 if info is None:
                     info = _LoadedInfo(
                         node_id=node_state.node_id,
-                        llama_url=resp.llama_url or "",
+                        llama_url=resp.llama_url,
                         internal_api_key=resp.internal_api_key or "",
                         vram_gb=model.vram_gb,
                     )
                     node_state.loaded[model.id] = info
                 else:
-                    info.llama_url = resp.llama_url or info.llama_url
+                    # En place : les pins des handles déjà distribués survivent.
+                    info.llama_url = resp.llama_url
                     info.internal_api_key = (
                         resp.internal_api_key or info.internal_api_key
                     )
+                    # READY confirmé par l'agent pour cette entrée : même
+                    # règle que _finish_pending_load.
+                    info.unload_uncertain = False
                 info.deployment_digest = model_digest
                 info.generation_id = generation_id
                 info.operation_id = pending.operation_id
                 node_state.suspect_models.discard(model.id)
                 self._placement[model.id] = node_state.node_id
+                self._load_failures.pop((model.id, node_state.node_id), None)
+                # No-op si le health courant compte déjà ce modèle ; couvre un
+                # agent qui a dû le recharger réellement.
+                self._account_load_locked(
+                    node_state, model, already_loaded=resp.already_loaded
+                )
                 node_state.inventory_revision += 1
                 info.touch()
                 return ClusterModelHandle(info, model, self)
@@ -1447,33 +1829,72 @@ class ClusterManager:
     # ── Déchargement ──────────────────────────────────────────────────────────
 
     async def unload_model(self, model_id: str) -> None:
-        """Force le déchargement d'un modèle (action admin)."""
+        """
+        Force le déchargement d'un modèle (action admin) sur TOUS les nœuds.
+
+        Toute copie suivie compte : la route primaire, mais aussi un doublon
+        revenu d'un nœud offline ou une ancienne génération retirée du
+        placement après un changement de définition. Ne regarder que
+        `_placement` laissait ces copies en VRAM pendant que la route admin
+        annonçait « VRAM libérée ». Refus global (aucun unload partiel) si une
+        copie traite encore des requêtes. Les nœuds offline sont sautés : leur
+        copie éventuelle est réconciliée comme doublon évictable à leur retour.
+        """
         model_lock = self._model_locks.setdefault(model_id, asyncio.Lock())
         async with model_lock:
             async with self._lock:
-                node_id = self._placement.get(model_id)
-                node_state = self._nodes.get(node_id) if node_id else None
-            if node_state is None:
-                return
-
-            async with node_state.operation_lock:
-                async with self._lock:
-                    info = node_state.loaded.get(model_id)
-                    if info is None:
-                        if self._placement.get(model_id) == node_state.node_id:
-                            self._placement.pop(model_id, None)
-                        return
-                    if info.active_requests > 0:
-                        raise RuntimeError(
-                            f"Le modèle '{model_id}' traite encore "
-                            f"{info.active_requests} requête(s) et ne peut pas être déchargé."
+                targets: list[_NodeState] = []
+                for state in self._nodes.values():
+                    if model_id not in state.loaded:
+                        continue
+                    if not state.online:
+                        log.warning(
+                            "Unload admin de '%s' : nœud '%s' offline, copie "
+                            "non déchargée (réconciliée à son retour).",
+                            model_id,
+                            state.node_id,
                         )
-                    info.evicting = True
-                confirmed = await self._do_unload(node_state, model_id, info)
-                if not confirmed:
-                    raise ClusterUnloadUncertainError(
+                        continue
+                    targets.append(state)
+                placement_node = self._placement.get(model_id)
+                if placement_node is not None and not any(
+                    state.node_id == placement_node for state in targets
+                ):
+                    placement_state = self._nodes.get(placement_node)
+                    if placement_state is None or model_id not in placement_state.loaded:
+                        self._placement.pop(model_id, None)
+                active = sum(
+                    state.loaded[model_id].active_requests for state in targets
+                )
+                if active > 0:
+                    raise RuntimeError(
+                        f"Le modèle '{model_id}' traite encore {active} "
+                        "requête(s) et ne peut pas être déchargé."
+                    )
+
+            uncertain: ClusterUnloadUncertainError | None = None
+            for node_state in targets:
+                async with node_state.operation_lock:
+                    async with self._lock:
+                        info = node_state.loaded.get(model_id)
+                        if info is None:
+                            continue
+                        if info.active_requests > 0:
+                            raise RuntimeError(
+                                f"Le modèle '{model_id}' traite encore "
+                                f"{info.active_requests} requête(s) et ne peut "
+                                "pas être déchargé."
+                            )
+                        info.evicting = True
+                    # `_do_unload` remet `evicting` à False sur toute issue,
+                    # annulation comprise (finally).
+                    confirmed = await self._do_unload(node_state, model_id, info)
+                if not confirmed and uncertain is None:
+                    uncertain = ClusterUnloadUncertainError(
                         model_id, node_state.node_id
                     )
+            if uncertain is not None:
+                raise uncertain
 
     async def _do_unload(
         self,
@@ -1486,7 +1907,24 @@ class ClusterManager:
 
         Le caller sérialise avec `node_state.operation_lock`. Retourne True
         uniquement si la disparition est confirmée par unload ou health.
+
+        Propriétaire du drapeau `evicting` posé par le caller : il est remis à
+        False sur TOUTE issue, y compris une annulation pendant l'unload ou la
+        re-synchronisation `health()`. Sans cela, l'entrée restait ni servie
+        (fast-path) ni évictable (plans obsolètes), indéfiniment.
         """
+        try:
+            return await self._do_unload_io(node_state, model_id, expected_info)
+        finally:
+            # Affectation synchrone : sûre même sous annulation.
+            expected_info.evicting = False
+
+    async def _do_unload_io(
+        self,
+        node_state: _NodeState,
+        model_id: str,
+        expected_info: _LoadedInfo,
+    ) -> bool:
         try:
             resp = await node_state.client.unload_model(model_id)
         except (NodeUnreachableError, NodeProtocolError) as exc:
@@ -1562,8 +2000,16 @@ class ClusterManager:
             expected_info.evicting = False
             if self._placement.get(model_id) == node_state.node_id:
                 self._placement.pop(model_id, None)
+            # Le caller tient operation_lock : une réservation restante est
+            # orpheline (load annulé) et l'agent vient de décharger le modèle.
+            node_state.pending_loads.pop(model_id, None)
 
-            if node_state.last_health is not None:
+            # Symétrique de _account_load_locked : ne retrancher que ce que le
+            # dernier health comptait encore.
+            if (
+                node_state.last_health is not None
+                and model_id in node_state.last_health.loaded_model_ids
+            ):
                 health = node_state.last_health
                 node_state.last_health = health.model_copy(
                     update={
@@ -1594,8 +2040,8 @@ class ClusterManager:
         Après un unload_model en échec, re-synchronise l'état local via health().
         On ne purge l'entrée locale QUE si le nœud confirme que le modèle n'est
         plus chargé (absent de loaded_model_ids). Sinon on considère la VRAM
-        toujours occupée : le placement suivant ne sur-réservera pas. Appelé sous
-        _lock.
+        toujours occupée : le placement suivant ne sur-réservera pas. Le caller
+        tient `operation_lock` ; `_lock` n'est pris que pour les mutations.
         """
         try:
             health = await node_state.client.health()
@@ -1623,6 +2069,7 @@ class ClusterManager:
                     node_state.loaded.pop(model_id, None)
                 if self._placement.get(model_id) == node_state.node_id:
                     self._placement.pop(model_id, None)
+                node_state.pending_loads.pop(model_id, None)
                 node_state.inventory_revision += 1
                 log.info(
                     "Re-sync '%s' sur '%s' : modèle absent côté nœud — état local purgé.",
@@ -1656,6 +2103,11 @@ class ClusterManager:
                 log.debug("Exception non gérée dans _check_node : %s", r)
 
     async def _check_node(self, state: _NodeState) -> None:
+        # Révision capturée AVANT le round-trip : une mutation locale pendant
+        # l'attente (load terminé, unload, invalidation) rend cette réponse
+        # antérieure à l'état courant.
+        async with self._lock:
+            revision = state.inventory_revision
         try:
             health = await state.client.health()
         except NodeUnreachableError as exc:
@@ -1689,28 +2141,44 @@ class ClusterManager:
             previous_failures = state.consecutive_failures
             state.online = True
             state.consecutive_failures = 0
-            state.last_health = health
+            stale = revision != state.inventory_revision
+            if not stale or state.last_health is None:
+                state.last_health = health
 
-            # Ne pas interpréter l'inventaire transitoire pendant un load/unload
-            # sérialisé. Le prochain heartbeat fera la convergence.
-            if not state.operation_lock.locked():
+            # Une réponse périmée n'est jamais appliquée à l'inventaire : elle
+            # retirerait un modèle chargé pendant le round-trip, puis le
+            # heartbeat suivant le réadopterait sous un `_LoadedInfo` neuf à zéro
+            # requête active. Idem pendant un load/unload sérialisé. Le
+            # prochain heartbeat fera la convergence.
+            if was_offline:
+                needs_status = True
+            elif not stale and not state.operation_lock.locked():
                 reported = set(health.loaded_model_ids)
-                local = set(state.loaded)
-                for model_id in local - reported:
-                    info = state.loaded.pop(model_id)
-                    if self._placement.get(model_id) == state.node_id:
-                        self._placement.pop(model_id, None)
-                    log.warning(
-                        "Heartbeat : '%s' a disparu de '%s'%s — placement invalidé.",
-                        model_id,
-                        state.node_id,
-                        " pendant une requête active" if info.active_requests else "",
-                    )
+                for model_id in set(state.loaded) - reported:
+                    self._forget_vanished_locked(state, model_id, "Heartbeat")
                     state.inventory_revision += 1
                 needs_status = bool(
-                    was_offline
-                    or (reported - set(state.loaded))
+                    (reported - set(state.loaded))
                     or (state.suspect_models & reported)
+                    # Seul status() porte la génération qui lève un
+                    # `unload_uncertain` resté READY côté nœud.
+                    or any(
+                        info.unload_uncertain
+                        for model_id, info in state.loaded.items()
+                        if model_id in reported
+                    )
+                    # operation_lock libre : toute réservation restante est
+                    # orpheline (load annulé). Si l'agent ne la publie pas, ou
+                    # si sa grâce est échue, seul status() peut établir son
+                    # issue (READY, encore en validation, ou terminée en
+                    # `failed` — jamais visible dans loaded_model_ids) et la
+                    # purger ; sinon elle réservait VRAM et port à vie.
+                    or any(
+                        model_id not in reported
+                        or time.monotonic()
+                        >= pending.created_at + self._operation_grace_seconds
+                        for model_id, pending in state.pending_loads.items()
+                    )
                 )
 
         if was_offline:
@@ -1729,7 +2197,10 @@ class ClusterManager:
         le compter vers le seuil offline sortirait du placement un nœud sain
         pour une définition qu'il refuse, et ses autres modèles avec lui.
         """
-        if isinstance(exc, ClusterLoadConflictError):
+        if isinstance(exc, (ClusterLoadConflictError, ClusterModelLoadFailedError)):
+            # `failed`/`deadline_exceeded` rapporté par un agent joignable :
+            # un GGUF absent sur un nœud ne doit pas sortir tout le cluster du
+            # placement en trois requêtes.
             return False
         return not (isinstance(exc, NodeProtocolError) and exc.is_rejection)
 
@@ -1843,15 +2314,26 @@ class ClusterManager:
             ]
 
         result: dict = {}
-        for node_id, client in online:
-            try:
-                node_metrics = await client.metrics()
-            except (NodeUnreachableError, NodeProtocolError) as exc:
-                log.debug("Métriques nœud '%s' indisponibles : %s", node_id, exc)
-                continue
-            except Exception as exc:  # défensif : jamais fatal pour l'observabilité
+        # Nœuds interrogés en parallèle : un nœud lent ne retarde plus les
+        # autres de son timeout de health.
+        responses = await asyncio.gather(
+            *(client.metrics() for _, client in online),
+            return_exceptions=True,
+        )
+        for (node_id, _client), node_metrics in zip(online, responses):
+            if isinstance(node_metrics, (NodeUnreachableError, NodeProtocolError)):
                 log.debug(
-                    "Métriques nœud '%s' : erreur inattendue (%s)", node_id, exc
+                    "Métriques nœud '%s' indisponibles : %s", node_id, node_metrics
+                )
+                continue
+            if isinstance(node_metrics, asyncio.CancelledError):
+                raise node_metrics
+            if isinstance(node_metrics, BaseException):
+                # Défensif : jamais fatal pour l'observabilité.
+                log.debug(
+                    "Métriques nœud '%s' : erreur inattendue (%s)",
+                    node_id,
+                    node_metrics,
                 )
                 continue
             if not isinstance(node_metrics, dict):

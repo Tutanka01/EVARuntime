@@ -1128,6 +1128,7 @@ def _build_manager():
             agent_secret=settings.agent_secret,
             timeout_seconds=settings.cluster_request_timeout,
             load_timeout_seconds=settings.cluster_load_timeout,
+            unload_timeout_seconds=settings.cluster_unload_timeout,
             verify=cluster_cfg.tls_verify,
         )
         for node in cluster_cfg.nodes

@@ -29,6 +29,45 @@ from server_manager import ModelState
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+_TERMINAL_STATES = {"ready", "failed", "conflict", "deadline_exceeded"}
+
+
+async def load_and_wait(
+    state: "main._AgentState",
+    model_dict: dict,
+    *,
+    deployment_digest: str | None = None,
+    generation_id: str | None = None,
+    operation_id: str | None = None,
+    deadline_seconds: float | None = None,
+):
+    """
+    Démarre une opération (`start_load`, seul chemin de production) puis
+    attend son état terminal ; un échec est relevé en HTTPException comme le
+    ferait un client qui suit l'opération. Remplace l'ancien
+    `_AgentState.load`, appelé uniquement par les tests.
+    """
+    response = await state.start_load(
+        model_dict,
+        deployment_digest=deployment_digest,
+        generation_id=generation_id,
+        operation_id=operation_id,
+        deadline_seconds=deadline_seconds,
+    )
+    operation = state._operations.get(response.operation_id)
+    if response.state not in _TERMINAL_STATES:
+        if operation is None or operation.task is None:
+            return response
+        await asyncio.shield(operation.task)
+        async with state._lock:
+            response = state._snapshot_operation(operation)
+    if operation is not None and operation.state in _TERMINAL_STATES - {"ready"}:
+        raise HTTPException(
+            status_code=operation.error_status, detail=operation.error_detail
+        )
+    return response
+
+
 def make_model_dict(model_id: str = "test-model", vram_gb: float = 1.0) -> dict:
     """Entrée YAML minimale valide acceptée par ModelRegistry._parse_entry.
 
@@ -199,9 +238,9 @@ class TestAgentStateLoadUnload:
         model_dict = make_model_dict("already-ready")
 
         async def scenario():
-            first = await fake_state.load(model_dict)
+            first = await load_and_wait(fake_state, model_dict)
             # Second appel : le manager existe déjà et est READY.
-            second = await fake_state.load(model_dict)
+            second = await load_and_wait(fake_state, model_dict)
             return first, second
 
         first, second = asyncio.run(scenario())
@@ -218,12 +257,12 @@ class TestAgentStateLoadUnload:
         model_dict = make_model_dict("loading-model")
 
         async def scenario():
-            await fake_state.load(model_dict)
+            await load_and_wait(fake_state, model_dict)
             # Forcer artificiellement l'état à LOADING pour simuler une requête
             # concurrente arrivée pendant un chargement en cours.
             mgr = fake_state._managers["loading-model"]
             mgr.state = ModelState.LOADING
-            return await fake_state.load(model_dict)
+            return await load_and_wait(fake_state, model_dict)
 
         second = asyncio.run(scenario())
         assert second.already_loaded is True
@@ -234,10 +273,10 @@ class TestAgentStateLoadUnload:
 
         async def scenario():
             for i in range(max_models):
-                await fake_state.load(make_model_dict(f"model-{i}", vram_gb=0.1))
+                await load_and_wait(fake_state, make_model_dict(f"model-{i}", vram_gb=0.1))
             # Un modèle supplémentaire : plus aucun port disponible.
             with pytest.raises(HTTPException) as exc_info:
-                await fake_state.load(make_model_dict("one-too-many", vram_gb=0.1))
+                await load_and_wait(fake_state, make_model_dict("one-too-many", vram_gb=0.1))
             return exc_info.value
 
         exc = asyncio.run(scenario())
@@ -251,7 +290,7 @@ class TestAgentStateLoadUnload:
 
         async def scenario():
             with pytest.raises(HTTPException) as exc_info:
-                await fake_state.load(model_dict)
+                await load_and_wait(fake_state, model_dict)
             return exc_info.value
 
         exc = asyncio.run(scenario())
@@ -271,7 +310,7 @@ class TestAgentStateLoadUnload:
 
         async def scenario():
             with pytest.raises(HTTPException) as exc_info:
-                await fake_state.load(model_dict)
+                await load_and_wait(fake_state, model_dict)
             return exc_info.value
 
         exc = asyncio.run(scenario())
@@ -288,7 +327,7 @@ class TestAgentStateLoadUnload:
         FakeServerManager.FAIL_LOAD.discard(model_id)
 
         async def retry():
-            return await fake_state.load(model_dict)
+            return await load_and_wait(fake_state, model_dict)
 
         result = asyncio.run(retry())
         assert result.already_loaded is False
@@ -305,7 +344,7 @@ class TestAgentStateLoadUnload:
         model_dict = make_model_dict("a-decharger", vram_gb=2.0)
 
         async def scenario():
-            await fake_state.load(model_dict)
+            await load_and_wait(fake_state, model_dict)
             ports_before = len(fake_state._port_pool)
             resp = await fake_state.unload("a-decharger")
             return resp, ports_before
@@ -322,14 +361,14 @@ class TestAgentStateLoadUnload:
         async def scenario():
             gate = asyncio.Event()
             FakeServerManager.LOAD_GATES[model_id] = gate
-            first_task = asyncio.create_task(fake_state.load(make_model_dict(model_id)))
+            first_task = asyncio.create_task(load_and_wait(fake_state, make_model_dict(model_id)))
             while (
                 model_id not in fake_state._managers
                 or fake_state._managers[model_id].state != ModelState.LOADING
             ):
                 await asyncio.sleep(0)
 
-            second_task = asyncio.create_task(fake_state.load(make_model_dict(model_id)))
+            second_task = asyncio.create_task(load_and_wait(fake_state, make_model_dict(model_id)))
             await asyncio.sleep(0.01)
             assert not first_task.done()
             assert not second_task.done()
@@ -350,7 +389,7 @@ class TestAgentStateLoadUnload:
         model_id = "unload-load-race"
 
         async def scenario():
-            first = await fake_state.load(make_model_dict(model_id))
+            first = await load_and_wait(fake_state, make_model_dict(model_id))
             old_manager = fake_state._managers[model_id]
             gate = asyncio.Event()
             FakeServerManager.UNLOAD_GATES[model_id] = gate
@@ -359,7 +398,7 @@ class TestAgentStateLoadUnload:
             while old_manager.state != ModelState.UNLOADING:
                 await asyncio.sleep(0)
 
-            reload_task = asyncio.create_task(fake_state.load(make_model_dict(model_id)))
+            reload_task = asyncio.create_task(load_and_wait(fake_state, make_model_dict(model_id)))
             await asyncio.sleep(0.01)
             assert not reload_task.done()
             assert fake_state._managers[model_id] is old_manager
@@ -473,7 +512,7 @@ class TestLoadOperations:
         digest = deployment_digest(model)
 
         async def scenario():
-            first = await fake_state.load(
+            first = await load_and_wait(fake_state, 
                 model,
                 deployment_digest=digest,
                 generation_id="generation-old",
@@ -482,7 +521,7 @@ class TestLoadOperations:
             changed = dict(model)
             changed["vram_gb"] = 2.0
             with pytest.raises(HTTPException) as caught:
-                await fake_state.load(
+                await load_and_wait(fake_state, 
                     changed,
                     deployment_digest=deployment_digest(changed),
                     generation_id="generation-new",
@@ -526,7 +565,7 @@ class TestLoadOperations:
 
         async def scenario():
             digest = deployment_digest(model)
-            await fake_state.load(
+            await load_and_wait(fake_state, 
                 model,
                 deployment_digest=digest,
                 generation_id="generation-retained",
@@ -561,7 +600,7 @@ class TestModelFilesFailFast:
         model["path"] = str(tmp_path / "missing.gguf")
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(state.load(model))
+            asyncio.run(load_and_wait(state, model))
 
         assert exc_info.value.status_code == 422
         assert "introuvable" in exc_info.value.detail
@@ -577,7 +616,7 @@ class TestModelFilesFailFast:
         model["path"] = str(gguf)
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(state.load(model))
+            asyncio.run(load_and_wait(state, model))
 
         assert exc_info.value.status_code == 422
         assert "non lisible" in exc_info.value.detail
@@ -598,7 +637,7 @@ class TestModelFilesFailFast:
         )
 
         with pytest.raises(HTTPException) as exc_info:
-            asyncio.run(state.load(model))
+            asyncio.run(load_and_wait(state, model))
 
         assert exc_info.value.status_code == 422
         assert "projecteur multimodal" in exc_info.value.detail
@@ -656,17 +695,17 @@ class TestLoadResponseUrl:
         du nœud (cf. gateway/tests/test_node_client.py::TestRemoteClientTrustedLlamaUrl).
         """
         model_dict = make_model_dict("url-test")
-        resp = asyncio.run(fake_state.load(model_dict))
+        resp = asyncio.run(load_and_wait(fake_state, model_dict))
 
         expected_port = resp.port
         assert resp.llama_url == f"http://{main.settings.llama_server_host}:{expected_port}"
 
     def test_agent_disables_blind_idle_unload(self, fake_state):
-        asyncio.run(fake_state.load(make_model_dict("cluster-lifecycle")))
+        asyncio.run(load_and_wait(fake_state, make_model_dict("cluster-lifecycle")))
         assert fake_state._managers["cluster-lifecycle"].idle_unload_enabled is False
 
     def test_llama_url_brackets_ipv6_bind_host(self, fake_state, monkeypatch):
         monkeypatch.setattr(main.settings, "llama_server_host", "::")
-        resp = asyncio.run(fake_state.load(make_model_dict("ipv6-url")))
+        resp = asyncio.run(load_and_wait(fake_state, make_model_dict("ipv6-url")))
 
         assert resp.llama_url == f"http://[::]:{resp.port}"

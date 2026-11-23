@@ -18,12 +18,9 @@ Exceptions :
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from typing import Protocol
 from urllib.parse import quote, urlparse
-from uuid import uuid4
 
 import httpx
 from pydantic import ValidationError
@@ -35,7 +32,6 @@ from .node_protocol import (
     NodeStatus,
     OperationStatusResponse,
     UnloadResponse,
-    deployment_digest,
 )
 
 log = logging.getLogger(__name__)
@@ -85,7 +81,6 @@ class NodeClient(Protocol):
     async def health(self) -> NodeHealth: ...
     async def status(self) -> NodeStatus: ...
     async def metrics(self) -> dict: ...
-    async def load_model(self, model_dict: dict) -> LoadResponse: ...
     async def start_load_model(
         self,
         model_dict: dict,
@@ -122,16 +117,21 @@ class RemoteNodeClient:
         timeout_seconds: float = 10.0,
         health_timeout_seconds: float = 3.0,
         load_timeout_seconds: float = 300.0,
+        unload_timeout_seconds: float = 30.0,
         verify: bool | str = True,
     ) -> None:
-        self.supports_load_operations = True
         self.node_id = node_id
         self.base_url = base_url.rstrip("/")
         self._request_timeout = timeout_seconds
         self._health_timeout = health_timeout_seconds
-        # Timeout dédié au chargement de modèle — bien plus long que le timeout
-        # du plan de contrôle car un gros GGUF peut prendre plusieurs minutes.
+        # Budget par défaut d'un chargement quand la définition n'en porte pas
+        # (`ClusterManager._load_deadline_seconds`) : un gros GGUF peut prendre
+        # plusieurs minutes côté agent.
         self._load_timeout = load_timeout_seconds
+        # Un unload attend côté agent l'arrêt du llama-server (SIGTERM, grâce
+        # 10 s, puis SIGKILL et reap jusqu'à 15 s) : le timeout court du plan
+        # de contrôle déclarait « incertain » un unload simplement lent.
+        self._unload_timeout = unload_timeout_seconds
 
         # trust_env=False : ce client porte AGENT_SECRET, le secret partagé qui
         # contrôle TOUS les nœuds. Sans lui, httpx lit HTTPS_PROXY/ALL_PROXY et
@@ -177,23 +177,6 @@ class RemoteNodeClient:
 
     # ── Mutations ─────────────────────────────────────────────────────────────
 
-    async def load_model(self, model_dict: dict) -> LoadResponse:
-        """API historique : démarre puis attend l'opération jusqu'au terminal."""
-        response = await self.start_load_model(
-            model_dict,
-            deployment_digest=deployment_digest(model_dict),
-            generation_id=uuid4().hex,
-            operation_id=uuid4().hex,
-            deadline_seconds=self._load_timeout,
-            _timeout_override=self._load_timeout,
-        )
-        if response.state in {"ready", "failed", "conflict", "deadline_exceeded"}:
-            return response
-        return await self.wait_for_operation(
-            response.operation_id,
-            deadline_seconds=response.deadline_seconds or self._load_timeout,
-        )
-
     async def start_load_model(
         self,
         model_dict: dict,
@@ -202,7 +185,6 @@ class RemoteNodeClient:
         generation_id: str,
         operation_id: str,
         deadline_seconds: float,
-        _timeout_override: float | None = None,
     ) -> LoadResponse:
         payload = LoadRequest(
             model=model_dict,
@@ -217,10 +199,7 @@ class RemoteNodeClient:
         raw = await self._post(
             "/agent/models/load",
             json=payload,
-            timeout=min(
-                self._request_timeout if _timeout_override is None else _timeout_override,
-                max(0.1, deadline_seconds),
-            ),
+            timeout=min(self._request_timeout, max(0.1, deadline_seconds)),
         )
         resp = self._parse(LoadResponse, raw)
         if not resp.deployment_digest:
@@ -240,23 +219,6 @@ class RemoteNodeClient:
         if response.state == "ready":
             response = self._with_trusted_url(response)
         return response
-
-    async def wait_for_operation(
-        self, operation_id: str, *, deadline_seconds: float
-    ) -> LoadResponse:
-        """Attend une opération sans jamais substituer un nouvel operation_id."""
-        deadline = time.monotonic() + deadline_seconds
-        while True:
-            response = await self.get_operation_status(operation_id)
-            if response.state in {"ready", "failed", "conflict", "deadline_exceeded"}:
-                return response
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise NodeUnreachableError(
-                    f"Nœud '{self.node_id}' : opération '{operation_id}' toujours "
-                    "en cours à l'échéance négociée"
-                )
-            await asyncio.sleep(min(0.2, remaining))
 
     def _with_trusted_url(self, resp: LoadResponse) -> LoadResponse:
         if resp.port is None or not resp.llama_url:
@@ -315,11 +277,15 @@ class RemoteNodeClient:
         # model_id est validé en amont par ModelRegistry (regex stricte).
         # On évite tout risque d'injection dans l'URL en le passant tel quel —
         # httpx ne fait pas d'encoding ici car il n'y a aucun caractère spécial autorisé.
-        raw = await self._post(f"/agent/models/{model_id}/unload")
+        raw = await self._post(
+            f"/agent/models/{model_id}/unload", timeout=self._unload_timeout
+        )
         return self._parse(UnloadResponse, raw)
 
     async def unload_all(self) -> None:
-        await self._post("/agent/unload-all")
+        # L'agent décharge ses modèles en parallèle : un seul budget d'unload
+        # couvre l'arrêt du plus lent.
+        await self._post("/agent/unload-all", timeout=self._unload_timeout)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -402,7 +368,9 @@ class LocalNodeAdapter:
     Adaptateur in-process qui présente la même API qu'un nœud distant.
 
     Le LocalBackend passé en injection doit exposer les méthodes asynchrones :
-        health(), status(), load_model(dict), unload_model(id), unload_all().
+        health(), status(), unload_model(id), unload_all(), et soit le contrat
+        d'opérations (start_load_model + get_operation_status), soit un
+        load_model(dict) synchrone adapté ci-dessous.
     Cela permet de mocker ou d'injecter n'importe quelle implémentation
     (ServerManager + état local, ou un fake en tests).
     """
@@ -411,7 +379,6 @@ class LocalNodeAdapter:
         self.node_id = node_id
         self.base_url = "in-process"
         self._backend = backend
-        self.supports_load_operations = hasattr(backend, "start_load_model")
 
     async def health(self) -> NodeHealth:
         return await self._backend.health()
@@ -425,9 +392,6 @@ class LocalNodeAdapter:
         if backend_metrics is None:
             return {}
         return await backend_metrics()
-
-    async def load_model(self, model_dict: dict) -> LoadResponse:
-        return await self._backend.load_model(model_dict)
 
     async def start_load_model(
         self,
@@ -448,18 +412,41 @@ class LocalNodeAdapter:
                 operation_id=operation_id,
                 deadline_seconds=deadline_seconds,
             )
-        # L'adaptateur local historique est synchrone du point de vue du
-        # contrôle : son résultat READY constitue déjà une opération terminée.
-        response = await self._backend.load_model(model_dict)
+        # Backend synchrone in-process : son issue EST l'état terminal de
+        # l'opération (aucune réponse tardive possible). Un refus explicite
+        # garde sa sémantique d'agent ; toute autre exception devient `failed`
+        # au lieu d'une incertitude réseau qui n'existe pas ici.
+        identity = {
+            "deployment_digest": deployment_digest,
+            "generation_id": generation_id,
+            "operation_id": operation_id,
+            "deadline_seconds": deadline_seconds,
+        }
+        try:
+            response = await self._backend.load_model(model_dict)
+        except NodeProtocolError as exc:
+            if exc.is_rejection:
+                raise
+            return LoadResponse(
+                model_id=model_dict.get("id", ""),
+                state="failed",
+                progress=0.0,
+                error_code="load_failed",
+                error_status=exc.status_code,
+                message=str(exc),
+                **identity,
+            )
+        except Exception as exc:
+            return LoadResponse(
+                model_id=model_dict.get("id", ""),
+                state="failed",
+                progress=0.0,
+                error_code="load_failed",
+                message=str(exc),
+                **identity,
+            )
         return response.model_copy(
-            update={
-                "deployment_digest": deployment_digest,
-                "generation_id": generation_id,
-                "operation_id": operation_id,
-                "state": "ready",
-                "progress": 1.0,
-                "deadline_seconds": deadline_seconds,
-            }
+            update={**identity, "state": "ready", "progress": 1.0}
         )
 
     async def get_operation_status(self, operation_id: str) -> OperationStatusResponse:

@@ -84,8 +84,16 @@ class FakeRegistry:
 
 class FakeNodeBackend:
     """
-    Simule un nœud GPU : répond aux appels load/unload/health,
-    tient un inventaire de modèles chargés.
+    Simule un node-agent sur le contrat d'opérations de PRODUCTION
+    (`start_load_model` → 202 `accepted`, puis `get_operation_status`), comme
+    `node_agent._AgentState` :
+      - un modèle LOADING est compté dans health (VRAM, port,
+        `loaded_model_ids`) dès l'acceptation ;
+      - 409 si le modèle est READY sous une autre définition (identité) ;
+      - capacité (VRAM/ports) vérifiée par l'agent → `failed` + 503 ;
+      - `fail_load` → `failed` terminal rapporté par un agent joignable ;
+      - `load_exc` → exception levée par le POST lui-même ;
+      - une opération READY dont le modèle a été déchargé répond `failed`.
     """
 
     def __init__(
@@ -99,13 +107,26 @@ class FakeNodeBackend:
         fail_unload: bool = False,
         fail_unload_all: bool = False,
         load_exc: Exception | None = None,
+        fail_load: str | None = None,
+        fail_load_status: int | None = 500,
         reserved_vram: float = 0.0,
         preloaded: dict[str, float] | None = None,
     ):
         self._nid = node_id
         self._total = total_vram
         self._max_ports = max_ports
-        self._loaded: dict[str, float] = dict(preloaded or {})  # model_id → vram_gb
+        # model_id → vram_gb pour tout manager présent (READY ou LOADING).
+        self._loaded: dict[str, float] = dict(preloaded or {})
+        self._loading: set[str] = set()
+        # model_id → (digest, generation, operation) du manager READY.
+        self._identity: dict[str, tuple[str, str, str]] = {}
+        # Instance du llama-server servant le modèle : une opération READY
+        # n'est valable que pour CETTE instance (port réutilisé ensuite).
+        self._instances: dict[str, object] = {
+            model_id: object() for model_id in self._loaded
+        }
+        self._operations: dict[str, dict] = {}
+        self._active: dict[str, str] = {}
         self.fail_health = fail_health
         # Si fourni, health() lève cette exception « inattendue » (ni
         # NodeUnreachableError ni NodeProtocolError) — pour tester le catch-all.
@@ -115,10 +136,15 @@ class FakeNodeBackend:
         self.fail_unload = fail_unload
         self.fail_unload_all = fail_unload_all
         self.load_exc = load_exc
+        self.fail_load = fail_load
+        self.fail_load_status = fail_load_status
+        # Répondre `already_loaded=True` à tout load (modèle déjà présent).
+        self.answer_already_loaded = False
         self._reserved_vram = reserved_vram
         self.load_started: asyncio.Event | None = None
         self.release_load: asyncio.Event | None = None
         self.load_calls: list[dict] = []
+        self.operation_status_calls = 0
         self.unload_calls: list[str] = []
         self.unload_all_called = False
         # Réponse explicite de l'agent, utile pour vérifier que l'orchestrateur
@@ -146,31 +172,193 @@ class FakeNodeBackend:
         )
 
     async def status(self) -> NodeStatus:
-        models = [
-            ModelStateOnNode(id=mid, state="ready", port=8081, vram_gb=vram)
-            for mid, vram in self._loaded.items()
-        ]
+        models = []
+        for mid, vram in self._loaded.items():
+            if mid in self._loading:
+                op = self._operations[self._active[mid]]
+                digest, generation, operation_id = op["identity"]
+                models.append(
+                    ModelStateOnNode(
+                        id=mid,
+                        state="loading",
+                        vram_gb=vram,
+                        deployment_digest=digest,
+                        generation_id=generation,
+                        operation_id=operation_id,
+                        progress=0.5,
+                        deadline_seconds=op["deadline"],
+                    )
+                )
+                continue
+            digest, generation, operation_id = self._identity.get(mid, ("", "", None))
+            models.append(
+                ModelStateOnNode(
+                    id=mid,
+                    state="ready",
+                    port=8081,
+                    vram_gb=vram,
+                    deployment_digest=digest,
+                    generation_id=generation,
+                    operation_id=operation_id,
+                )
+            )
         return NodeStatus(node_id=self._nid, health=await self.health(), models=models)
 
-    async def load_model(self, model_dict: dict) -> LoadResponse:
-        self.load_calls.append(model_dict)
-        if self.load_started is not None:
-            self.load_started.set()
-        if self.release_load is not None:
-            await self.release_load.wait()
-        if self.load_exc is not None:
-            raise self.load_exc
-        mid = model_dict["id"]
-        vram = float(model_dict.get("vram_gb", 0.0))
-        already = mid in self._loaded
-        self._loaded[mid] = vram
+    def _ready_response(self, op: dict, *, already: bool) -> LoadResponse:
+        digest, generation, operation_id = op["identity"]
         return LoadResponse(
-            model_id=mid,
+            model_id=op["model"]["id"],
+            deployment_digest=digest,
+            generation_id=generation,
+            operation_id=operation_id,
+            state="ready",
+            progress=1.0,
             llama_url=f"http://{self._nid}:8081",
             internal_api_key="internal-key",
             port=8081,
             already_loaded=already,
+            deadline_seconds=op["deadline"],
         )
+
+    def _snapshot(self, op: dict) -> LoadResponse:
+        digest, generation, operation_id = op["identity"]
+        mid = op["model"]["id"]
+        if op["state"] == "ready":
+            if self._instances.get(mid) is not op["instance"] or mid in self._loading:
+                return LoadResponse(
+                    model_id=mid,
+                    deployment_digest=digest,
+                    generation_id=generation,
+                    operation_id=operation_id,
+                    state="failed",
+                    deadline_seconds=op["deadline"],
+                    error_code="unloaded",
+                    error_status=409,
+                    message="modèle déchargé depuis",
+                )
+            return self._ready_response(op, already=op["already"])
+        if op["state"] == "failed":
+            return LoadResponse(
+                model_id=mid,
+                deployment_digest=digest,
+                generation_id=generation,
+                operation_id=operation_id,
+                state="failed",
+                progress=0.25,
+                deadline_seconds=op["deadline"],
+                error_code="load_failed",
+                error_status=op["error_status"],
+                message=op["message"],
+            )
+        return LoadResponse(
+            model_id=mid,
+            deployment_digest=digest,
+            generation_id=generation,
+            operation_id=operation_id,
+            state=op["state"],
+            progress=0.1 if op["state"] == "accepted" else 0.5,
+            deadline_seconds=op["deadline"],
+        )
+
+    async def start_load_model(
+        self,
+        model_dict: dict,
+        *,
+        deployment_digest: str,
+        generation_id: str,
+        operation_id: str,
+        deadline_seconds: float,
+    ) -> LoadResponse:
+        self.load_calls.append(model_dict)
+        if self.load_started is not None:
+            self.load_started.set()
+        if self.load_exc is not None:
+            raise self.load_exc
+        existing = self._operations.get(operation_id)
+        if existing is not None:
+            return self._snapshot(existing)
+        mid = model_dict["id"]
+        vram = float(model_dict.get("vram_gb", 0.0))
+        op = {
+            "model": model_dict,
+            "identity": (deployment_digest, generation_id, operation_id),
+            "deadline": deadline_seconds,
+            "state": "accepted",
+            "already": False,
+            "instance": None,
+            "error_status": None,
+            "message": "",
+        }
+        if mid in self._loading:
+            active = self._operations[self._active[mid]]
+            if active["identity"][:2] != (deployment_digest, generation_id):
+                raise NodeProtocolError("autre génération active", status_code=409)
+            return self._snapshot(active)
+        if mid in self._loaded or self.answer_already_loaded:
+            identity = self._identity.get(mid)
+            if identity is not None and identity[0] != deployment_digest:
+                # Réponse réelle de node_agent.start_load (identité).
+                raise NodeProtocolError(
+                    f"Le modèle '{mid}' est déjà associé à une autre génération",
+                    status_code=409,
+                )
+            self._loaded.setdefault(mid, vram)
+            self._instances.setdefault(mid, object())
+            op.update(state="ready", already=True, instance=self._instances[mid])
+            self._operations[operation_id] = op
+            return self._ready_response(op, already=True)
+        self._operations[operation_id] = op
+        if (
+            len(self._loaded) >= self._max_ports
+            or self._total - self._used - self._reserved_vram < vram
+        ):
+            # Contrôle de capacité de l'agent (pool de ports / VRAM) : 503.
+            op.update(state="failed", error_status=503, message="capacité du nœud")
+            return self._snapshot(op)
+        self._loaded[mid] = vram
+        self._loading.add(mid)
+        self._active[mid] = operation_id
+        op["task"] = asyncio.create_task(self._run_load(op))
+        return self._snapshot(op)
+
+    async def _run_load(self, op: dict) -> None:
+        mid = op["model"]["id"]
+        op["state"] = "loading"
+        if self.release_load is not None:
+            await self.release_load.wait()
+        if self._active.get(mid) == op["identity"][2]:
+            self._active.pop(mid, None)
+        if mid not in self._loading:
+            op.update(state="failed", error_status=503, message="déchargé pendant le load")
+            return
+        self._loading.discard(mid)
+        if self.fail_load is not None:
+            self._loaded.pop(mid, None)
+            op.update(
+                state="failed",
+                error_status=self.fail_load_status,
+                message=self.fail_load,
+            )
+            return
+        self._identity[mid] = op["identity"]
+        self._instances[mid] = object()
+        op.update(state="ready", instance=self._instances[mid])
+
+    async def get_operation_status(self, operation_id: str) -> LoadResponse:
+        self.operation_status_calls += 1
+        # Laisse progresser une tâche de chargement non bloquée, comme le
+        # ferait le round-trip HTTP réel.
+        await asyncio.sleep(0)
+        op = self._operations.get(operation_id)
+        if op is None:
+            raise NodeProtocolError("Opération inconnue.", status_code=404)
+        return self._snapshot(op)
+
+    def _drop(self, model_id: str) -> float:
+        self._loading.discard(model_id)
+        self._identity.pop(model_id, None)
+        self._instances.pop(model_id, None)
+        return self._loaded.pop(model_id, 0.0)
 
     async def unload_model(self, model_id: str) -> UnloadResponse:
         self.unload_calls.append(model_id)
@@ -180,16 +368,19 @@ class FakeNodeBackend:
         if self.unload_response is not None:
             response = self.unload_response.model_copy(update={"model_id": model_id})
             if response.unloaded:
-                self._loaded.pop(model_id, None)
+                self._drop(model_id)
             return response
-        freed = self._loaded.pop(model_id, 0.0)
+        if model_id not in self._loaded:
+            return UnloadResponse(model_id=model_id, unloaded=False)
+        freed = self._drop(model_id)
         return UnloadResponse(model_id=model_id, unloaded=True, freed_vram_gb=freed)
 
     async def unload_all(self) -> None:
         if self.fail_unload_all:
             raise NodeUnreachableError("simulated unload-all failure")
         self.unload_all_called = True
-        self._loaded.clear()
+        for model_id in list(self._loaded):
+            self._drop(model_id)
 
 
 class OperationNodeBackend(FakeNodeBackend):
@@ -337,17 +528,7 @@ class TestPlacement:
         """
         telemetry.reset_all()
         backend = FakeNodeBackend("a", total_vram=48.0)
-
-        async def fake_load(model_dict: dict) -> LoadResponse:
-            return LoadResponse(
-                model_id=model_dict["id"],
-                llama_url=f"http://{backend._nid}:8081",
-                internal_api_key="internal-key",
-                port=8081,
-                already_loaded=True,
-            )
-
-        backend.load_model = fake_load
+        backend.answer_already_loaded = True
         mgr = make_manager([backend], models=[FakeModelDef("m1", 10.0)])
         await mgr.start_health_monitor()
         try:
@@ -923,9 +1104,7 @@ class TestEffectiveCapacity:
 class TestLoadFailover:
     @pytest.mark.anyio
     async def test_load_failure_retries_another_node(self):
-        first = FakeNodeBackend(
-            "a", total_vram=30.0, load_exc=NodeProtocolError("load refusé")
-        )
+        first = FakeNodeBackend("a", total_vram=30.0, fail_load="load refusé")
         fallback = FakeNodeBackend("b", total_vram=80.0)
         mgr = make_manager([first, fallback])
         await mgr.start_health_monitor()

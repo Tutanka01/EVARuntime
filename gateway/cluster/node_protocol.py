@@ -93,6 +93,11 @@ class LoadResponse(BaseModel):
     )
     deadline_seconds: Optional[float] = Field(default=None, gt=0, le=86_400)
     error_code: Optional[str] = None
+    # Additif : statut HTTP équivalent d'un état terminal `failed`, posé par
+    # l'agent (422 définition/artefact, 500 llama-server, 503 capacité du nœud,
+    # 504 échéance). Permet à l'orchestrateur de distinguer un échec propre au
+    # modèle d'une capacité transitoire ; None pour un agent antérieur.
+    error_status: Optional[int] = Field(default=None, ge=100, le=599)
     message: str = ""
 
 

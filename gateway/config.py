@@ -268,8 +268,13 @@ class Settings(BaseSettings):
     # Utilisé uniquement quand cluster_mode=cluster
     agent_secret: str = "CHANGE_ME_AGENT_SECRET"
 
-    # Plan de contrôle (load/unload/health) — timeout court
+    # Plan de contrôle (load/status/opérations) — timeout court
     cluster_request_timeout: float = 10.0
+    # Unload et unload-all : l'agent attend l'arrêt du llama-server (SIGTERM,
+    # 10 s de grâce, puis SIGKILL et reap jusqu'à 15 s). Avec le timeout court,
+    # un unload lent était déclaré « non confirmé ». Non défini explicitement :
+    # max(30 s, CLUSTER_REQUEST_TIMEOUT), dérivé dans le validateur croisé.
+    cluster_unload_timeout: float = 30.0
     # Timeout dédié au chargement de modèle — un gros GGUF prend souvent
     # plusieurs minutes côté agent, bien au-delà du timeout court du plan de
     # contrôle. Distinct de cluster_request_timeout pour ne pas casser le mode
@@ -311,6 +316,7 @@ class Settings(BaseSettings):
         "default_monthly_token_limit",
         "cluster_request_timeout",
         "cluster_load_timeout",
+        "cluster_unload_timeout",
         "cluster_health_interval",
         "cluster_health_failures_to_offline",
         mode="before",
@@ -446,7 +452,9 @@ class Settings(BaseSettings):
             raise ValueError(f"Valeur cluster doit être ≥ 1, reçu : {v}")
         return v
 
-    @field_validator("cluster_request_timeout", "cluster_load_timeout")
+    @field_validator(
+        "cluster_request_timeout", "cluster_load_timeout", "cluster_unload_timeout"
+    )
     @classmethod
     def validate_cluster_timeout_positive(cls, v: float) -> float:
         if not math.isfinite(v) or v <= 0:
@@ -525,6 +533,11 @@ class Settings(BaseSettings):
                 "IDLE_CHECK_INTERVAL_SECONDS doit être inférieur ou égal à "
                 "IDLE_TIMEOUT_SECONDS"
             )
+        if "cluster_unload_timeout" not in self.model_fields_set:
+            # Une installation antérieure ne définit pas CLUSTER_UNLOAD_TIMEOUT :
+            # dériver la valeur au lieu de refuser au démarrage une configuration
+            # jusque-là valide (CLUSTER_REQUEST_TIMEOUT > 30 s).
+            self.cluster_unload_timeout = max(30.0, self.cluster_request_timeout)
         if self.cluster_mode == "cluster":
             if self.cluster_load_timeout < self.cluster_request_timeout:
                 errors.append(
@@ -534,6 +547,12 @@ class Settings(BaseSettings):
             if self.cluster_load_timeout < self.model_load_timeout_seconds:
                 errors.append(
                     "CLUSTER_LOAD_TIMEOUT doit couvrir MODEL_LOAD_TIMEOUT_SECONDS"
+                )
+            if self.cluster_unload_timeout < self.cluster_request_timeout:
+                # Atteint seulement pour une valeur définie explicitement.
+                errors.append(
+                    "CLUSTER_UNLOAD_TIMEOUT doit être supérieur ou égal à "
+                    "CLUSTER_REQUEST_TIMEOUT"
                 )
 
         if self.httpx_max_connections > 0 and (

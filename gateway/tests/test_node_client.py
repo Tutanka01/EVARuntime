@@ -23,6 +23,7 @@ from cluster.node_protocol import (
     NodeHealth,
     NodeStatus,
     UnloadResponse,
+    deployment_digest,
 )
 
 
@@ -47,6 +48,17 @@ def make_client(handler) -> RemoteNodeClient:
         },
     )
     return client
+
+
+async def start_load(client: RemoteNodeClient, model_dict: dict) -> LoadResponse:
+    """POST /agent/models/load avec une identité d'opération fixe (contrat CLU-005)."""
+    return await client.start_load_model(
+        model_dict,
+        deployment_digest=deployment_digest(model_dict),
+        generation_id="generation-test",
+        operation_id="operation-test",
+        deadline_seconds=60.0,
+    )
 
 
 @pytest.mark.anyio
@@ -192,7 +204,7 @@ class TestRemoteClientHappyPath:
 
         client = make_client(handler)
         try:
-            resp = await client.load_model({"id": "m1", "path": "/x/y.gguf"})
+            resp = await start_load(client, {"id": "m1", "path": "/x/y.gguf"})
         finally:
             await client.close()
 
@@ -268,7 +280,7 @@ class TestRemoteClientTrustedLlamaUrl:
         # L'agent renvoie 127.0.0.1 (défaut) → doit être remplacé par l'hôte du nœud.
         client = make_client(self._load_handler("http://127.0.0.1:8081"))
         try:
-            resp = await client.load_model({"id": "m1"})
+            resp = await start_load(client, {"id": "m1"})
         finally:
             await client.close()
         assert resp.llama_url == "http://node.test:8081"
@@ -278,7 +290,7 @@ class TestRemoteClientTrustedLlamaUrl:
         # Un agent compromis / MITM renvoie une URL arbitraire → ignorée.
         client = make_client(self._load_handler("http://attacker.example:80"))
         try:
-            resp = await client.load_model({"id": "m1"})
+            resp = await start_load(client, {"id": "m1"})
         finally:
             await client.close()
         assert resp.llama_url == "http://node.test:8081"
@@ -293,7 +305,7 @@ class TestRemoteClientTrustedLlamaUrl:
     ):
         client = make_client(self._load_handler(reported_url))
         try:
-            resp = await client.load_model({"id": "m1"})
+            resp = await start_load(client, {"id": "m1"})
         finally:
             await client.close()
 
@@ -307,7 +319,7 @@ class TestRemoteClientTrustedLlamaUrl:
             self._load_handler("http://attacker.example:80", port=8082, already=True)
         )
         try:
-            resp = await client.load_model({"id": "m1"})
+            resp = await start_load(client, {"id": "m1"})
         finally:
             await client.close()
         assert resp.already_loaded is True
@@ -338,7 +350,7 @@ class TestRemoteClientTrustedLlamaUrl:
             transport=httpx.MockTransport(handler),
         )
         try:
-            response = await client.load_model({"id": "m1"})
+            response = await start_load(client, {"id": "m1"})
         finally:
             await client.close()
 
@@ -349,7 +361,7 @@ class TestRemoteClientTrustedLlamaUrl:
         client = make_client(self._load_handler("http://node.test:8081", port=0))
         try:
             with pytest.raises(NodeProtocolError, match="port"):
-                await client.load_model({"id": "m1"})
+                await start_load(client, {"id": "m1"})
         finally:
             await client.close()
 
@@ -358,32 +370,31 @@ class TestRemoteClientTrustedLlamaUrl:
         client = make_client(self._load_handler("http://node.test:8081", port=999999))
         try:
             with pytest.raises(NodeProtocolError, match="port"):
-                await client.load_model({"id": "m1"})
+                await start_load(client, {"id": "m1"})
         finally:
             await client.close()
 
 
 # ── RemoteNodeClient — Timeout de chargement dédié ───────────────────────────
 
-class TestRemoteClientLoadTimeout:
+class TestRemoteClientTimeouts:
     """
-    load_model doit utiliser le timeout long (self._load_timeout), pas le
-    timeout court du plan de contrôle. Les autres POST gardent le défaut.
+    Le POST de load n'attend que l'acceptation (timeout court du plan de
+    contrôle, borné par l'échéance) ; unload et unload-all disposent d'un
+    budget dédié couvrant l'arrêt du llama-server côté agent (SIGTERM 10 s +
+    reap jusqu'à 15 s), au lieu du timeout court de 10 s.
     """
 
-    @pytest.mark.anyio
-    async def test_load_uses_long_timeout_others_default(self):
+    @staticmethod
+    def _spy_client(**kwargs) -> tuple[RemoteNodeClient, list]:
         captured: list = []
-
         client = RemoteNodeClient(
             node_id="test-node",
             base_url="https://node.test:9443",
             agent_secret="s3cret",
-            timeout_seconds=2.0,
-            load_timeout_seconds=300.0,
             verify=False,
+            **kwargs,
         )
-
         original_post = client._post
 
         async def spy_post(path, *, json=None, timeout=None):
@@ -396,37 +407,52 @@ class TestRemoteClientLoadTimeout:
             path = request.url.path
             if path == "/agent/models/load":
                 return httpx.Response(
-                    200,
+                    202,
                     json={
                         "model_id": "m1",
-                        "llama_url": "http://node.test:8081",
-                        "internal_api_key": "key",
-                        "port": 8081,
-                        "already_loaded": False,
+                        "state": "accepted",
+                        "progress": 0.1,
                     },
                 )
-            # unload-all
-            return httpx.Response(200, json={})
+            if path.endswith("/unload"):
+                return httpx.Response(
+                    200, json={"model_id": "m1", "unloaded": True}
+                )
+            return httpx.Response(200, json={"unloaded": True})
 
         client._client = httpx.AsyncClient(
             base_url="https://node.test:9443",
             transport=httpx.MockTransport(handler),
-            headers={
-                "Authorization": "Bearer s3cret",
-                "User-Agent": "llm-gateway-orchestrator",
-            },
         )
+        return client, captured
 
+    @pytest.mark.anyio
+    async def test_unload_uses_dedicated_timeout_not_request_timeout(self):
+        client, captured = self._spy_client(
+            timeout_seconds=2.0, unload_timeout_seconds=45.0
+        )
         try:
-            await client.load_model({"id": "m1"})
+            await start_load(client, {"id": "m1"})
+            await client.unload_model("m1")
             await client.unload_all()
         finally:
             await client.close()
 
         by_path = dict(captured)
-        assert by_path["/agent/models/load"] == 300.0
-        # unload-all : pas d'override → None (timeout par défaut du client)
-        assert by_path["/agent/unload-all"] is None
+        # Contrôle positif : le load garde le timeout court d'acceptation.
+        assert by_path["/agent/models/load"] == 2.0
+        assert by_path["/agent/models/m1/unload"] == 45.0
+        assert by_path["/agent/unload-all"] == 45.0
+
+    @pytest.mark.anyio
+    async def test_default_unload_timeout_covers_agent_shutdown_budget(self):
+        client, captured = self._spy_client(timeout_seconds=10.0)
+        try:
+            await client.unload_model("m1")
+        finally:
+            await client.close()
+        # SIGTERM (10 s) + reap (15 s) côté agent : le défaut doit les couvrir.
+        assert dict(captured)["/agent/models/m1/unload"] >= 30.0
 
 
 # ── RemoteNodeClient — Erreurs réseau ────────────────────────────────────────
@@ -464,7 +490,7 @@ class TestRemoteClientNetworkErrors:
         client = make_client(handler)
         try:
             with pytest.raises(NodeUnreachableError):
-                await client.load_model({"id": "x"})
+                await start_load(client, {"id": "x"})
         finally:
             await client.close()
 
@@ -582,8 +608,18 @@ class TestLocalNodeAdapter:
         h = await adapter.health()
         assert h.total_vram_gb == 48.0
 
-        load = await adapter.load_model({"id": "m1"})
+        load = await adapter.start_load_model(
+            {"id": "m1"},
+            deployment_digest="d" * 64,
+            generation_id="generation",
+            operation_id="operation",
+            deadline_seconds=30.0,
+        )
+        # Backend synchrone : son résultat est déjà l'état terminal, avec
+        # l'identité de l'opération demandée.
         assert load.model_id == "m1"
+        assert load.state == "ready"
+        assert load.operation_id == "operation"
         assert backend.loaded == ["m1"]
 
         unload = await adapter.unload_model("m1")

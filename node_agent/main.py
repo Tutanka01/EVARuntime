@@ -179,6 +179,10 @@ class _LoadOperation:
     error_status: int = 500
     error_detail: str = ""
     completed_at: float | None = None
+    # Manager qui sert le résultat READY. Le résultat n'est valable que tant
+    # que CE manager reste le manager READY du modèle : après un unload, le
+    # port est rendu au pool et réattribué au prochain modèle chargé.
+    manager: object | None = None
 
 
 def _build_llama_metrics_client() -> httpx.AsyncClient:
@@ -217,6 +221,9 @@ class _AgentState:
         self._active_operations: dict[str, str] = {}
         self._manager_identity: dict[str, tuple[str, str, str]] = {}
         self._closing = False
+        # Client de collecte des métriques, partagé entre les appels
+        # /agent/metrics (pool de connexions réutilisé) et fermé à l'arrêt.
+        self._metrics_client: httpx.AsyncClient | None = None
         # La mesure matérielle est indépendante des estimations de modèles
         # utilisées pour l'admission. Elle reste disponible dans /health même
         # lorsque nvidia-smi est absent : l'état `unavailable` est publié au
@@ -355,7 +362,34 @@ class _AgentState:
                     detail=f"Vérification d'intégrité échouée : {exc}",
                 ) from exc
 
+    def _operation_still_serving(self, operation: _LoadOperation) -> bool:
+        manager = self._managers.get(operation.model_id)
+        return (
+            manager is not None
+            and manager is operation.manager
+            and manager.state == ModelState.READY
+        )
+
     def _snapshot_operation(self, operation: _LoadOperation) -> LoadResponse:
+        if operation.state == "ready" and not self._operation_still_serving(operation):
+            # Résultat périmé : le modèle a été déchargé (ou remplacé) depuis.
+            # Répondre `ready` avec l'ancien port enverrait l'orchestrateur
+            # vers le llama-server d'un AUTRE modèle qui l'a réutilisé.
+            return LoadResponse(
+                model_id=operation.model_id,
+                deployment_digest=operation.deployment_digest,
+                generation_id=operation.generation_id,
+                operation_id=operation.operation_id,
+                state="failed",
+                progress=1.0,
+                deadline_seconds=operation.deadline_seconds,
+                error_code="unloaded",
+                error_status=409,
+                message=(
+                    f"Le modèle '{operation.model_id}' n'est plus servi par "
+                    "cette opération (déchargé ou remplacé)."
+                ),
+            )
         if operation.response is not None:
             return operation.response.model_copy(
                 update={
@@ -530,6 +564,7 @@ class _AgentState:
                         progress=1.0,
                         response=response,
                         completed_at=time.monotonic(),
+                        manager=manager,
                     )
                     return response
                 if manager is not None and manager.state == ModelState.UNLOADING:
@@ -551,46 +586,6 @@ class _AgentState:
                 operation.task = asyncio.create_task(self._run_load(operation))
                 operation.task.add_done_callback(self._consume_operation_task)
                 return self._snapshot_operation(operation)
-
-    async def load(
-        self,
-        model_dict: dict,
-        *,
-        deployment_digest: str | None = None,
-        generation_id: str | None = None,
-        operation_id: str | None = None,
-        deadline_seconds: float | None = None,
-    ) -> LoadResponse:
-        """Compatibilité locale : démarre puis attend l'opération terminale."""
-        response = await self.start_load(
-            model_dict,
-            deployment_digest=deployment_digest,
-            generation_id=generation_id,
-            operation_id=operation_id,
-            deadline_seconds=deadline_seconds,
-        )
-        if response.state in {"ready", "failed", "conflict", "deadline_exceeded"}:
-            operation = self._operations.get(response.operation_id)
-            if operation is not None and operation.state in {
-                "failed", "conflict", "deadline_exceeded"
-            }:
-                raise HTTPException(
-                    status_code=operation.error_status,
-                    detail=operation.error_detail,
-                )
-            return response
-        operation = self._operations.get(response.operation_id)
-        if operation is None or operation.task is None:
-            return response
-        await asyncio.shield(operation.task)
-        async with self._lock:
-            result = self._snapshot_operation(operation)
-        if result.state in {"failed", "conflict", "deadline_exceeded"}:
-            raise HTTPException(
-                status_code=operation.error_status,
-                detail=operation.error_detail,
-            )
-        return result
 
     @staticmethod
     def _consume_operation_task(task: asyncio.Task) -> None:
@@ -691,6 +686,7 @@ class _AgentState:
                 operation.state = "ready"
                 operation.progress = 1.0
                 operation.completed_at = time.monotonic()
+                operation.manager = self._managers.get(operation.model_id)
                 self._manager_identity[operation.model_id] = (
                     operation.deployment_digest,
                     operation.generation_id,
@@ -706,6 +702,18 @@ class _AgentState:
                 operation.completed_at = time.monotonic()
                 operation.error_status = 503
                 operation.error_detail = "Opération interrompue pendant l'arrêt de l'agent."
+                operation.response = LoadResponse(
+                    model_id=operation.model_id,
+                    deployment_digest=operation.deployment_digest,
+                    generation_id=operation.generation_id,
+                    operation_id=operation.operation_id,
+                    state="failed",
+                    progress=operation.progress,
+                    deadline_seconds=operation.deadline_seconds,
+                    error_code="cancelled",
+                    error_status=operation.error_status,
+                    message=operation.error_detail,
+                )
             raise
         except HTTPException as exc:
             async with self._lock:
@@ -725,6 +733,10 @@ class _AgentState:
                     progress=operation.progress,
                     deadline_seconds=operation.deadline_seconds,
                     error_code=operation.state,
+                    # 422 artefact/définition, 503 capacité du nœud, 504
+                    # échéance… : l'orchestrateur distingue ainsi un échec du
+                    # modèle d'une capacité transitoire.
+                    error_status=exc.status_code,
                     message=operation.error_detail,
                 )
                 if self._active_operations.get(operation.model_id) == operation.operation_id:
@@ -747,6 +759,7 @@ class _AgentState:
                     progress=operation.progress,
                     deadline_seconds=operation.deadline_seconds,
                     error_code="load_failed",
+                    error_status=operation.error_status,
                     message=operation.error_detail,
                 )
                 if self._active_operations.get(operation.model_id) == operation.operation_id:
@@ -888,11 +901,27 @@ class _AgentState:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        await self.unload_all()
+        try:
+            await self.unload_all()
+        finally:
+            if self._metrics_client is not None:
+                client, self._metrics_client = self._metrics_client, None
+                await client.aclose()
 
     async def unload_all(self) -> None:
-        for mid in list(self._managers):
-            await self.unload(mid)
+        """
+        Décharge tous les modèles EN PARALLÈLE : chaque arrêt peut attendre
+        SIGTERM + reap (jusqu'à ~25 s) ; en série, le temps total croissait avec
+        le nombre de modèles et dépassait le budget unique de l'orchestrateur.
+        Les modèles sont indépendants (verrou par modèle).
+        """
+        results = await asyncio.gather(
+            *(self.unload(mid) for mid in list(self._managers)),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _on_unloaded(self, model_id: str, expected: ServerManager | None) -> None:
         self._release_manager(model_id, expected)
@@ -959,32 +988,47 @@ class _AgentState:
                 if mgr.state == ModelState.READY
             ]
         result: dict = {}
-        if not ready:
+        if not ready or self._closing:
+            # Après shutdown(), ne jamais recréer un client que plus personne
+            # ne fermerait.
             return result
-        async with _build_llama_metrics_client() as client:
-            for model_id, mgr in ready:
-                try:
-                    resp = await client.get(
-                        mgr.llama_url("/metrics"),
-                        headers=mgr.auth_headers(),
-                    )
-                    if resp.status_code != 200:
-                        continue
-                    raw = self._parse_prometheus(resp.text)
-                    result[model_id] = {
-                        "kv_cache_usage_ratio": raw.get("llamacpp:kv_cache_usage_ratio"),
-                        "kv_cache_tokens": raw.get("llamacpp:kv_cache_tokens"),
-                        "requests_processing": raw.get("llamacpp:requests_processing"),
-                        "requests_deferred": raw.get("llamacpp:requests_deferred"),
-                        "tokens_per_second": raw.get("llamacpp:tokens_per_second"),
-                        "prompt_tokens_total": raw.get("llamacpp:prompt_tokens_total"),
-                        "tokens_predicted_total": raw.get("llamacpp:tokens_predicted_total"),
-                    }
-                except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
-                    pass
-                except Exception:
-                    log.exception("Métriques llama indisponibles pour '%s'", model_id)
+        if self._metrics_client is None:
+            self._metrics_client = _build_llama_metrics_client()
+        client = self._metrics_client
+        samples = await asyncio.gather(
+            *(self._scrape_llama_metrics(client, model_id, mgr) for model_id, mgr in ready)
+        )
+        for model_id, sample in zip((model_id for model_id, _ in ready), samples):
+            if sample is not None:
+                result[model_id] = sample
         return result
+
+    async def _scrape_llama_metrics(
+        self, client: httpx.AsyncClient, model_id: str, mgr
+    ) -> dict | None:
+        """Lit /metrics d'un llama-server ; None s'il est injoignable."""
+        try:
+            resp = await client.get(
+                mgr.llama_url("/metrics"),
+                headers=mgr.auth_headers(),
+            )
+            if resp.status_code != 200:
+                return None
+            raw = self._parse_prometheus(resp.text)
+            return {
+                "kv_cache_usage_ratio": raw.get("llamacpp:kv_cache_usage_ratio"),
+                "kv_cache_tokens": raw.get("llamacpp:kv_cache_tokens"),
+                "requests_processing": raw.get("llamacpp:requests_processing"),
+                "requests_deferred": raw.get("llamacpp:requests_deferred"),
+                "tokens_per_second": raw.get("llamacpp:tokens_per_second"),
+                "prompt_tokens_total": raw.get("llamacpp:prompt_tokens_total"),
+                "tokens_predicted_total": raw.get("llamacpp:tokens_predicted_total"),
+            }
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+            return None
+        except Exception:
+            log.exception("Métriques llama indisponibles pour '%s'", model_id)
+            return None
 
     def node_status(self) -> NodeStatus:
         models = []
